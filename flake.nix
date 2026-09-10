@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    dev-workspace.url = "github:aither64/dev-workspace/086e3d867140ab090e507a194b7fdfc1cc43cc65";
+    dev-workspace.url = "github:aither64/dev-workspace/4b3d426d0484a62bac5bcfc7d5c7b6ff2140b045";
   };
 
   outputs =
@@ -16,6 +16,8 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      migrationHostPaths = builtins.fromJSON (builtins.readFile ./nix/host-paths.json);
+      hostPathContractMatches = migrationHostPaths == dev-workspace.lib.hostPaths;
       skillNames = builtins.attrNames (
         nixpkgs.lib.filterAttrs (
           name: type: type == "directory" && builtins.pathExists "${self}/skills/${name}/SKILL.md"
@@ -43,15 +45,21 @@
         };
       mkPackage =
         {
+          activationEnvironmentAliases ? [ ],
           pkgs,
+          routerSocket ? dev-workspace.lib.hostPaths.routerSocket,
           siteConfig,
+          userNamespace ? "dev-workspaces",
         }:
         let
           tools = mkOrganizationTools { inherit pkgs siteConfig; };
         in
-        dev-workspace.lib.mkPackage {
+        (dev-workspace.lib.mkPackage {
           inherit
+            activationEnvironmentAliases
             pkgs
+            routerSocket
+            userNamespace
             ;
           extensions = {
             commands = builtins.listToAttrs (
@@ -77,7 +85,13 @@
               };
             };
           };
-        };
+        }).overrideAttrs
+          (previous: {
+            postInstall = (previous.postInstall or "") + ''
+              ln -s ${tools}/bin/vpsfree-dev-workspace-migrate \
+                "$out/libexec/vpsfree-dev-workspace-migrate"
+            '';
+          });
       testSiteConfig = {
         kb = {
           cz = {
@@ -103,6 +117,13 @@
       testPackage = mkPackage {
         inherit pkgs;
         siteConfig = testSiteConfig;
+      };
+      testCompatibilityPackage = mkPackage {
+        activationEnvironmentAliases = [ "VPSFREE_WORKSPACE_ACTIVATION" ];
+        inherit pkgs;
+        routerSocket = "/run/previous-workspace-router/router.sock";
+        siteConfig = testSiteConfig;
+        userNamespace = "previous-workspaces";
       };
       rejectedClusterDefaults = [ "/tmp/mutable-vpsadmin.json" ];
       invalidClusterDefaultsRejected = builtins.all (
@@ -134,15 +155,51 @@
         export VPSADMIN_DEVCLUSTER_DEFAULT_CONFIG=$PWD/test/fixtures/vpsadmin-config.json
         export VPSADMINOS_DEVCLUSTER_DEFAULT_CONFIG=$PWD/test/fixtures/vpsadminos-config.json
         export DEVCLUSTER_RUNTIME_CONTRACT=${dev-workspace.lib.runtimeContract}
+        export DEV_WORKSPACE_RUNTIME_CONTRACT=${dev-workspace.lib.runtimeContract}
       '';
     in
     assert invalidClusterDefaultsRejected;
+    assert hostPathContractMatches;
     {
       lib = {
         inherit mkPackage;
       };
       checks.${system} = {
+        compatibility-package = testCompatibilityPackage;
+        host-migration = import ./nix/tests/host-migration.nix {
+          inherit pkgs;
+          devWorkspace = dev-workspace;
+          migrationPackage = testPackage;
+        };
         package = testPackage;
+        package-metadata = pkgs.runCommand "vpsfree-dev-workspace-package-metadata" { } ''
+          ${pkgs.jq}/bin/jq -e \
+            --arg router ${nixpkgs.lib.escapeShellArg dev-workspace.lib.hostPaths.routerSocket} \
+            '.activationEnvironmentAliases == [] and
+             .userNamespace == "dev-workspaces" and
+             .routerSocket == $router' \
+            ${testPackage}/share/dev-workspace/package.json >/dev/null
+          ${pkgs.jq}/bin/jq -e \
+            '.activationEnvironmentAliases == ["VPSFREE_WORKSPACE_ACTIVATION"] and
+             .userNamespace == "previous-workspaces" and
+             .routerSocket == "/run/previous-workspace-router/router.sock"' \
+            ${testCompatibilityPackage}/share/dev-workspace/package.json >/dev/null
+          ${pkgs.jq}/bin/jq -e \
+            '[.commands[].name] == [
+              "kb-cleanup",
+              "kb-contract-build",
+              "kb-contract-fetch",
+              "kb-contract-manifest",
+              "kb-contract-reconcile",
+              "kb-page",
+              "kb-release",
+              "kb-stage"
+            ]' \
+          ${testPackage}/share/dev-workspace/extensions.json >/dev/null
+          test ! -e ${testPackage}/bin/vpsfree-dev-workspace-migrate
+          test -x ${testPackage}/libexec/vpsfree-dev-workspace-migrate
+          touch "$out"
+        '';
         tests =
           pkgs.runCommand "vpsfree-dev-workspace-tests"
             {
@@ -163,6 +220,7 @@
               cd source
               patchShebangs bin dev-clusters
               ${testEnvironment}
+              export RUNTIME_AUTHORITY_CORPUS=${dev-workspace.lib.runtimeAuthorityCorpus}
               ruby test/devcluster_status_test.rb
               ruby test/kb_cleanup_test.rb
               ruby test/kb_contract_tools_test.rb

@@ -1,0 +1,2034 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'base64'
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'open3'
+require 'optparse'
+require 'pathname'
+require 'psych'
+require 'tempfile'
+
+module VpsfreeDevWorkspaceMigration
+  class Error < StandardError; end
+
+  def self.load_runtime_contract
+    candidates = [
+      ENV['DEV_WORKSPACE_RUNTIME_CONTRACT'],
+      File.expand_path('../dev-clusters/runtime-contract.json', __dir__)
+    ].compact
+    path = candidates.find { |candidate| File.file?(candidate) }
+    raise Error, 'generic workspace runtime contract is missing' unless path
+
+    JSON.parse(File.binread(path))
+  rescue JSON::ParserError, Errno::EACCES => e
+    raise Error, "cannot load generic workspace runtime contract: #{e.message}"
+  end
+
+  def self.tmux_metadata_values(metadata, name, prefix)
+    values = metadata.fetch(name)
+    unless values.is_a?(Array) && values.all? do |value|
+             value.is_a?(Hash) && value.keys.sort == %w[name path] &&
+               value.fetch('name').is_a?(String) && value.fetch('name').start_with?(prefix) &&
+               [true, false].include?(value.fetch('path'))
+           end && values.map { |value| value.fetch('name') }.uniq.length == values.length
+      raise Error, "generic workspace runtime contract has invalid tmux #{name}"
+    end
+
+    values
+  rescue KeyError => e
+    raise Error, "generic workspace runtime contract is incomplete: #{e.message}"
+  end
+
+  RUNTIME_CONTRACT = load_runtime_contract.freeze
+  TMUX_METADATA = RUNTIME_CONTRACT.fetch('tmuxMetadata').freeze
+  TMUX_SESSION_OPTIONS = tmux_metadata_values(TMUX_METADATA, 'sessionOptions', '@dev_session').freeze
+  TMUX_WINDOW_OPTIONS = tmux_metadata_values(TMUX_METADATA, 'windowOptions', '@dev_session_').freeze
+  TMUX_ENVIRONMENT = tmux_metadata_values(TMUX_METADATA, 'environment', 'DEV_SESSION_').freeze
+
+  HOST_PATH_KEYS = %w[
+    caStateDirectory certificateDirectory htpasswdFile lockFile passwordFile
+    publicCaFile routerSocket
+  ].freeze
+  HOST_PATHS = begin
+    path = File.expand_path('../nix/host-paths.json', __dir__)
+    values = JSON.parse(File.binread(path))
+    unless values.is_a?(Hash) && values.keys.sort == HOST_PATH_KEYS &&
+           values.values.all? { |value| value.is_a?(String) && value.start_with?('/') && value != '/' }
+      raise Error, "invalid generic host path contract: #{path}"
+    end
+    values.freeze
+  rescue JSON::ParserError, Errno::ENOENT, Errno::EACCES => e
+    raise Error, "cannot load generic host path contract: #{e.message}"
+  end
+
+  SCHEMA = 5
+  MAX_JOURNAL_BYTES = 16 * 1024 * 1024
+  MAX_REWRITE_BYTES = 1024 * 1024
+  MAX_AUTHORITY_BYTES = 64 * 1024
+  NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
+  SLUG = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
+  DIGEST = /\A[0-9a-f]{64}\z/
+  SESSION_ID = /\A\$[0-9]+\z/
+  WINDOW_ID = /\A@[0-9]+\z/
+  PANE_ID = /\A%[0-9]+\z/
+  SOCKET_PATH = /\A\/[A-Za-z0-9._\/-]+\z/
+  CLIENT_VERSION = /\A[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\z/
+  AUTHORITY_KEYS = %w[
+    schema state slug workspace tmux_socket tmux_session_id tmux_identity
+    codex_thread_id codex_socket_path codex_client_version
+  ].freeze
+  AUTHORITY_REQUIRED_KEYS = %w[
+    schema state slug workspace tmux_socket tmux_session_id
+  ].freeze
+  AUTHORITY_CODEX_KEYS = %w[
+    codex_thread_id codex_socket_path codex_client_version
+  ].freeze
+  SESSION_OPTION_NAMES = TMUX_SESSION_OPTIONS.map do |value|
+    value.fetch('name').delete_prefix('@dev_')
+  end.freeze
+  SESSION_PATH_OPTION_NAMES = TMUX_SESSION_OPTIONS.filter_map do |value|
+    value.fetch('name').delete_prefix('@dev_') if value.fetch('path')
+  end.freeze
+  WINDOW_OPTION_NAMES = TMUX_WINDOW_OPTIONS.map do |value|
+    value.fetch('name').delete_prefix('@dev_')
+  end.freeze
+  WINDOW_PATH_OPTION_NAMES = TMUX_WINDOW_OPTIONS.filter_map do |value|
+    value.fetch('name').delete_prefix('@dev_') if value.fetch('path')
+  end.freeze
+  OPTION_NAMES = (SESSION_OPTION_NAMES + WINDOW_OPTION_NAMES).freeze
+  ENVIRONMENT_NAMES = TMUX_ENVIRONMENT.map { |value| value.fetch('name') }.freeze
+  ENVIRONMENT_PATH_NAMES = TMUX_ENVIRONMENT.filter_map do |value|
+    value.fetch('name') if value.fetch('path')
+  end.freeze
+  TMUX_REMOVED = { 'state' => 'removed' }.freeze
+  PERSISTED_STATE_FIELDS = {
+    journal: { 'state' => %w[prepared forward reversed].freeze }.freeze,
+    move: { 'state' => %w[pending moved skipped reversed].freeze }.freeze,
+    rewrite: { 'state' => %w[pending applied reversed].freeze }.freeze,
+    tmux: {
+      'forwardDropIn' => %w[pending installed removed].freeze,
+      'reverseDropIn' => %w[pending installed removed].freeze
+    }.freeze,
+    tmux_server: {
+      'forwardHandoff' => %w[pending ready].freeze,
+      'reverseHandoff' => %w[pending ready].freeze
+    }.freeze,
+    tmux_session: { 'state' => %w[pending forward reversed].freeze }.freeze
+  }.freeze
+  PERSISTED_STATE_MAXIMUMS = PERSISTED_STATE_FIELDS.values.each_with_object({}) do |fields, maximums|
+    fields.each do |name, values|
+      candidates = [maximums[name], *values].compact
+      maximums[name] = candidates.max_by { |value| JSON.generate(value).bytesize }
+    end
+  end.freeze
+  DROP_IN_CONTENT = <<~UNIT.freeze
+    [Service]
+    KillMode=process
+    Restart=no
+  UNIT
+
+  class Runner
+    def initialize(argv, out: $stdout, err: $stderr)
+      @argv = argv.dup
+      @out = out
+      @err = err
+      @options = {
+        home: Dir.home,
+        runtime_dir: ENV.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.euid}"),
+        host_root: '/',
+        tmux: 'tmux',
+        systemctl: 'systemctl'
+      }
+      parse!
+    end
+
+    def run
+      case @command
+      when 'preflight'
+        preflight
+      when 'forward'
+        require_confirmation!
+        with_journal_lock { forward }
+      when 'reverse'
+        require_confirmation!
+        with_journal_lock { reverse }
+      when 'status'
+        status
+      else
+        raise Error, "unknown command #{@command.inspect}"
+      end
+    end
+
+    private
+
+    def option_parser
+      OptionParser.new do |opts|
+        opts.banner = <<~USAGE
+          Usage:
+            vpsfree-dev-workspace-migrate preflight --scope user|host --direction forward|reverse [options]
+            vpsfree-dev-workspace-migrate forward --scope user|host --yes [options]
+            vpsfree-dev-workspace-migrate reverse --scope user|host --yes [options]
+            vpsfree-dev-workspace-migrate status --scope user|host [options]
+
+          User migration requires --workspace-root and preserves live tmux
+          servers while their systemd keepers are handed off. Run both scopes
+          only after conversations are idle and lifecycle operations complete.
+        USAGE
+        opts.on('--scope SCOPE', %w[user host]) { |value| @options[:scope] = value }
+        opts.on('--direction DIRECTION', %w[forward reverse]) { |value| @options[:direction] = value }
+        opts.on('--home PATH') { |value| @options[:home] = absolute(value, '--home') }
+        opts.on('--runtime-dir PATH') { |value| @options[:runtime_dir] = absolute(value, '--runtime-dir') }
+        opts.on('--host-root PATH') { |value| @options[:host_root] = absolute(value, '--host-root') }
+        opts.on('--workspace-root PATH') { |value| @options[:workspace_root] = absolute(value, '--workspace-root') }
+        opts.on('--journal PATH') { |value| @options[:journal] = absolute(value, '--journal') }
+        opts.on('--tmux-command COMMAND') { |value| @options[:tmux] = command(value, '--tmux-command') }
+        opts.on('--systemctl-command COMMAND') do |value|
+          @options[:systemctl] = command(value, '--systemctl-command')
+        end
+        opts.on('--yes') { @options[:yes] = true }
+        opts.on('-h', '--help') do
+          @out.puts opts
+          exit 0
+        end
+      end
+    end
+
+    def parse!
+      parser = option_parser
+      if %w[-h --help].include?(@argv.first)
+        @out.puts parser
+        exit 0
+      end
+      @command = @argv.shift
+      parser.parse!(@argv)
+      raise Error, 'a command is required' unless @command
+      raise Error, '--scope is required' unless @options[:scope]
+      raise Error, 'unexpected arguments' unless @argv.empty?
+      if @command == 'preflight'
+        @options[:direction] ||= 'forward'
+      elsif @options[:direction]
+        raise Error, '--direction is only valid with preflight'
+      end
+      if @options[:scope] == 'user' && %w[preflight forward reverse].include?(@command) && !@options[:workspace_root]
+        raise Error, '--workspace-root is required for user migration'
+      end
+
+      @options[:journal] ||= default_journal
+    rescue OptionParser::ParseError => e
+      raise Error, e.message
+    end
+
+    def absolute(value, option)
+      path = File.expand_path(value)
+      raise Error, "#{option} requires an absolute path" unless Pathname.new(value).absolute?
+      raise Error, "#{option} cannot name the filesystem root" if path == '/'
+
+      path
+    end
+
+    def command(value, option)
+      raise Error, "#{option} requires one command without whitespace" unless value.match?(/\A\S+\z/)
+
+      value
+    end
+
+    def default_journal
+      if @options[:scope] == 'user'
+        File.join(@options[:home], '.local/state/vpsfree-dev-workspace-user-migration.json')
+      else
+        rooted('/var/lib/vpsfree-dev-workspace-host-migration.json')
+      end
+    end
+
+    def rooted(path)
+      return path if @options[:host_root] == '/'
+
+      File.join(@options[:host_root], path.delete_prefix('/'))
+    end
+
+    def require_confirmation!
+      raise Error, '--yes is required for migration changes' unless @options[:yes]
+    end
+
+    def with_journal_lock
+      ensure_safe_parent(@options[:journal])
+      lock_path = "#{@options[:journal]}.lock"
+      validate_private_file(lock_path) if path_exists?(lock_path)
+      flags = File::RDWR | File::CREAT
+      flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+      File.open(lock_path, flags, 0o600) do |lock|
+        File.chmod(0o600, lock_path)
+        raise Error, "migration is already running: #{lock_path}" unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+
+        yield
+      end
+    end
+
+    def forward
+      journal = load_or_prepare_journal
+      validate_journal!(journal, mutation: true)
+      raise Error, 'migration has already been reversed' if journal.fetch('state') == 'reversed'
+      if journal.fetch('state') == 'forward'
+        @out.puts 'migration is already complete'
+        return
+      end
+      preflight_moves!(journal, forward: true)
+      mutation_locks = lock_mutation_files(journal, forward: true)
+      verify_forward_profile!(journal) if @options[:scope] == 'user'
+      preflight_moves!(journal, forward: true)
+      if @options[:scope] == 'user'
+        prepare_rewrites(journal, persist: !@new_journal)
+        preflight_rewrites!(journal, forward: true)
+        prepare_tmux(journal, persist: !@new_journal)
+        preflight_inventory!(journal, forward: true)
+        save_journal(journal) if @new_journal
+        handoff_tmux_servers(journal, forward: true)
+      elsif @new_journal
+        save_journal(journal)
+      end
+      apply_moves(journal)
+      apply_rewrites(journal)
+      migrate_tmux_metadata(journal, forward: true) if @options[:scope] == 'user'
+      verify_user_migration_result!(journal, forward: true) if @options[:scope] == 'user'
+      journal['state'] = 'forward'
+      save_journal(journal)
+      @out.puts "forward migration complete; retain #{@options[:journal]} for rollback"
+    ensure
+      mutation_locks&.each(&:close)
+    end
+
+    def reverse
+      journal = load_journal
+      validate_journal!(journal, mutation: true)
+      raise Error, 'forward migration is incomplete' unless journal.fetch('state') == 'forward'
+      preflight_moves!(journal, forward: false)
+      mutation_locks = lock_mutation_files(journal, forward: false)
+      verify_reverse_profiles!(journal) if @options[:scope] == 'user'
+      preflight_moves!(journal, forward: false)
+      if @options[:scope] == 'user'
+        preflight_rewrites!(journal, forward: false)
+        preflight_inventory!(journal, forward: false)
+        handoff_tmux_servers(journal, forward: false)
+        migrate_tmux_metadata(journal, forward: false)
+      end
+      reverse_rewrites(journal)
+      reverse_moves(journal)
+      verify_user_migration_result!(journal, forward: false) if @options[:scope] == 'user'
+      journal['state'] = 'reversed'
+      save_journal(journal)
+      @out.puts 'reverse migration complete'
+    ensure
+      mutation_locks&.each(&:close)
+    end
+
+    def preflight
+      forward = @options.fetch(:direction) == 'forward'
+      journal = forward ? build_journal : load_journal
+      validate_journal!(journal, mutation: true)
+      if !forward && journal.fetch('state') != 'forward'
+        raise Error, 'forward migration is incomplete'
+      end
+      preflight_moves!(journal, forward:)
+      mutation_locks = lock_mutation_files(journal, forward:)
+      if @options[:scope] == 'user'
+        forward ? verify_forward_profile!(journal) : verify_reverse_profiles!(journal)
+      end
+      preflight_moves!(journal, forward:)
+      if @options[:scope] == 'user'
+        if forward
+          prepare_rewrites(journal, persist: false)
+          prepare_tmux(journal, persist: false)
+        end
+        preflight_rewrites!(journal, forward:)
+        preflight_inventory!(journal, forward:)
+      end
+      validate_journal_capacity!(journal)
+      @out.puts "#{@options[:scope]} #{@options.fetch(:direction)} migration preflight passed"
+    ensure
+      mutation_locks&.each(&:close)
+    end
+
+    def status
+      unless File.file?(@options[:journal])
+        raise Error, "unsafe journal path: #{@options[:journal]}" if path_exists?(@options[:journal])
+
+        @out.puts 'not started'
+        return
+      end
+
+      journal = load_journal
+      validate_journal!(journal, mutation: false)
+      @out.puts journal.fetch('state')
+    end
+
+    def journal_context
+      {
+        'home' => @options[:home],
+        'runtimeDir' => @options[:runtime_dir],
+        'hostRoot' => @options[:host_root],
+        'workspaceRoot' => @options[:workspace_root]
+      }
+    end
+
+    def load_or_prepare_journal
+      if File.file?(@options[:journal])
+        @new_journal = false
+        return load_journal
+      end
+      raise Error, "unsafe journal path: #{@options[:journal]}" if path_exists?(@options[:journal])
+
+      @new_journal = true
+      build_journal
+    end
+
+    def build_journal
+      {
+        'schema' => SCHEMA,
+        'scope' => @options[:scope],
+        'state' => 'prepared',
+        'context' => journal_context,
+        'moves' => migration_pairs.map { |source, target| inspect_move(source, target) },
+        'profile' => @options[:scope] == 'user' ? inspect_compatibility_profile : nil,
+        'rewrites' => [],
+        'tmux' => nil
+      }
+    end
+
+    def inspect_compatibility_profile
+      state = File.join(@options[:home], '.local/state/vpsfree-workspaces')
+      package = current_profile_package(state)
+      metadata, contents = package_metadata(package)
+      validate_package_metadata!(
+        metadata,
+        namespace: 'vpsfree-workspaces',
+        router_socket: '/run/vpsfree-workspace-router/router.sock',
+        activation_aliases: ['VPSFREE_WORKSPACE_ACTIVATION']
+      )
+      {
+        'compatibilityPackage' => package,
+        'metadataSha256' => Digest::SHA256.hexdigest(contents)
+      }
+    end
+
+    def verify_forward_profile!(journal)
+      state = current_user_state_path(journal)
+      package = current_profile_package(state)
+      expected = journal.fetch('profile').fetch('compatibilityPackage')
+      raise Error, 'workspace profile no longer selects the compatibility package' unless package == expected
+
+      verify_profile_metadata!(journal.fetch('profile'), package)
+    end
+
+    def verify_reverse_profiles!(journal)
+      state = current_user_state_path(journal)
+      current = current_profile_package(state)
+      expected = journal.fetch('profile').fetch('compatibilityPackage')
+      if current == expected
+        verify_profile_metadata!(journal.fetch('profile'), current)
+        return
+      end
+
+      metadata, = package_metadata(current)
+      validate_package_metadata!(
+        metadata,
+        namespace: 'dev-workspaces',
+        router_socket: HOST_PATHS.fetch('routerSocket'),
+        activation_aliases: []
+      )
+
+      previous = previous_profile_package(state)
+      unless previous == expected
+        raise Error, 'previous workspace profile generation is not the recorded compatibility package'
+      end
+      verify_profile_metadata!(journal.fetch('profile'), previous)
+    end
+
+    def current_user_state_path(journal)
+      move = journal.fetch('moves').find do |entry|
+        entry.fetch('source') == File.join(@options[:home], '.local/state/vpsfree-workspaces')
+      end
+      current_move_path(move)
+    end
+
+    def current_profile_package(state)
+      profile, _generation = profile_link(state)
+      File.realpath(profile)
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP => e
+      raise Error, "workspace profile cannot be resolved: #{e.message}"
+    end
+
+    def previous_profile_package(state)
+      _profile, current = profile_link(state)
+      basename = File.join(state, 'profile')
+      generation = Dir["#{basename}-*-link"].filter_map do |path|
+        match = File.basename(path).match(/\Aprofile-(\d+)-link\z/)
+        match && match[1].to_i < current ? match[1].to_i : nil
+      end.max
+      raise Error, 'workspace profile has no previous compatibility generation' unless generation
+
+      File.realpath("#{basename}-#{generation}-link")
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP => e
+      raise Error, "previous workspace profile cannot be resolved: #{e.message}"
+    end
+
+    def profile_link(state)
+      profile = File.join(state, 'profile')
+      raise Error, "workspace profile is not a symlink: #{profile}" unless File.symlink?(profile)
+
+      target = File.expand_path(File.readlink(profile), state)
+      match = File.basename(target).match(/\Aprofile-(\d+)-link\z/)
+      unless match && target == File.join(state, File.basename(target)) && File.symlink?(target)
+        raise Error, "workspace profile has an invalid generation link: #{profile}"
+      end
+      [profile, match[1].to_i]
+    end
+
+    def package_metadata(package)
+      path = File.join(package, 'share/dev-workspace/package.json')
+      raise Error, "workspace package metadata is unsafe: #{path}" if File.symlink?(path) || !File.file?(path)
+
+      contents = File.binread(path, 64 * 1024 + 1)
+      raise Error, "workspace package metadata is too large: #{path}" if contents.bytesize > 64 * 1024
+
+      [JSON.parse(contents), contents]
+    rescue JSON::ParserError => e
+      raise Error, "workspace package metadata is malformed: #{e.message}"
+    end
+
+    def validate_package_metadata!(metadata, namespace:, router_socket:, activation_aliases:)
+      keys = %w[activationEnvironmentAliases routerSocket schema userNamespace]
+      aliases = metadata['activationEnvironmentAliases'] if metadata.is_a?(Hash)
+      valid = metadata.is_a?(Hash) && metadata.keys.sort == keys && metadata['schema'] == 1 &&
+              metadata['userNamespace'] == namespace && metadata['routerSocket'] == router_socket &&
+              aliases.is_a?(Array) && aliases.uniq == aliases &&
+              aliases.all? { |name| name.is_a?(String) && name.match?(/\A[A-Z][A-Z0-9_]*\z/) }
+      valid &&= aliases == activation_aliases
+      raise Error, "workspace package is not the required #{namespace} generation" unless valid
+    end
+
+    def verify_profile_metadata!(profile, package)
+      _metadata, contents = package_metadata(package)
+      return if Digest::SHA256.hexdigest(contents) == profile.fetch('metadataSha256')
+
+      raise Error, 'workspace compatibility package metadata changed'
+    end
+
+    def migration_pairs
+      if @options[:scope] == 'user'
+        home = @options[:home]
+        runtime = @options[:runtime_dir]
+        [
+          [File.join(home, '.config/vpsfree-workspaces'), File.join(home, '.config/dev-workspaces')],
+          [File.join(home, '.local/state/vpsfree-workspaces'), File.join(home, '.local/state/dev-workspaces')],
+          [File.join(runtime, 'vpsfree-workspaces'), File.join(runtime, 'dev-workspaces')]
+        ]
+      else
+        [
+          [
+            rooted('/var/lib/vpsfree-workspace-portal-password'),
+            rooted(File.dirname(HOST_PATHS.fetch('passwordFile')))
+          ],
+          [
+            rooted('/var/lib/vpsfree-workspace-portal-auth'),
+            rooted(File.dirname(HOST_PATHS.fetch('htpasswdFile')))
+          ],
+          [
+            rooted('/var/lib/vpsfree-workspace-pki'),
+            rooted(HOST_PATHS.fetch('caStateDirectory'))
+          ],
+          [
+            rooted('/var/lib/vpsfree-workspace-portal-tls'),
+            rooted(HOST_PATHS.fetch('certificateDirectory'))
+          ],
+          [
+            rooted('/var/lib/vpsfree-workspace-portal-public'),
+            rooted(File.dirname(HOST_PATHS.fetch('publicCaFile')))
+          ],
+          [
+            rooted('/run/vpsfree-workspace-router'),
+            rooted(File.dirname(HOST_PATHS.fetch('routerSocket')))
+          ],
+          [
+            rooted('/run/lock/vpsfree-workspace-portal-substrate.lock'),
+            rooted(HOST_PATHS.fetch('lockFile'))
+          ]
+        ]
+      end
+    end
+
+    def inspect_move(source, target)
+      reject_mount_tree(source)
+      reject_mount_tree(target)
+      source_exists = path_exists?(source)
+      raise Error, "migration target already exists: #{target}" if path_exists?(target)
+      if source_exists
+        stat = File.lstat(source)
+        raise Error, "migration source is a symlink: #{source}" if stat.symlink?
+        unless stat.directory? || stat.file?
+          raise Error, "migration source has unsupported type: #{source}"
+        end
+      end
+      source_exists ? validate_safe_existing_parents!(source) : validate_safe_parent_path!(source)
+      validate_safe_parent_path!(target)
+      {
+        'createdParents' => source_exists ? missing_parent_directories(target) : [],
+        'source' => source,
+        'target' => target,
+        'state' => source_exists ? 'pending' : 'skipped',
+        'fingerprint' => source_exists ? fingerprint(source) : nil,
+        'identity' => source_exists ? path_identity(source) : nil
+      }
+    end
+
+    def apply_moves(journal)
+      journal.fetch('moves').each do |move|
+        next unless move.fetch('state') == 'pending'
+
+        source = move.fetch('source')
+        target = move.fetch('target')
+        verify_created_parent_ownership!(journal, move) if path_exists?(source) && !path_exists?(target)
+        if !path_exists?(source) && path_exists?(target)
+          verify_identity!(target, move)
+          verify_fingerprint!(target, move)
+          fsync_rename_parents(source, target)
+        else
+          raise Error, "migration source disappeared: #{source}" unless path_exists?(source)
+          raise Error, "migration target appeared: #{target}" if path_exists?(target)
+          verify_identity!(source, move)
+          verify_fingerprint!(source, move)
+          durable_rename(source, target)
+        end
+        move['state'] = 'moved'
+        save_journal(journal)
+      end
+    end
+
+    def preflight_moves!(journal, forward:)
+      journal.fetch('moves').each do |move|
+        source = move.fetch('source')
+        target = move.fetch('target')
+        state = move.fetch('state')
+        if state == 'skipped'
+          raise Error, "migration source appeared: #{source}" if path_exists?(source)
+          raise Error, "migration target appeared: #{target}" if path_exists?(target)
+          validate_safe_parent_path!(source)
+          validate_safe_parent_path!(target)
+          next
+        end
+
+        expected_states = forward ? %w[pending moved] : %w[moved reversed]
+        raise Error, "unexpected move state #{state}" unless expected_states.include?(state)
+
+        expected_path = if forward
+                          state == 'pending' && path_exists?(source) ? source : target
+                        else
+                          state == 'moved' && path_exists?(target) ? target : source
+                        end
+        other_path = expected_path == source ? target : source
+        unless path_exists?(expected_path) && !path_exists?(other_path)
+          raise Error, "migration move is not isolated: #{source} and #{target}"
+        end
+        validate_safe_existing_parents!(expected_path)
+        validate_safe_parent_path!(other_path)
+        reject_mount_tree(expected_path)
+        reject_mount_tree(other_path)
+        verify_identity!(expected_path, move)
+        if @options[:scope] == 'host' || (forward && state == 'pending')
+          verify_fingerprint!(expected_path, move)
+        end
+      end
+    end
+
+    def reverse_moves(journal)
+      journal.fetch('moves').reverse_each do |move|
+        next if %w[skipped reversed].include?(move.fetch('state'))
+        raise Error, "unexpected move state #{move.fetch('state')}" unless move.fetch('state') == 'moved'
+
+        source = move.fetch('source')
+        target = move.fetch('target')
+        if path_exists?(source) && !path_exists?(target)
+          verify_identity!(source, move)
+          verify_fingerprint!(source, move) if @options[:scope] == 'host'
+          fsync_existing_rename_parents(target, source)
+        else
+          raise Error, "rollback source target is missing: #{target}" unless path_exists?(target)
+          raise Error, "rollback destination already exists: #{source}" if path_exists?(source)
+          verify_identity!(target, move)
+          verify_fingerprint!(target, move) if @options[:scope] == 'host'
+          durable_rename(target, source)
+        end
+        remove_created_parents(move)
+        move['state'] = 'reversed'
+        save_journal(journal)
+      end
+    end
+
+    def missing_parent_directories(path)
+      directories = []
+      current = File.dirname(path)
+      stop = @options[:scope] == 'user' ? @options[:home] : @options[:host_root]
+      until current == stop || current == '/'
+        break if path_exists?(current)
+
+        directories << current
+        current = File.dirname(current)
+      end
+      directories
+    end
+
+    def verify_created_parent_ownership!(journal, move)
+      owned = journal.fetch('moves').filter_map do |candidate|
+        candidate.fetch('createdParents') if candidate.fetch('state') == 'moved'
+      end.flatten.uniq
+      unexpected = move.fetch('createdParents').select do |path|
+        path_exists?(path) && !owned.include?(path)
+      end
+      return if unexpected.empty?
+
+      raise Error, "migration target parent appeared after preparation: #{unexpected.first}"
+    end
+
+    def remove_created_parents(move)
+      move.fetch('createdParents').each do |directory|
+        next unless File.directory?(directory) && Dir.empty?(directory)
+
+        parent = File.dirname(directory)
+        Dir.rmdir(directory)
+        fsync_directory(parent)
+      end
+    end
+
+    def verify_fingerprint!(path, move)
+      return if fingerprint(path) == move.fetch('fingerprint')
+
+      raise Error, "migration tree changed since preparation: #{path}"
+    end
+
+    def verify_identity!(path, move)
+      return if path_identity(path) == move.fetch('identity')
+
+      raise Error, "migration path identity changed since preparation: #{path}"
+    end
+
+    def lock_mutation_files(journal, forward:)
+      if @options[:scope] == 'host'
+        move = journal.fetch('moves').find { |item| item.fetch('source').end_with?('substrate.lock') }
+        path = current_move_path(move)
+        return path_exists?(path) ? [lock_file(path, 'substrate operation')] : []
+      end
+
+      runtime_move = journal.fetch('moves').find do |move|
+        move.fetch('source') == File.join(@options[:runtime_dir], 'vpsfree-workspaces')
+      end
+      state_move = journal.fetch('moves').find do |move|
+        move.fetch('source') == File.join(@options[:home], '.local/state/vpsfree-workspaces')
+      end
+      runtime = current_move_path(runtime_move)
+      state = current_move_path(state_move)
+      paths = Dir.glob(File.join(runtime, '*', 'authority', '*.lock'))
+      paths.concat(Dir.glob(File.join(@options[:workspace_root], 'worktrees', '.locks', '*.lock')))
+      transition = File.join(state, 'transition.lock')
+      raise Error, "workspace transition lock is missing: #{transition}" unless path_exists?(transition)
+      paths << transition
+      locks = []
+      paths.uniq.sort.each { |path| locks << lock_file(path, 'lifecycle operation') }
+      locks
+    rescue StandardError
+      locks&.each(&:close)
+      raise
+    end
+
+    def current_move_path(move)
+      source = move.fetch('source')
+      target = move.fetch('target')
+      source_exists = path_exists?(source)
+      target_exists = path_exists?(target)
+      raise Error, "migration move occupies both paths: #{source} and #{target}" if source_exists && target_exists
+
+      return source if source_exists
+      return target if target_exists
+
+      move.fetch('state') == 'moved' ? target : source
+    end
+
+    def lock_file(path, description)
+      raise Error, "unsafe lock path: #{path}" if File.symlink?(path) || !File.file?(path)
+      stat = File.stat(path)
+      unless stat.uid == Process.euid && (stat.mode & 0o7777) == 0o600
+        raise Error, "#{description} lock must be an owned mode-0600 file: #{path}"
+      end
+      flags = File::RDWR
+      flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+      file = File.open(path, flags)
+      unless file.flock(File::LOCK_EX | File::LOCK_NB)
+        file.close
+        raise Error, "#{description} is active: #{path}"
+      end
+      file
+    end
+
+    def prepare_rewrites(journal, persist: true)
+      return unless journal.fetch('rewrites').empty?
+
+      journal['rewrites'] = rewrite_candidates(journal).map do |source|
+        path = migrated_rewrite_path(source, journal)
+        validate_rewrite_source!(source, inventory_path: path)
+        original = File.binread(source, MAX_REWRITE_BYTES + 1)
+        raise Error, "rewrite source is too large: #{source}" if original.bytesize > MAX_REWRITE_BYTES
+        validate_machine_state!(source, original, inventory_path: path)
+        updated = rewrite_machine_state(path, original)
+        validate_machine_state!(source, updated, inventory_path: path)
+        stat = File.stat(source)
+        {
+          'path' => path,
+          'state' => 'pending',
+          'original' => Base64.strict_encode64(original),
+          'updated' => Base64.strict_encode64(updated),
+          'originalSha256' => Digest::SHA256.hexdigest(original),
+          'updatedSha256' => Digest::SHA256.hexdigest(updated),
+          'mode' => stat.mode & 0o7777,
+          'uid' => stat.uid,
+          'gid' => stat.gid
+        }
+      end
+      save_journal(journal) if persist
+    end
+
+    def rewrite_candidates(journal)
+      runtime_move = journal.fetch('moves').find do |move|
+        move.fetch('source') == File.join(@options[:runtime_dir], 'vpsfree-workspaces')
+      end
+      config_move = journal.fetch('moves').find do |move|
+        move.fetch('source') == File.join(@options[:home], '.config/vpsfree-workspaces')
+      end
+      runtime_root = current_move_path(runtime_move)
+      candidates = Dir.glob(File.join(runtime_root, '*', 'authority', '*.json'))
+      config = File.join(current_move_path(config_move), 'registry.json')
+      candidates << config if path_exists?(config)
+      %w[work archive].each do |tracking_root|
+        candidates.concat(Dir.glob(File.join(@options[:workspace_root], tracking_root, '*', 'portal.yml')))
+      end
+      candidates.uniq.sort
+    end
+
+    def preflight_rewrites!(journal, forward:)
+      journal.fetch('rewrites').each do |rewrite|
+        path = current_rewrite_path(rewrite.fetch('path'), journal)
+        validate_rewrite_source!(path, inventory_path: rewrite.fetch('path'))
+        verify_rewrite_metadata!(path, rewrite)
+        contents = File.binread(path, MAX_REWRITE_BYTES + 1)
+        raise Error, "rewrite source is too large: #{path}" if contents.bytesize > MAX_REWRITE_BYTES
+        original = Base64.strict_decode64(rewrite.fetch('original'))
+        updated = Base64.strict_decode64(rewrite.fetch('updated'))
+        allowed = if forward
+                    rewrite.fetch('state') == 'pending' ? [original, updated] : [updated]
+                  else
+                    rewrite.fetch('state') == 'applied' ? [updated, original] : [original]
+                  end
+        unless allowed.include?(contents)
+          raise Error, "rewrite source changed after journal preparation: #{path}"
+        end
+        validate_machine_state!(path, contents, inventory_path: rewrite.fetch('path'))
+      end
+    rescue ArgumentError
+      raise Error, 'migration journal has invalid base64 rewrite bytes'
+    end
+
+    def preflight_inventory!(journal, forward:)
+      expected_rewrites = journal.fetch('rewrites').map { |rewrite| rewrite.fetch('path') }.sort
+      actual_rewrites = rewrite_candidates(journal).map do |path|
+        migrated_rewrite_path(path, journal)
+      end.sort
+      unless actual_rewrites == expected_rewrites
+        raise Error, 'workspace rewrite inventory changed after journal preparation'
+      end
+
+      preflight_tmux_inventory!(journal, forward:)
+      validate_runtime_authorities_against_tmux!(journal, migrated: !forward)
+    end
+
+    def migrated_rewrite_path(path, journal)
+      journal.fetch('moves').each do |move|
+        source = move.fetch('source')
+        next unless path == source || path.start_with?("#{source}/")
+
+        return move.fetch('target') + path.delete_prefix(source)
+      end
+      path
+    end
+
+    def current_rewrite_path(path, journal)
+      journal.fetch('moves').each do |move|
+        target = move.fetch('target')
+        next unless path == target || path.start_with?("#{target}/")
+
+        source_path = move.fetch('source') + path.delete_prefix(target)
+        return source_path if path_exists?(source_path)
+      end
+      path
+    end
+
+    def validate_rewrite_source!(path, inventory_path: path)
+      validate_safe_existing_parents!(path)
+      raise Error, "unsafe rewrite source: #{path}" if File.symlink?(path) || !File.file?(path)
+      unless rewrite_source_owned?(path)
+        raise Error, "rewrite source is not owned by the current user: #{path}"
+      end
+      validate_rewrite_group!(File.stat(path).gid, path)
+      unless rewrite_path_allowed?(inventory_path)
+        raise Error, "rewrite source is outside the migration inventory: #{path}"
+      end
+      validate_authority_metadata!(path) if runtime_authority_identity(inventory_path)
+    end
+
+    def rewrite_source_owned?(path)
+      File.stat(path).uid == Process.euid
+    end
+
+    def validate_rewrite_group!(gid, path)
+      return if Process.euid.zero? || gid == Process.egid || Process.groups.include?(gid)
+
+      raise Error, "rewrite source group cannot be preserved: #{path}"
+    end
+
+    def verify_rewrite_metadata!(path, rewrite)
+      stat = File.stat(path)
+      expected = [rewrite.fetch('mode'), rewrite.fetch('uid'), rewrite.fetch('gid')]
+      actual = [stat.mode & 0o7777, stat.uid, stat.gid]
+      raise Error, "rewrite source metadata changed after journal preparation: #{path}" unless actual == expected
+    end
+
+    def rewrite_path_allowed?(path)
+      path == File.join(@options[:home], '.config/dev-workspaces/registry.json') ||
+        !runtime_authority_identity(path).nil? || portal_manifest_path?(path)
+    end
+
+    def validate_machine_state!(path, contents, inventory_path: path)
+      return unless inventory_path.end_with?('.json')
+
+      data = JSON.parse(contents)
+      if (identity = runtime_authority_identity(inventory_path))
+        validate_runtime_authority!(data, identity, path, contents.bytesize)
+      elsif inventory_path.end_with?('/registry.json')
+        unless data.is_a?(Hash) && data['schema'] == 1 && data['workspaces'].is_a?(Array)
+          raise Error, "workspace registry is malformed: #{path}"
+        end
+      end
+    rescue JSON::ParserError => e
+      raise Error, "malformed machine state #{path}: #{e.message}"
+    end
+
+    def runtime_authority_identity(path)
+      root = File.join(@options[:runtime_dir], 'dev-workspaces')
+      return unless path.start_with?("#{root}/")
+
+      parts = path.delete_prefix("#{root}/").split('/', -1)
+      return unless parts.length == 3
+
+      workspace, authority, filename = parts
+      return unless workspace&.match?(NAME) && authority == 'authority' && filename&.end_with?('.json')
+
+      slug = filename.delete_suffix('.json')
+      [workspace, slug] if slug.match?(SLUG)
+    end
+
+    def portal_manifest_path?(path)
+      root = @options[:workspace_root].to_s
+      return false unless path.start_with?("#{root}/")
+
+      parts = path.delete_prefix("#{root}/").split('/', -1)
+      return false unless parts.length == 3
+
+      tracking_root, slug, filename = parts
+      %w[work archive].include?(tracking_root) && slug&.match?(SLUG) && filename == 'portal.yml'
+    end
+
+    def validate_runtime_authority!(data, identity, path, size)
+      _workspace_name, slug = identity
+      required = data.is_a?(Hash) && data.keys.all? { |key| key.is_a?(String) } &&
+                 (data.keys - AUTHORITY_KEYS).empty? &&
+                 (AUTHORITY_REQUIRED_KEYS - data.keys).empty?
+      unless required && size <= MAX_AUTHORITY_BYTES && data['schema'].is_a?(Integer) && data['schema'] == 1 &&
+             data['state'] == 'ready' &&
+             data['slug'] == slug && data['workspace'] == @options[:workspace_root] &&
+             valid_socket_path?(data['tmux_socket']) && data['tmux_session_id'].is_a?(String) &&
+             data['tmux_session_id'].match?(SESSION_ID)
+        raise Error, "runtime authority is invalid or not ready: #{path}"
+      end
+      if data.key?('tmux_identity') &&
+         (!data['tmux_identity'].is_a?(String) || !data['tmux_identity'].match?(DIGEST))
+        raise Error, "runtime authority has invalid tmux identity: #{path}"
+      end
+      present = AUTHORITY_CODEX_KEYS.count { |key| data.key?(key) }
+      return if present.zero?
+
+      unless present == AUTHORITY_CODEX_KEYS.length && data['codex_thread_id'].is_a?(String) &&
+             !data['codex_thread_id'].empty? && valid_socket_path?(data['codex_socket_path']) &&
+             data['codex_client_version'].is_a?(String) && data['codex_client_version'].match?(CLIENT_VERSION)
+        raise Error, "runtime authority has invalid Codex identity: #{path}"
+      end
+    end
+
+    def validate_authority_metadata!(path)
+      stat = File.stat(path)
+      directory = File.dirname(path)
+      directory_stat = File.stat(directory)
+      unless stat.uid == Process.euid && (stat.mode & 0o777) == 0o600 &&
+             directory_stat.uid == Process.euid && (directory_stat.mode & 0o777) == 0o700
+        raise Error, "runtime authority path has unsafe metadata: #{path}"
+      end
+    end
+
+    def valid_socket_path?(value)
+      value.is_a?(String) && value.bytesize <= 4096 && value.match?(SOCKET_PATH) &&
+        Pathname.new(value).cleanpath.to_s == value
+    end
+
+    def apply_rewrites(journal)
+      journal.fetch('rewrites').each do |rewrite|
+        next unless rewrite.fetch('state') == 'pending'
+
+        path = rewrite.fetch('path')
+        validate_rewrite_source!(path)
+        current = File.binread(path)
+        original = Base64.strict_decode64(rewrite.fetch('original'))
+        updated = Base64.strict_decode64(rewrite.fetch('updated'))
+        if current == original
+          atomic_write(path, updated, rewrite) unless updated == original
+        elsif current != updated
+          raise Error, "rewrite source changed after journal preparation: #{path}"
+        end
+        rewrite['state'] = 'applied'
+        save_journal(journal)
+      end
+    end
+
+    def reverse_rewrites(journal)
+      journal.fetch('rewrites').reverse_each do |rewrite|
+        next if rewrite.fetch('state') == 'reversed'
+        raise Error, "unexpected rewrite state #{rewrite.fetch('state')}" unless rewrite.fetch('state') == 'applied'
+
+        path = rewrite.fetch('path')
+        validate_rewrite_source!(path)
+        current = File.binread(path)
+        original = Base64.strict_decode64(rewrite.fetch('original'))
+        updated = Base64.strict_decode64(rewrite.fetch('updated'))
+        if current == updated
+          atomic_write(path, original, rewrite) unless updated == original
+        elsif current != original
+          raise Error, "rewritten file changed since migration: #{path}"
+        end
+        rewrite['state'] = 'reversed'
+        save_journal(journal)
+      end
+    end
+
+    def rewrite_machine_state(path, contents)
+      if runtime_authority_identity(path)
+        rewrite_runtime_authority(contents)
+      elsif path == File.join(@options[:home], '.config/dev-workspaces/registry.json')
+        contents
+      elsif portal_manifest_path?(path)
+        rewrite_portal_manifest(contents, path)
+      else
+        raise Error, "unsupported migration rewrite path: #{path}"
+      end
+    end
+
+    def rewrite_runtime_authority(contents)
+      data = JSON.parse(contents)
+      changed = false
+      %w[tmux_socket codex_socket_path].each do |name|
+        next unless data.key?(name)
+
+        updated = replace_path_namespaces(data.fetch(name))
+        next if updated == data.fetch(name)
+
+        data[name] = updated
+        changed = true
+      end
+      return contents unless changed
+
+      JSON.generate(data) + (contents.end_with?("\n") ? "\n" : '')
+    rescue JSON::ParserError => e
+      raise Error, "cannot rewrite runtime authority: #{e.message}"
+    end
+
+    def rewrite_portal_manifest(contents, path)
+      stream = Psych.parse_stream(contents, filename: path)
+      documents = stream.children
+      unless documents.length == 1 && documents.first.root.is_a?(Psych::Nodes::Mapping)
+        raise Error, "portal manifest is not one YAML mapping: #{path}"
+      end
+      codex = yaml_mapping_value(documents.first.root, 'codex', path)
+      return contents unless codex
+      unless codex.is_a?(Psych::Nodes::Mapping)
+        raise Error, "portal manifest Codex state is malformed: #{path}"
+      end
+      socket = yaml_mapping_value(codex, 'socket_path', path)
+      return contents unless socket
+      unless socket.is_a?(Psych::Nodes::Scalar) && socket.start_line == socket.end_line
+        raise Error, "portal manifest Codex socket is malformed: #{path}"
+      end
+      updated = replace_path_namespaces(socket.value)
+      return contents if updated == socket.value
+      unless valid_socket_path?(updated)
+        raise Error, "portal manifest Codex socket is invalid: #{path}"
+      end
+
+      replacement = case socket.style
+                    when Psych::Nodes::Scalar::PLAIN
+                      updated
+                    when Psych::Nodes::Scalar::SINGLE_QUOTED
+                      "'#{updated.gsub("'", "''")}'"
+                    when Psych::Nodes::Scalar::DOUBLE_QUOTED
+                      JSON.generate(updated)
+                    else
+                      raise Error, "portal manifest Codex socket uses an unsupported scalar style: #{path}"
+                    end
+      lines = contents.lines
+      line = lines.fetch(socket.start_line)
+      lines[socket.start_line] =
+        line[0...socket.start_column] + replacement + line[socket.end_column..]
+      lines.join
+    rescue Psych::SyntaxError, IndexError => e
+      raise Error, "cannot rewrite portal manifest #{path}: #{e.message}"
+    end
+
+    def yaml_mapping_value(mapping, name, path)
+      matches = mapping.children.each_slice(2).select do |key, _value|
+        key.is_a?(Psych::Nodes::Scalar) && key.value == name
+      end
+      raise Error, "portal manifest has duplicate #{name} keys: #{path}" if matches.length > 1
+
+      matches.first&.last
+    end
+
+    def replace_path_namespaces(content)
+      path_replacements.each do |old, new|
+        return new if content == old
+        return new + content.delete_prefix(old) if content.start_with?("#{old}/")
+      end
+
+      content.dup
+    end
+
+    def path_replacements
+      old_runtime = File.join(@options[:runtime_dir], 'vpsfree-workspaces')
+      new_runtime = File.join(@options[:runtime_dir], 'dev-workspaces')
+      old_config = File.join(@options[:home], '.config/vpsfree-workspaces')
+      new_config = File.join(@options[:home], '.config/dev-workspaces')
+      old_state = File.join(@options[:home], '.local/state/vpsfree-workspaces')
+      new_state = File.join(@options[:home], '.local/state/dev-workspaces')
+      [
+        [old_runtime, new_runtime], [old_config, new_config], [old_state, new_state],
+        ['/run/vpsfree-workspace-router/router.sock', HOST_PATHS.fetch('routerSocket')],
+        ['/run/lock/vpsfree-workspace-portal-substrate.lock', HOST_PATHS.fetch('lockFile')],
+        ['/var/lib/vpsfree-workspace-portal-password/password', HOST_PATHS.fetch('passwordFile')],
+        ['/var/lib/vpsfree-workspace-portal-auth/htpasswd', HOST_PATHS.fetch('htpasswdFile')],
+        ['/var/lib/vpsfree-workspace-pki', HOST_PATHS.fetch('caStateDirectory')],
+        ['/var/lib/vpsfree-workspace-portal-tls', HOST_PATHS.fetch('certificateDirectory')],
+        ['/var/lib/vpsfree-workspace-portal-public/ca.pem', HOST_PATHS.fetch('publicCaFile')]
+      ]
+    end
+
+    def prepare_tmux(journal, persist: true)
+      return if journal['tmux']
+
+      old_root = File.join(@options[:runtime_dir], 'vpsfree-workspaces')
+      servers = Dir.glob(File.join(old_root, '*', 'tmux.sock')).sort.map do |socket|
+        workspace = File.basename(File.dirname(socket))
+        raise Error, "invalid tmux workspace name: #{workspace}" unless workspace.match?(NAME)
+
+        {
+          'workspace' => workspace,
+          'oldSocket' => socket,
+          'newSocket' => File.join(@options[:runtime_dir], 'dev-workspaces', workspace, 'tmux.sock'),
+          'identity' => tmux_socket_identity(socket),
+          'forwardHandoff' => 'pending',
+          'reverseHandoff' => 'pending'
+        }
+      end
+      journal['tmux'] = {
+        'servers' => servers,
+        'sessions' => servers.flat_map { |server| capture_tmux(server) },
+        'forwardDropIn' => 'pending',
+        'reverseDropIn' => 'pending'
+      }
+      save_journal(journal) if persist
+    end
+
+    def capture_tmux(server)
+      socket = server.fetch('oldSocket')
+      tmux(socket, 'list-sessions', '-F', '#{session_id}').lines.map(&:strip).reject(&:empty?).map do |session|
+        raise Error, "invalid tmux session identity: #{session}" unless session.match?(SESSION_ID)
+
+        name = tmux(socket, 'display-message', '-p', '-t', "#{session}:", '#{session_name}').delete_suffix("\n")
+        if name.empty? || name.include?("\0") || name.include?("\n")
+          raise Error, "invalid tmux session name: #{session}"
+        end
+        options = capture_tmux_options(
+          socket, session, SESSION_OPTION_NAMES,
+          path_names: SESSION_PATH_OPTION_NAMES, window: false
+        )
+        environment = ENVIRONMENT_NAMES.map do |new_name|
+          old_name = "VPSFREE_#{new_name}"
+          original_value = tmux_environment(socket, session, old_name)
+          existing_value = tmux_environment(socket, session, new_name)
+          raise Error, "tmux environment already uses the new namespace: #{session} #{new_name}" if existing_value
+
+          [
+            old_name, new_name, original_value,
+            migrated_tmux_value(original_value, path: ENVIRONMENT_PATH_NAMES.include?(new_name))
+          ]
+        end
+        windows = tmux_window_ids(socket, session).map do |window|
+          {
+            'window' => window,
+            'options' => capture_tmux_options(
+              socket, window, WINDOW_OPTION_NAMES,
+              path_names: WINDOW_PATH_OPTION_NAMES, window: true
+            )
+          }
+        end
+        {
+          'workspace' => server.fetch('workspace'),
+          'session' => session,
+          'name' => name,
+          'options' => options,
+          'environment' => environment,
+          'windows' => windows,
+          'state' => 'pending'
+        }
+      end
+    end
+
+    def capture_tmux_options(socket, target, names, path_names:, window:)
+      names.map do |suffix|
+        old_name = "@vpsfree_dev_#{suffix}"
+        new_name = "@dev_#{suffix}"
+        original_value = tmux_option(socket, target, old_name, window:)
+        existing_value = tmux_option(socket, target, new_name, window:)
+        raise Error, "tmux option already uses the new namespace: #{target} #{new_name}" if existing_value
+
+        [
+          old_name, new_name, original_value,
+          migrated_tmux_value(original_value, path: path_names.include?(suffix))
+        ]
+      end
+    end
+
+    def preflight_tmux_inventory!(journal, forward:)
+      data = journal.fetch('tmux')
+      runtime_move = journal.fetch('moves').find do |move|
+        move.fetch('source') == File.join(@options[:runtime_dir], 'vpsfree-workspaces')
+      end
+      runtime_root = current_move_path(runtime_move)
+      actual_sockets = Dir.glob(File.join(runtime_root, '*', 'tmux.sock')).sort
+      expected_sockets = data.fetch('servers').map do |server|
+        File.join(runtime_root, server.fetch('workspace'), 'tmux.sock')
+      end.sort
+      raise Error, 'tmux server inventory changed after journal preparation' unless actual_sockets == expected_sockets
+
+      data.fetch('servers').each do |server|
+        socket = File.join(runtime_root, server.fetch('workspace'), 'tmux.sock')
+        verify_tmux_socket_identity!(socket, server.fetch('identity'))
+        records = data.fetch('sessions').select do |record|
+          record.fetch('workspace') == server.fetch('workspace')
+        end
+        actual_sessions = tmux_session_ids(socket)
+        expected_sessions = records.map { |record| record.fetch('session') }.sort
+        unless actual_sessions == expected_sessions
+          raise Error, "tmux session inventory changed after journal preparation: #{server.fetch('workspace')}"
+        end
+        records.each { |record| preflight_tmux_record!(record, socket, forward:) }
+      end
+    end
+
+    def preflight_tmux_record!(record, socket, forward:)
+      session = record.fetch('session')
+      actual_name = tmux(socket, 'display-message', '-p', '-t', "#{session}:", '#{session_name}').delete_suffix("\n")
+      raise Error, "tmux session name changed during migration: #{session}" unless actual_name == record.fetch('name')
+      expected_windows = record.fetch('windows').map { |window| window.fetch('window') }.sort
+      actual_windows = tmux_window_ids(socket, session)
+      unless actual_windows == expected_windows
+        raise Error, "tmux window inventory changed after journal preparation: #{session}"
+      end
+
+      completed = forward ? record.fetch('state') == 'forward' : record.fetch('state') == 'reversed'
+      record.fetch('options').each do |old_name, new_name, original_value, migrated_value|
+        preflight_tmux_value!(
+          socket, session, old_name, new_name, original_value, migrated_value,
+          forward:, environment: false, window: false, completed:
+        )
+      end
+      record.fetch('environment').each do |old_name, new_name, original_value, migrated_value|
+        preflight_tmux_value!(
+          socket, session, old_name, new_name, original_value, migrated_value,
+          forward:, environment: true, window: false, completed:
+        )
+      end
+      record.fetch('windows').each do |window|
+        window.fetch('options').each do |old_name, new_name, original_value, migrated_value|
+          preflight_tmux_value!(
+            socket, window.fetch('window'), old_name, new_name, original_value, migrated_value,
+            forward:, environment: false, window: true, completed:
+          )
+        end
+      end
+    end
+
+    def validate_runtime_authorities_against_tmux!(journal, migrated:)
+      authorities = journal.fetch('rewrites').filter_map do |rewrite|
+        identity = runtime_authority_identity(rewrite.fetch('path'))
+        next unless identity
+
+        snapshot = Base64.strict_decode64(rewrite.fetch(migrated ? 'updated' : 'original'))
+        authority = JSON.parse(snapshot)
+        validate_runtime_authority!(authority, identity, rewrite.fetch('path'), snapshot.bytesize)
+        [identity, authority]
+      end
+      servers = journal.fetch('tmux').fetch('servers')
+      sessions = journal.fetch('tmux').fetch('sessions')
+      authorities.each do |(workspace, slug), authority|
+        server = servers.find { |candidate| candidate.fetch('workspace') == workspace }
+        record = sessions.find do |candidate|
+          candidate.fetch('workspace') == workspace &&
+            candidate.fetch('session') == authority.fetch('tmux_session_id')
+        end
+        socket = server&.fetch(migrated ? 'newSocket' : 'oldSocket')
+        unless server && record && socket == authority.fetch('tmux_socket') &&
+               record.fetch('name') == slug &&
+               runtime_authority_tmux_metadata_matches?(authority, record, migrated:)
+          raise Error, "runtime authority does not match its live tmux session: #{workspace}/#{slug}"
+        end
+      end
+    rescue ArgumentError, JSON::ParserError
+      raise Error, 'migration journal contains an invalid runtime authority snapshot'
+    end
+
+    def runtime_authority_tmux_metadata_matches?(authority, record, migrated:)
+      index = migrated ? [1, 3] : [0, 2]
+      options = record.fetch('options').to_h { |entry| [entry.fetch(index[0]), entry.fetch(index[1])] }
+      environment = record.fetch('environment').to_h { |entry| [entry.fetch(index[0]), entry.fetch(index[1])] }
+      option_prefix = migrated ? '@dev_' : '@vpsfree_dev_'
+      environment_prefix = migrated ? '' : 'VPSFREE_'
+      return false unless options["#{option_prefix}session"] == '1' &&
+                          options["#{option_prefix}session_slug"] == authority.fetch('slug') &&
+                          environment["#{environment_prefix}DEV_SESSION_WORKSPACE"] == authority.fetch('workspace') &&
+                          environment["#{environment_prefix}DEV_SESSION_SLUG"] == authority.fetch('slug')
+
+      codex_present = authority.key?('codex_thread_id')
+      return false unless options["#{option_prefix}session_codex_thread"] == authority['codex_thread_id'] &&
+                          options["#{option_prefix}session_codex_socket"] == authority['codex_socket_path'] &&
+                          options["#{option_prefix}session_codex_version"] == authority['codex_client_version']
+      return false if codex_present && !options["#{option_prefix}session_codex_pane"].to_s.match?(PANE_ID)
+
+      identity = environment["#{environment_prefix}DEV_SESSION_TMUX_IDENTITY"]
+      return false unless authority.key?('tmux_identity') && identity == authority['tmux_identity']
+
+      true
+    end
+
+    def preflight_tmux_value!(
+      socket, target, old_name, new_name, original_value, migrated_value,
+      forward:, environment:, window:, completed:
+    )
+      source, destination = forward ? [old_name, new_name] : [new_name, old_name]
+      source_expected, destination_expected = forward ?
+        [original_value, migrated_value] : [migrated_value, original_value]
+      source_value = read_tmux_value(socket, target, source, environment:, window:)
+      destination_value = read_tmux_value(socket, target, destination, environment:, window:)
+      valid = if completed
+                source_value.nil? && destination_value == destination_expected
+              else
+                (source_value == source_expected && [nil, destination_expected].include?(destination_value)) ||
+                  (source_value.nil? && destination_value == destination_expected)
+              end
+      raise Error, "tmux metadata changed during migration: #{target} #{source}" unless valid
+    end
+
+    def tmux_session_ids(socket)
+      sessions = tmux(socket, 'list-sessions', '-F', '#{session_id}').lines.map(&:strip).reject(&:empty?)
+      unless sessions.all? { |session| session.match?(SESSION_ID) } && sessions.uniq.length == sessions.length
+        raise Error, "invalid tmux session inventory: #{socket}"
+      end
+
+      sessions.sort
+    end
+
+    def tmux_window_ids(socket, session)
+      windows = tmux(
+        socket, 'list-windows', '-t', session, '-F', '#{window_id}'
+      ).lines.map(&:strip).reject(&:empty?)
+      unless windows.all? { |window| window.match?(WINDOW_ID) } && windows.uniq.length == windows.length
+        raise Error, "invalid tmux window inventory: #{session}"
+      end
+
+      windows.sort
+    end
+
+    def handoff_tmux_servers(journal, forward:)
+      tmux_data = journal.fetch('tmux')
+      servers = tmux_data.fetch('servers')
+      return if servers.empty?
+
+      state_key = forward ? 'forwardHandoff' : 'reverseHandoff'
+      pending = servers.reject { |server| server.fetch(state_key) == 'ready' }
+      drop_state = forward ? 'forwardDropIn' : 'reverseDropIn'
+      if pending.empty?
+        if tmux_data.fetch(drop_state) == 'installed'
+          remove_tmux_drop_in(tmux_data, drop_state)
+          save_journal(journal)
+        end
+        return
+      end
+
+      install_tmux_drop_in(tmux_data, drop_state)
+      pending.each do |server|
+        socket = server.fetch(forward ? 'oldSocket' : 'newSocket')
+        verify_tmux_socket_identity!(socket, server.fetch('identity'))
+        unit = "workspace-tmux@#{server.fetch('workspace')}.service"
+        properties = systemd_properties(unit)
+        main_pid = Integer(properties.fetch('MainPID'))
+        if main_pid.positive?
+          unless properties.fetch('ActiveState') == 'active' && properties.fetch('KillMode') == 'process' &&
+                 properties.fetch('Restart') == 'no'
+            raise Error, "tmux keeper is not ready for handoff: #{unit}"
+          end
+          systemctl!('kill', '--kill-who=main', '--signal=KILL', unit)
+          wait_for_keeper_exit(unit)
+        end
+        tmux(socket, 'has-session', '-t', '__workspace_portal_keeper')
+        server[state_key] = 'ready'
+        save_journal(journal)
+      end
+      remove_tmux_drop_in(tmux_data, drop_state)
+      save_journal(journal)
+    end
+
+    def tmux_drop_in
+      File.join(@options[:runtime_dir], 'systemd/user/workspace-tmux@.service.d',
+                'vpsfree-dev-workspace-migration.conf')
+    end
+
+    def install_tmux_drop_in(tmux_data, state_key)
+      path = tmux_drop_in
+      state = tmux_data.fetch(state_key)
+      if path_exists?(path)
+        unless File.file?(path) && !File.symlink?(path) && File.binread(path) == DROP_IN_CONTENT
+          raise Error, "tmux migration drop-in is occupied: #{path}"
+        end
+      else
+        raise Error, "unexpected tmux drop-in state: #{state}" if state == 'installed'
+        atomic_write(path, DROP_IN_CONTENT, 'mode' => 0o600)
+      end
+      systemctl!('daemon-reload')
+      tmux_data[state_key] = 'installed'
+    end
+
+    def remove_tmux_drop_in(tmux_data, state_key)
+      path = tmux_drop_in
+      if path_exists?(path)
+        unless File.file?(path) && !File.symlink?(path) && File.binread(path) == DROP_IN_CONTENT
+          raise Error, "tmux migration drop-in changed unexpectedly: #{path}"
+        end
+        File.unlink(path)
+        fsync_directory(File.dirname(path))
+      end
+      systemctl!('daemon-reload')
+      tmux_data[state_key] = 'removed'
+      directory = File.dirname(path)
+      Dir.rmdir(directory) if File.directory?(directory) && Dir.empty?(directory)
+    end
+
+    def systemd_properties(unit)
+      output = systemctl_capture('show', unit, '--property=ActiveState', '--property=MainPID',
+                                 '--property=KillMode', '--property=Restart')
+      properties = output.lines.filter_map do |line|
+        key, value = line.chomp.split('=', 2)
+        [key, value] if value
+      end.to_h
+      unless properties.keys.sort == %w[ActiveState KillMode MainPID Restart]
+        raise Error, "systemd returned incomplete tmux keeper state: #{unit}"
+      end
+      properties
+    end
+
+    def wait_for_keeper_exit(unit)
+      50.times do
+        return if Integer(systemd_properties(unit).fetch('MainPID')).zero?
+        sleep 0.1
+      end
+      raise Error, "tmux keeper did not stop for handoff: #{unit}"
+    end
+
+    def systemctl!(*arguments)
+      _output, error, status = Open3.capture3(@options[:systemctl], '--user', *arguments)
+      raise Error, "systemctl failed: #{error.strip}" unless status.success?
+    end
+
+    def systemctl_capture(*arguments)
+      output, error, status = Open3.capture3(@options[:systemctl], '--user', *arguments)
+      raise Error, "systemctl failed: #{error.strip}" unless status.success?
+      output
+    end
+
+    def migrate_tmux_metadata(journal, forward:)
+      journal.fetch('tmux').fetch('sessions').each do |record|
+        next if forward && record.fetch('state') == 'forward'
+        next if !forward && record.fetch('state') == 'reversed'
+        expected = forward ? 'pending' : 'forward'
+        raise Error, "unexpected tmux record state #{record.fetch('state')}" unless record.fetch('state') == expected
+
+        server = journal.fetch('tmux').fetch('servers').find do |item|
+          item.fetch('workspace') == record.fetch('workspace')
+        end
+        socket = server.fetch('newSocket')
+        verify_tmux_socket_identity!(socket, server.fetch('identity'))
+        apply_tmux_record(record, socket, forward:)
+        record['state'] = forward ? 'forward' : 'reversed'
+        save_journal(journal)
+      end
+    end
+
+    def apply_tmux_record(record, socket, forward:)
+      session = record.fetch('session')
+      record.fetch('options').each do |old_name, new_name, original_value, migrated_value|
+        migrate_tmux_value(
+          socket, session, old_name, new_name, original_value, migrated_value,
+          forward:, environment: false, window: false
+        )
+      end
+      record.fetch('environment').each do |old_name, new_name, original_value, migrated_value|
+        migrate_tmux_value(
+          socket, session, old_name, new_name, original_value, migrated_value,
+          forward:, environment: true, window: false
+        )
+      end
+      record.fetch('windows').each do |window_record|
+        window_record.fetch('options').each do |old_name, new_name, original_value, migrated_value|
+          migrate_tmux_value(
+            socket, window_record.fetch('window'), old_name, new_name, original_value, migrated_value,
+            forward:, environment: false, window: true
+          )
+        end
+      end
+    end
+
+    def migrate_tmux_value(
+      socket, subject, old_name, new_name, original_value, migrated_value,
+      forward:, environment:, window:
+    )
+      source_name, destination_name = forward ? [old_name, new_name] : [new_name, old_name]
+      source_expected, destination_expected = forward ?
+        [original_value, migrated_value] : [migrated_value, original_value]
+      source_value = read_tmux_value(socket, subject, source_name, environment:, window:)
+      destination_value = read_tmux_value(socket, subject, destination_name, environment:, window:)
+      unless (source_value == source_expected && [nil, destination_expected].include?(destination_value)) ||
+             (source_value.nil? && destination_value == destination_expected)
+        raise Error, "tmux metadata changed during migration: #{subject} #{source_name}"
+      end
+      if environment
+        unless destination_value == destination_expected
+          if destination_expected == TMUX_REMOVED
+            tmux(socket, 'set-environment', '-r', '-t', subject, destination_name)
+          elsif destination_expected.nil?
+            tmux(socket, 'set-environment', '-u', '-t', subject, destination_name)
+          else
+            tmux(socket, 'set-environment', '-t', subject, destination_name, destination_expected)
+          end
+        end
+        tmux(socket, 'set-environment', '-u', '-t', subject, source_name) unless source_value.nil?
+      else
+        scope = window ? ['-w'] : []
+        unless destination_value == destination_expected
+          tmux(socket, 'set-option', *scope, '-t', subject, destination_name, destination_expected)
+        end
+        tmux(socket, 'set-option', *scope, '-qu', '-t', subject, source_name) unless source_value.nil?
+      end
+      unless read_tmux_value(socket, subject, source_name, environment:, window:).nil? &&
+             read_tmux_value(socket, subject, destination_name, environment:, window:) == destination_expected
+        raise Error, "tmux metadata verification failed: #{subject} #{destination_name}"
+      end
+    end
+
+    def migrated_tmux_value(value, path:)
+      value.nil? || value == TMUX_REMOVED || !path ? value : replace_path_namespaces(value)
+    end
+
+    def verify_user_migration_result!(journal, forward:)
+      preflight_rewrites!(journal, forward:)
+      preflight_tmux_inventory!(journal, forward:)
+      validate_runtime_authorities_against_tmux!(journal, migrated: forward)
+    end
+
+    def read_tmux_value(socket, target, name, environment:, window:)
+      return tmux_environment(socket, target, name) if environment
+
+      tmux_option(socket, target, name, window:)
+    end
+
+    def tmux_environment(socket, session, name)
+      output, _error, status = Open3.capture3(@options[:tmux], '-S', socket, 'show-environment', '-t', session, name)
+      return nil unless status.success?
+
+      framed = output.delete_suffix("\n")
+      return TMUX_REMOVED.dup if framed == "-#{name}"
+
+      prefix = "#{name}="
+      unless framed.start_with?(prefix)
+        raise Error, "tmux returned malformed environment metadata: #{session} #{name}"
+      end
+
+      framed.delete_prefix(prefix)
+    end
+
+    def tmux_option(socket, target, name, window: false)
+      scope = window ? ['-w'] : []
+      tmux_optional(socket, 'show-options', *scope, '-qv', '-t', target, name)
+    end
+
+    def tmux_optional(socket, *arguments)
+      output, _error, status = Open3.capture3(@options[:tmux], '-S', socket, *arguments)
+      status.success? && !output.empty? ? output.delete_suffix("\n") : nil
+    end
+
+    def tmux(socket, *arguments)
+      output, error, status = Open3.capture3(@options[:tmux], '-S', socket, *arguments)
+      raise Error, "tmux failed for #{socket}: #{error.strip}" unless status.success?
+
+      output
+    end
+
+    def load_journal
+      validate_private_file(@options[:journal])
+      contents = File.binread(@options[:journal], MAX_JOURNAL_BYTES + 1)
+      raise Error, "migration journal is too large: #{@options[:journal]}" if contents.bytesize > MAX_JOURNAL_BYTES
+      JSON.parse(contents)
+    rescue Errno::ENOENT
+      raise Error, "migration journal does not exist: #{@options[:journal]}"
+    rescue JSON::ParserError => e
+      raise Error, "invalid migration journal: #{e.message}"
+    end
+
+    def validate_private_file(path)
+      raise Error, "migration journal is a symlink: #{path}" if File.symlink?(path)
+      stat = File.stat(path)
+      unless stat.file? && stat.uid == Process.euid && (stat.mode & 0o7777) == 0o600
+        raise Error, "migration journal must be an owned mode-0600 file: #{path}"
+      end
+    end
+
+    def validate_journal!(journal, mutation:)
+      expected_keys = %w[context moves profile rewrites schema scope state tmux]
+      unless journal.is_a?(Hash) && journal.keys.sort == expected_keys && journal['schema'] == SCHEMA
+        raise Error, 'unsupported migration journal schema'
+      end
+      raise Error, 'migration journal belongs to another scope' unless journal['scope'] == @options[:scope]
+      raise Error, 'invalid migration journal state' unless valid_persisted_states?(journal, :journal)
+      return unless mutation
+
+      if mutation && journal.fetch('context') != journal_context
+        raise Error, 'migration journal belongs to different paths'
+      end
+      validate_moves!(journal.fetch('moves'))
+      validate_profile!(journal.fetch('profile'))
+      validate_rewrites!(journal.fetch('rewrites'))
+      validate_tmux!(journal.fetch('tmux')) if journal['tmux']
+      raise Error, 'host migration journal contains tmux state' if @options[:scope] == 'host' && journal['tmux']
+    end
+
+    def validate_profile!(profile)
+      if @options[:scope] == 'host'
+        raise Error, 'host migration journal contains user profile state' unless profile.nil?
+        return
+      end
+      keys = %w[compatibilityPackage metadataSha256]
+      unless profile.is_a?(Hash) && profile.keys.sort == keys &&
+             Pathname.new(profile['compatibilityPackage'].to_s).absolute? &&
+             profile['compatibilityPackage'] != '/' && profile['metadataSha256'].to_s.match?(DIGEST)
+        raise Error, 'migration journal has invalid user profile state'
+      end
+    end
+
+    def validate_moves!(moves)
+      unless moves.is_a?(Array) && moves.length == migration_pairs.length
+        raise Error, 'migration journal has an invalid move inventory'
+      end
+      moves.zip(migration_pairs).each do |move, (source, target)|
+        keys = %w[createdParents fingerprint identity source state target]
+        unless move.is_a?(Hash) && move.keys.sort == keys && move['source'] == source && move['target'] == target &&
+               valid_persisted_states?(move, :move) &&
+               valid_created_parents?(move.fetch('createdParents'), target) &&
+               ((move['state'] == 'skipped' && move['createdParents'].empty? &&
+                 move['fingerprint'].nil? && move['identity'].nil?) ||
+                (move['fingerprint'].to_s.match?(DIGEST) && valid_path_identity?(move['identity'])))
+          raise Error, 'migration journal has an invalid move entry'
+        end
+      end
+    end
+
+    def valid_created_parents?(directories, target)
+      return false unless directories.is_a?(Array) && directories.uniq.length == directories.length
+
+      parent = File.dirname(target)
+      directories.all? do |directory|
+        directory.is_a?(String) && Pathname.new(directory).absolute? && directory != '/' &&
+          (directory == parent || parent.start_with?("#{directory}/"))
+      end
+    end
+
+    def validate_rewrites!(rewrites)
+      raise Error, 'migration journal has an invalid rewrite inventory' unless rewrites.is_a?(Array)
+      paths = rewrites.map do |rewrite|
+        keys = %w[gid mode original originalSha256 path state uid updated updatedSha256]
+        unless rewrite.is_a?(Hash) && rewrite.keys.sort == keys && rewrite_path_allowed?(rewrite['path'].to_s) &&
+               valid_persisted_states?(rewrite, :rewrite) && rewrite['originalSha256'].to_s.match?(DIGEST) &&
+               rewrite['updatedSha256'].to_s.match?(DIGEST) && rewrite['mode'].is_a?(Integer) &&
+               rewrite['uid'].is_a?(Integer) && rewrite['gid'].is_a?(Integer)
+          raise Error, 'migration journal has an invalid rewrite entry'
+        end
+        original = Base64.strict_decode64(rewrite.fetch('original'))
+        updated = Base64.strict_decode64(rewrite.fetch('updated'))
+        unless Digest::SHA256.hexdigest(original) == rewrite.fetch('originalSha256') &&
+               Digest::SHA256.hexdigest(updated) == rewrite.fetch('updatedSha256') &&
+               rewrite_machine_state(rewrite.fetch('path'), original) == updated
+          raise Error, 'migration journal has inconsistent rewrite bytes'
+        end
+        rewrite.fetch('path')
+      rescue ArgumentError
+        raise Error, 'migration journal has invalid base64 rewrite bytes'
+      end
+      raise Error, 'migration journal has duplicate rewrite paths' unless paths.uniq.length == paths.length
+    end
+
+    def validate_tmux!(data)
+      unless @options[:scope] == 'user' && data.is_a?(Hash) &&
+             data.keys.sort == %w[forwardDropIn reverseDropIn servers sessions] &&
+             valid_persisted_states?(data, :tmux) &&
+             data['servers'].is_a?(Array) && data['sessions'].is_a?(Array)
+        raise Error, 'migration journal has invalid tmux state'
+      end
+      workspaces = data['servers'].map do |server|
+        keys = %w[forwardHandoff identity newSocket oldSocket reverseHandoff workspace]
+        workspace = server['workspace']
+        unless server.is_a?(Hash) && server.keys.sort == keys && workspace.to_s.match?(NAME) &&
+               valid_persisted_states?(server, :tmux_server) &&
+               valid_tmux_socket_identity?(server['identity']) &&
+               server['oldSocket'] == File.join(@options[:runtime_dir], 'vpsfree-workspaces', workspace, 'tmux.sock') &&
+               server['newSocket'] == File.join(@options[:runtime_dir], 'dev-workspaces', workspace, 'tmux.sock')
+          raise Error, 'migration journal has an invalid tmux server'
+        end
+        workspace
+      end
+      raise Error, 'migration journal has duplicate tmux servers' unless workspaces.uniq.length == workspaces.length
+      data['sessions'].each do |record|
+        keys = %w[environment name options session state windows workspace]
+        unless record.is_a?(Hash) && record.keys.sort == keys && workspaces.include?(record['workspace']) &&
+               record['session'].is_a?(String) && record['session'].match?(SESSION_ID) &&
+               record['name'].is_a?(String) && !record['name'].empty? &&
+               !record['name'].include?("\0") && !record['name'].include?("\n") &&
+               valid_persisted_states?(record, :tmux_session) &&
+               valid_tmux_values?(
+                 record['options'], allowed: SESSION_OPTION_NAMES,
+                 path_names: SESSION_PATH_OPTION_NAMES, option: true
+               ) &&
+               valid_tmux_values?(
+                 record['environment'], allowed: ENVIRONMENT_NAMES,
+                 path_names: ENVIRONMENT_PATH_NAMES, option: false
+               ) &&
+               valid_tmux_windows?(record['windows'])
+          raise Error, 'migration journal has an invalid tmux session'
+        end
+      end
+      sessions = data['sessions'].map { |record| [record['workspace'], record['session']] }
+      raise Error, 'migration journal has duplicate tmux sessions' unless sessions.uniq.length == sessions.length
+    end
+
+    def valid_tmux_windows?(windows)
+      return false unless windows.is_a?(Array)
+
+      identifiers = windows.map do |window|
+        return false unless window.is_a?(Hash) && window.keys.sort == %w[options window] &&
+                            window['window'].to_s.match?(WINDOW_ID) &&
+                            valid_tmux_values?(
+                              window['options'], allowed: WINDOW_OPTION_NAMES,
+                              path_names: WINDOW_PATH_OPTION_NAMES, option: true
+                            )
+
+        window.fetch('window')
+      end
+      identifiers.uniq.length == identifiers.length
+    end
+
+    def valid_tmux_values?(values, allowed:, path_names:, option:)
+      return false unless values.is_a?(Array)
+
+      names = values.map do |entry|
+        return false unless entry.is_a?(Array) && entry.length == 4
+
+        old_name, new_name, original_value, migrated_value = entry
+        suffix = option ? old_name.to_s.delete_prefix('@vpsfree_dev_') : new_name
+        return false unless allowed.include?(suffix) &&
+                            old_name == (option ? "@vpsfree_dev_#{suffix}" : "VPSFREE_#{suffix}") &&
+                            new_name == (option ? "@dev_#{suffix}" : suffix) &&
+                            valid_tmux_captured_value?(original_value, environment: !option) &&
+                            migrated_value == migrated_tmux_value(
+                              original_value,
+                              path: path_names.include?(suffix)
+                            )
+
+        old_name
+      end
+      expected = allowed.map { |suffix| option ? "@vpsfree_dev_#{suffix}" : "VPSFREE_#{suffix}" }
+      names.sort == expected.sort
+    end
+
+    def valid_tmux_captured_value?(value, environment:)
+      value.nil? || value.is_a?(String) || (environment && value == TMUX_REMOVED)
+    end
+
+    def valid_persisted_states?(record, domain)
+      PERSISTED_STATE_FIELDS.fetch(domain).all? do |name, values|
+        values.include?(record[name])
+      end
+    end
+
+    def save_journal(journal)
+      content = journal_content(journal)
+      validate_journal_capacity!(journal, content:)
+
+      atomic_write(@options[:journal], content, 'mode' => 0o600)
+    end
+
+    def validate_journal_capacity!(journal, content: journal_content(journal))
+      maximum = journal_content(maximum_reachable_journal(journal))
+      return if content.bytesize <= MAX_JOURNAL_BYTES && maximum.bytesize <= MAX_JOURNAL_BYTES
+
+      raise Error, 'migration journal exceeds 16 MiB in a reachable state'
+    end
+
+    def maximum_reachable_journal(journal)
+      reachable = JSON.parse(JSON.generate(journal))
+      project_maximum_persisted_states!(reachable)
+      reachable
+    end
+
+    def project_maximum_persisted_states!(value)
+      case value
+      when Hash
+        value.each do |name, nested|
+          maximum = PERSISTED_STATE_MAXIMUMS[name]
+          maximum ? value[name] = maximum : project_maximum_persisted_states!(nested)
+        end
+      when Array
+        value.each { |nested| project_maximum_persisted_states!(nested) }
+      end
+    end
+
+    def journal_content(journal)
+      JSON.pretty_generate(journal) + "\n"
+    end
+
+    def atomic_write(path, content, metadata)
+      ensure_safe_parent(path)
+      directory = File.dirname(path)
+      Tempfile.create(['migration', '.tmp'], directory) do |file|
+        file.binmode
+        file.write(content)
+        file.flush
+        if metadata.key?('gid')
+          owner = Process.euid.zero? ? metadata.fetch('uid') : -1
+          File.chown(owner, metadata.fetch('gid'), file.path)
+        end
+        File.chmod(metadata.fetch('mode', 0o600), file.path)
+        file.fsync
+        File.rename(file.path, path)
+      end
+      fsync_directory(directory)
+    end
+
+    def ensure_safe_parent(path)
+      validate_safe_parent_path!(path)
+      parent = File.dirname(path)
+      missing = []
+      current = parent
+      until path_exists?(current)
+        missing << current
+        current = File.dirname(current)
+      end
+      missing.reverse_each do |directory|
+        Dir.mkdir(directory, 0o755)
+        fsync_directory(File.dirname(directory))
+      end
+      validate_safe_parent_path!(path)
+    end
+
+    def validate_safe_parent_path!(path)
+      parent = File.dirname(path)
+      components = Pathname.new(parent).each_filename.to_a
+      current = parent.start_with?('/') ? '/' : Dir.pwd
+      components.each do |component|
+        current = File.join(current, component)
+        next unless path_exists?(current)
+
+        stat = File.lstat(current)
+        raise Error, "unsafe symlink in path: #{current}" if stat.symlink?
+        raise Error, "non-directory parent: #{current}" unless stat.directory?
+        validate_host_parent_metadata!(current, stat)
+      end
+    end
+
+    def validate_safe_existing_parents!(path)
+      parent = File.dirname(path)
+      current = parent.start_with?('/') ? '/' : Dir.pwd
+      Pathname.new(parent).each_filename do |component|
+        current = File.join(current, component)
+        stat = File.lstat(current)
+        raise Error, "unsafe symlink in path: #{current}" if stat.symlink?
+        raise Error, "non-directory parent: #{current}" unless stat.directory?
+        validate_host_parent_metadata!(current, stat)
+      end
+    rescue Errno::ENOENT
+      raise Error, "missing rewrite source parent: #{current}"
+    end
+
+    def validate_host_parent_metadata!(path, stat)
+      return unless @options[:scope] == 'host'
+
+      root = @options[:host_root]
+      return unless root == '/' || path == root || path.start_with?("#{root}/")
+      return if stat.uid == Process.euid && (stat.mode & 0o022).zero?
+
+      raise Error, "unsafe ownership or mode in host migration path: #{path}"
+    end
+
+    def durable_rename(source, target)
+      ensure_safe_parent(target)
+      File.rename(source, target)
+      fsync_rename_parents(source, target)
+    end
+
+    def fsync_rename_parents(source, target)
+      [File.dirname(source), File.dirname(target)].uniq.each do |directory|
+        fsync_directory(directory)
+      end
+    end
+
+    def fsync_existing_rename_parents(source, target)
+      [File.dirname(source), File.dirname(target)].uniq.each do |directory|
+        fsync_directory(directory) if File.directory?(directory)
+      end
+    end
+
+    def reject_mount_tree(path)
+      return unless File.file?('/proc/self/mountinfo')
+
+      prefix = "#{path}/"
+      mounted = File.foreach('/proc/self/mountinfo').any? do |line|
+        fields = line.split
+        mount = fields[4]&.gsub(/\\([0-7]{3})/) { Regexp.last_match(1).to_i(8).chr }
+        mount == path || mount&.start_with?(prefix)
+      end
+      raise Error, "migration path contains a mount point: #{path}" if mounted
+    end
+
+    def fingerprint(path)
+      digest = Digest::SHA256.new
+      visit = lambda do |entry, relative|
+        stat = File.lstat(entry)
+        type = if stat.file?
+                 'file'
+               elsif stat.directory?
+                 'directory'
+               elsif stat.symlink?
+                 'symlink'
+               elsif stat.socket?
+                 'socket'
+               else
+                 raise Error, "unsupported entry in migration tree: #{entry}"
+               end
+        digest << [relative, type, stat.mode & 0o7777, stat.uid, stat.gid].join("\0") << "\0"
+        digest << File.readlink(entry) << "\0" if stat.symlink?
+        digest << File.binread(entry) << "\0" if stat.file?
+        if stat.directory?
+          Dir.children(entry).sort.each do |child|
+            visit.call(File.join(entry, child), relative.empty? ? child : File.join(relative, child))
+          end
+        end
+      end
+      visit.call(path, '')
+      digest.hexdigest
+    end
+
+    def path_identity(path)
+      stat = File.lstat(path)
+      {
+        'device' => stat.dev,
+        'inode' => stat.ino,
+        'type' => stat.ftype,
+        'uid' => stat.uid
+      }
+    end
+
+    def tmux_socket_identity(path)
+      validate_safe_existing_parents!(path)
+      stat = File.lstat(path)
+      unless stat.socket? && stat.uid == Process.euid
+        raise Error, "tmux socket is unsafe: #{path}"
+      end
+
+      {
+        'ctimeNsec' => stat.ctime.nsec,
+        'ctimeSec' => stat.ctime.to_i,
+        'device' => stat.dev,
+        'inode' => stat.ino,
+        'type' => stat.ftype,
+        'uid' => stat.uid
+      }
+    rescue Errno::ENOENT
+      raise Error, "tmux socket is missing: #{path}"
+    end
+
+    def verify_tmux_socket_identity!(path, expected)
+      return if tmux_socket_identity(path) == expected
+
+      raise Error, "tmux socket identity changed since preparation: #{path}"
+    end
+
+    def valid_path_identity?(identity)
+      identity.is_a?(Hash) && identity.keys.sort == %w[device inode type uid] &&
+        identity['device'].is_a?(Integer) && identity['inode'].is_a?(Integer) &&
+        identity['uid'].is_a?(Integer) && %w[directory file].include?(identity['type'])
+    end
+
+    def valid_tmux_socket_identity?(identity)
+      identity.is_a?(Hash) &&
+        identity.keys.sort == %w[ctimeNsec ctimeSec device inode type uid] &&
+        identity['ctimeNsec'].is_a?(Integer) && identity['ctimeSec'].is_a?(Integer) &&
+        identity['device'].is_a?(Integer) && identity['inode'].is_a?(Integer) &&
+        identity['uid'].is_a?(Integer) && identity['type'] == 'socket'
+    end
+
+    def fsync_directory(path)
+      File.open(path, File::RDONLY) { |directory| directory.fsync }
+    end
+
+    def path_exists?(path)
+      File.exist?(path) || File.symlink?(path)
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  begin
+    VpsfreeDevWorkspaceMigration::Runner.new(ARGV).run
+  rescue VpsfreeDevWorkspaceMigration::Error, SystemCallError => e
+    warn "error: #{e.message}"
+    exit 1
+  end
+end

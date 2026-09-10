@@ -3,7 +3,7 @@
 This repository adds vpsFree.cz tools to the reusable
 [`aither64/dev-workspace`](https://github.com/aither64/dev-workspace) runtime.
 It owns the KB commands, vpsAdmin and vpsAdminOS development-cluster providers,
-and Codex skills.
+Codex skills, and the one-time namespace migration helper.
 
 Concrete endpoints, credential paths, and development-cluster defaults are not
 stored here. A consuming workspace passes them to `lib.mkPackage`:
@@ -39,8 +39,19 @@ vpsfree-dev-workspace.lib.mkPackage {
 Each registered workspace keeps its portal identity and selected cluster
 providers in the `.dev-workspace.json` file at its own root.
 
+The optional `userNamespace` and `routerSocket` arguments are passed to the
+generic package constructor. They are intended for a compatibility generation
+during the namespace migration; ordinary packages should keep the generic
+defaults.
+
 Run all checks with:
 
 ```sh
 nix flake check --print-build-logs
 ```
+
+The migration helper is intentionally not automatic or linked into `~/bin`.
+Invoke it through the package's private
+`libexec/vpsfree-dev-workspace-migrate` path, read its `--help` output and
+follow the [namespace migration runbook](docs/namespace-migration.md). Retain
+its private journals until the deployed cutover has been accepted.

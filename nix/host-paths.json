@@ -1,0 +1,9 @@
+{
+  "caStateDirectory": "/var/lib/dev-workspaces/pki",
+  "certificateDirectory": "/var/lib/dev-workspaces/tls",
+  "htpasswdFile": "/var/lib/dev-workspaces/auth/htpasswd",
+  "lockFile": "/run/lock/dev-workspace-substrate.lock",
+  "passwordFile": "/var/lib/dev-workspaces/password/password",
+  "publicCaFile": "/var/lib/dev-workspaces/public/ca.pem",
+  "routerSocket": "/run/dev-workspaces/router.sock"
+}

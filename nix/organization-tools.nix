@@ -75,9 +75,13 @@ let
     openssl
     util-linux
   ];
+  runtimeContractData = builtins.fromJSON (builtins.readFile runtimeContract);
+  authorityPolicyValid = (runtimeContractData.runtimeAuthorityIdentityPolicy or null) == 1;
 in
 assert lib.assertMsg stringsValid "vpsFree KB site configuration is incomplete";
 assert lib.assertMsg configsValid "vpsFree development cluster defaults are required";
+assert lib.assertMsg authorityPolicyValid
+  "the namespace migration must be reviewed for the selected runtime authority policy";
 stdenvNoCC.mkDerivation {
   pname = "vpsfree-dev-workspace-tools";
   version = "0.1.0";
@@ -90,6 +94,8 @@ stdenvNoCC.mkDerivation {
 
     mkdir -p "$out/share/vpsfree-dev-workspace"
     cp -R bin lib dev-clusters "$out/share/vpsfree-dev-workspace/"
+    install -Dm644 nix/host-paths.json \
+      "$out/share/vpsfree-dev-workspace/nix/host-paths.json"
     chmod -R u+w "$out/share/vpsfree-dev-workspace"
     install -Dm644 ${runtimeContract} \
       "$out/share/vpsfree-dev-workspace/dev-clusters/runtime-contract.json"
@@ -104,6 +110,8 @@ stdenvNoCC.mkDerivation {
       makeWrapper "$source" "$out/bin/$name" \
         --prefix RUBYLIB : "$out/share/vpsfree-dev-workspace/lib" \
         --prefix PATH : "$runtimePath" \
+        --set DEV_WORKSPACE_RUNTIME_CONTRACT \
+          "$out/share/vpsfree-dev-workspace/dev-clusters/runtime-contract.json" \
         --set VPSFREE_KB_CZ_URL ${lib.escapeShellArg requiredStrings.czUrl} \
         --set VPSFREE_KB_CZ_TOKEN_PATH ${lib.escapeShellArg requiredStrings.czTokenPath} \
         --set VPSFREE_KB_CZ_STAGING_URL ${lib.escapeShellArg requiredStrings.czStagingUrl} \
