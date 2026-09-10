@@ -24,7 +24,6 @@
 let
   kb = siteConfig.kb or { };
   clusters = siteConfig.clusterDefaults or { };
-  validClusterConfig = value: builtins.isPath value;
   clusterConfigurations = builtins.mapAttrs (
     name: value:
     builtins.path {
@@ -33,24 +32,17 @@ let
     }
   ) clusters;
   requiredStrings = {
-    czUrl = kb.cz.url or null;
-    czTokenPath = kb.cz.tokenPath or null;
-    czStagingUrl = kb.cz.stagingUrl or null;
-    czStagingPasswordPath = kb.cz.stagingPasswordPath or null;
-    orgUrl = kb.org.url or null;
-    orgTokenPath = kb.org.tokenPath or null;
-    orgStagingUrl = kb.org.stagingUrl or null;
-    orgStagingPasswordPath = kb.org.stagingPasswordPath or null;
-    stagingUsername = kb.stagingUsername or null;
-    stageContainerctl = kb.stageContainerctl or null;
+    czUrl = kb.cz.url;
+    czTokenPath = kb.cz.tokenPath;
+    czStagingUrl = kb.cz.stagingUrl;
+    czStagingPasswordPath = kb.cz.stagingPasswordPath;
+    orgUrl = kb.org.url;
+    orgTokenPath = kb.org.tokenPath;
+    orgStagingUrl = kb.org.stagingUrl;
+    orgStagingPasswordPath = kb.org.stagingPasswordPath;
+    stagingUsername = kb.stagingUsername;
+    stageContainerctl = kb.stageContainerctl;
   };
-  validString = value: builtins.isString value && value != "";
-  stringsValid = builtins.all validString (builtins.attrValues requiredStrings);
-  configsValid =
-    clusters ? vpsadmin
-    && clusters ? vpsadminos
-    && validClusterConfig clusters.vpsadmin
-    && validClusterConfig clusters.vpsadminos;
   kbRuntimePath = lib.makeBinPath [
     coreutils
     git
@@ -78,8 +70,6 @@ let
   runtimeContractData = builtins.fromJSON (builtins.readFile runtimeContract);
   authorityPolicyValid = (runtimeContractData.runtimeAuthorityIdentityPolicy or null) == 1;
 in
-assert lib.assertMsg stringsValid "vpsFree KB site configuration is incomplete";
-assert lib.assertMsg configsValid "vpsFree development cluster defaults are required";
 assert lib.assertMsg authorityPolicyValid
   "the namespace migration must be reviewed for the selected runtime authority policy";
 stdenvNoCC.mkDerivation {

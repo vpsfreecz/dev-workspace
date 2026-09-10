@@ -16,6 +16,7 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      validateSiteConfig = import ./nix/site-config.nix { lib = nixpkgs.lib; };
       migrationHostPaths = builtins.fromJSON (builtins.readFile ./nix/host-paths.json);
       hostPathContractMatches = migrationHostPaths == dev-workspace.lib.hostPaths;
       skillNames = builtins.attrNames (
@@ -52,7 +53,11 @@
           userNamespace ? "dev-workspaces",
         }:
         let
-          tools = mkOrganizationTools { inherit pkgs siteConfig; };
+          validatedSiteConfig = validateSiteConfig siteConfig;
+          tools = mkOrganizationTools {
+            inherit pkgs;
+            siteConfig = validatedSiteConfig;
+          };
         in
         (dev-workspace.lib.mkPackage {
           inherit
@@ -125,20 +130,33 @@
         siteConfig = testSiteConfig;
         userNamespace = "previous-workspaces";
       };
-      rejectedClusterDefaults = [ "/tmp/mutable-vpsadmin.json" ];
-      invalidClusterDefaultsRejected = builtins.all (
-        value:
-        !(builtins.tryEval (
-          builtins.deepSeq (mkOrganizationTools {
-            inherit pkgs;
-            siteConfig = testSiteConfig // {
-              clusterDefaults = testSiteConfig.clusterDefaults // {
-                vpsadmin = value;
-              };
+      rejectedSiteConfigs = [
+        (
+          testSiteConfig
+          // {
+            clusterDefaults = testSiteConfig.clusterDefaults // {
+              vpsadmin = "/tmp/mutable-vpsadmin.json";
             };
-          }) true
-        )).success
-      ) rejectedClusterDefaults;
+          }
+        )
+        (
+          testSiteConfig
+          // {
+            clusterDefaults = testSiteConfig.clusterDefaults // {
+              vpsadmin = ./test/fixtures/not-object.json;
+            };
+          }
+        )
+        (
+          testSiteConfig
+          // {
+            workspaceConfigurations.example-workspace = ./test/fixtures/not-object.json;
+          }
+        )
+      ];
+      invalidSiteConfigsRejected = builtins.all (
+        siteConfig: !(builtins.tryEval (builtins.deepSeq (validateSiteConfig siteConfig) true)).success
+      ) rejectedSiteConfigs;
       testEnvironment = ''
         export LANG=C.UTF-8
         export LC_ALL=C.UTF-8
@@ -158,7 +176,7 @@
         export DEV_WORKSPACE_RUNTIME_CONTRACT=${dev-workspace.lib.runtimeContract}
       '';
     in
-    assert invalidClusterDefaultsRejected;
+    assert invalidSiteConfigsRejected;
     assert hostPathContractMatches;
     {
       lib = {
@@ -200,6 +218,11 @@
           test -x ${testPackage}/libexec/vpsfree-dev-workspace-migrate
           touch "$out"
         '';
+        rejects-invalid-site-config =
+          pkgs.runCommand "vpsfree-dev-workspace-rejects-invalid-site-config" { }
+            ''
+              touch "$out"
+            '';
         tests =
           pkgs.runCommand "vpsfree-dev-workspace-tests"
             {
