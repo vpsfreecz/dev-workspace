@@ -12,12 +12,12 @@ load File.expand_path('kb-page', __dir__)
 
 module KbStageCli
   class Runner
-    CONTAINERCTL = '/run/current-system/sw/bin/kb-staging-containerctl'
+    CONTAINERCTL = ENV.fetch('KB_STAGE_CONTAINERCTL')
 
-    URLS = %w[
-      http://kb-cs.aitherdev.int.vpsfree.cz/
-      http://kb-en.aitherdev.int.vpsfree.cz/
-    ].freeze
+    URLS = [
+      ENV.fetch('VPSFREE_KB_CZ_STAGING_URL'),
+      ENV.fetch('VPSFREE_KB_ORG_STAGING_URL')
+    ].map { |url| "#{url.sub(%r{/+\z}, '')}/" }.freeze
 
     def initialize(out: $stdout)
       @out = out

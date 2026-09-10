@@ -20,7 +20,7 @@ dev-clusters/vpsadminos/bin/devcluster gcroots --cleanup
 ```
 
 When running inside a `dev-session` shell, `ssh` can use
-`VPSFREE_DEV_SESSION_SLUG` automatically:
+`DEV_SESSION_SLUG` automatically:
 
 ```sh
 dev-clusters/vpsadminos/bin/devcluster ssh node1

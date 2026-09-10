@@ -84,7 +84,7 @@ class DevclusterStatusTest < Minitest::Test
       assert_equal('mail-secret', mailpit_password.fetch('value'))
 
       stdout, stderr, result = Open3.capture3(
-        { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+        { 'DEVCLUSTER_WORKSPACE' => workspace },
         HELPERS.fetch('vpsadmin'), 'urls', slug
       )
       assert(result.success?, stderr)
@@ -145,7 +145,7 @@ class DevclusterStatusTest < Minitest::Test
       FileUtils.mkdir_p(root)
       File.symlink(Dir.mktmpdir('devcluster-target'), File.join(root, 'unsafe'))
       _stdout, stderr, result = Open3.capture3(
-        { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+        { 'DEVCLUSTER_WORKSPACE' => workspace },
         HELPERS.fetch('vpsadmin'), 'status', 'unsafe', '--json'
       )
       refute(result.success?)
@@ -179,7 +179,7 @@ class DevclusterStatusTest < Minitest::Test
           ['gcroots', '--cleanup', slug]
         ].each do |arguments|
           _stdout, stderr, result = Open3.capture3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace }, helper, *arguments
+            { 'DEVCLUSTER_WORKSPACE' => workspace }, helper, *arguments
           )
           refute(result.success?, "#{kind} #{arguments.first} accepted a leaf symlink")
           assert_includes(stderr, 'cluster state directory')
@@ -208,7 +208,7 @@ class DevclusterStatusTest < Minitest::Test
       File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
         lock.flock(File::LOCK_EX)
         stdin, stdout, stderr, waiter = Open3.popen3(
-          { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+          { 'DEVCLUSTER_WORKSPACE' => workspace },
           HELPERS.fetch('vpsadmin'), 'cert', 'init', '--force'
         )
         stdin.close
@@ -235,7 +235,7 @@ class DevclusterStatusTest < Minitest::Test
       File.symlink(external, File.join(cert_dir, 'vpsadmin-ca.key'))
 
       _stdout, stderr, result = Open3.capture3(
-        { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+        { 'DEVCLUSTER_WORKSPACE' => workspace },
         HELPERS.fetch('vpsadmin'), 'cert', 'init', '--force'
       )
       refute(result.success?)
@@ -254,7 +254,7 @@ class DevclusterStatusTest < Minitest::Test
       File.symlink(external, File.join(certs, 'default'))
 
       _stdout, stderr, result = Open3.capture3(
-        { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+        { 'DEVCLUSTER_WORKSPACE' => workspace },
         HELPERS.fetch('vpsadmin'), 'cert', 'init', '--force'
       )
       refute(result.success?)
@@ -281,7 +281,7 @@ class DevclusterStatusTest < Minitest::Test
         File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
           lock.flock(File::LOCK_EX)
           stdin, stdout, stderr, waiter = Open3.popen3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            { 'DEVCLUSTER_WORKSPACE' => workspace },
             helper, 'start', slug, '--network', 'local'
           )
           stdin.close
@@ -313,7 +313,7 @@ class DevclusterStatusTest < Minitest::Test
         File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
           lock.flock(File::LOCK_EX)
           stdin, stdout, stderr, waiter = Open3.popen3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            { 'DEVCLUSTER_WORKSPACE' => workspace },
             helper, 'start', slug
           )
           stdin.close
@@ -345,7 +345,7 @@ class DevclusterStatusTest < Minitest::Test
           File.chmod(0o600, journal)
 
           _stdout, stderr, result = Open3.capture3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace }, helper, 'start', slug
+            { 'DEVCLUSTER_WORKSPACE' => workspace }, helper, 'start', slug
           )
 
           refute(result.success?, "#{kind} started during session #{operation}")
@@ -364,7 +364,7 @@ class DevclusterStatusTest < Minitest::Test
         File.open(state, 'a') { |file| file.write('x' * (2 * 1024 * 1024)) }
 
         _stdout, stderr, result = Open3.capture3(
-          { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace }, helper, 'config', slug
+          { 'DEVCLUSTER_WORKSPACE' => workspace }, helper, 'config', slug
         )
 
         assert(result.success?, "#{kind} rejected shared tracking limit: #{stderr}")
@@ -395,7 +395,7 @@ class DevclusterStatusTest < Minitest::Test
 
         invocations.each do |arguments|
           _stdout, stderr, result = Open3.capture3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            { 'DEVCLUSTER_WORKSPACE' => workspace },
             HELPERS.fetch(kind), arguments.fetch(0), slug, *arguments.drop(1)
           )
           refute(result.success?, "#{kind} #{arguments.first} mutated during archive")
@@ -418,8 +418,8 @@ class DevclusterStatusTest < Minitest::Test
 
         _stdout, stderr, result = Open3.capture3(
           {
-            'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-            'VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION' => 'archive'
+            'DEVCLUSTER_WORKSPACE' => workspace,
+            'DEV_SESSION_LIFECYCLE_OPERATION' => 'archive'
           },
           helper, 'reset', slug
         )
@@ -507,7 +507,7 @@ class DevclusterStatusTest < Minitest::Test
         directory, = prepare_lifecycle_reset(workspace, kind, slug)
         runtime_root = File.join(workspace, 'custom-runtime')
         authority = File.join(
-          runtime_root, 'vpsfree-cz', 'authority'
+          runtime_root, 'example-workspace', 'authority'
         )
         FileUtils.mkdir_p(authority)
         lock_path = File.join(authority, "#{slug}.lock")
@@ -521,8 +521,40 @@ class DevclusterStatusTest < Minitest::Test
           slug,
           lock,
           lock_path,
-          'VPSFREE_WORKSPACE_NAME' => 'vpsfree-cz',
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => runtime_root
+          'DEV_WORKSPACE_NAME' => 'example-workspace',
+          'DEV_WORKSPACES_RUNTIME_DIR' => runtime_root
+        )
+
+        assert(result.success?, stderr)
+        refute(File.exist?(directory))
+      ensure
+        lock&.flock(File::LOCK_UN)
+        lock&.close
+      end
+    end
+  end
+
+  def test_lifecycle_reset_accepts_the_generic_default_runtime_authority_lock
+    HELPERS.each do |kind, helper|
+      Dir.mktmpdir("devcluster-#{kind}-default-runtime") do |workspace|
+        slug = '2026-09-05-changing'
+        directory, = prepare_lifecycle_reset(workspace, kind, slug)
+        xdg_runtime = File.join(workspace, 'run')
+        authority = File.join(xdg_runtime, 'dev-workspaces', 'example-workspace', 'authority')
+        FileUtils.mkdir_p(authority)
+        lock_path = File.join(authority, "#{slug}.lock")
+        lock = File.open(lock_path, File::RDWR | File::CREAT, 0o600)
+        File.chmod(0o600, lock_path)
+        lock.flock(File::LOCK_EX)
+
+        _stdout, stderr, result = run_lifecycle_reset(
+          helper,
+          workspace,
+          slug,
+          lock,
+          lock_path,
+          'DEV_WORKSPACE_NAME' => 'example-workspace',
+          'XDG_RUNTIME_DIR' => xdg_runtime
         )
 
         assert(result.success?, stderr)
@@ -545,7 +577,7 @@ class DevclusterStatusTest < Minitest::Test
         write_lifecycle(workspace, slug, 'complete')
         operations.each do |operation|
           _stdout, stderr, result = Open3.capture3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            { 'DEVCLUSTER_WORKSPACE' => workspace },
             HELPERS.fetch(kind), operation, slug
           )
           refute(result.success?, "#{kind} #{operation} accepted a terminal session")
@@ -567,7 +599,7 @@ class DevclusterStatusTest < Minitest::Test
         File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
           lock.flock(File::LOCK_EX)
           stdin, stdout, stderr, waiter = Open3.popen3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            { 'DEVCLUSTER_WORKSPACE' => workspace },
             helper, 'gcroots', '--cleanup', slug
           )
           stdin.close
@@ -616,7 +648,7 @@ class DevclusterStatusTest < Minitest::Test
           Process.kill('TERM', parent)
           Process.wait(parent)
           _stdout, stderr, result = Open3.capture3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace }, helper, 'reset', slug
+            { 'DEVCLUSTER_WORKSPACE' => workspace }, helper, 'reset', slug
           )
           assert(result.success?, "#{kind} reset remained blocked after launcher exit: #{stderr}")
           assert(Process.kill(0, child), "#{kind} detached child exited before lock verification")
@@ -683,7 +715,7 @@ class DevclusterStatusTest < Minitest::Test
         write_state(directory, 'runner.pid', "#{unrelated_pid}\n")
         assert_equal('stale', read_status('vpsadmin', workspace, slug).fetch('state'))
         _stdout, stderr, result = Open3.capture3(
-          { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+          { 'DEVCLUSTER_WORKSPACE' => workspace },
           HELPERS.fetch('vpsadmin'), 'reset', slug
         )
         assert(result.success?, stderr)
@@ -708,7 +740,7 @@ class DevclusterStatusTest < Minitest::Test
 
         begin
           _stdout, stderr, result = Open3.capture3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            { 'DEVCLUSTER_WORKSPACE' => workspace },
             HELPERS.fetch(kind), 'reset', slug
           )
           assert(result.success?, stderr)
@@ -738,7 +770,7 @@ class DevclusterStatusTest < Minitest::Test
           begin
             File.write(File.join(directory_b, 'runner.pid'), "#{child}\n")
             _stdout, stderr, result = Open3.capture3(
-              { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace_a }, helper, 'reset', slug
+              { 'DEVCLUSTER_WORKSPACE' => workspace_a }, helper, 'reset', slug
             )
             assert(result.success?, stderr)
             assert(Process.kill(0, child), "#{kind} reset killed another workspace's cluster")
@@ -755,7 +787,7 @@ class DevclusterStatusTest < Minitest::Test
     HELPERS.each do |kind, helper|
       with_cluster(kind) do |workspace, directory, slug|
         stdout, stderr, result = Open3.capture3(
-          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace}, helper, 'cleanup-paths', slug
+          {'DEVCLUSTER_WORKSPACE' => workspace}, helper, 'cleanup-paths', slug
         )
         assert(result.success?, stderr)
         contract = JSON.parse(stdout)
@@ -773,7 +805,7 @@ class DevclusterStatusTest < Minitest::Test
     slug = '2026-08-18-vpsadmin-password-reset'
     Dir.mktmpdir('devcluster-cleanup-contract') do |workspace|
       stdout, stderr, result = Open3.capture3(
-        {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+        {'DEVCLUSTER_WORKSPACE' => workspace},
         HELPERS.fetch(kind), 'cleanup-paths', slug
       )
       assert(result.success?, stderr)
@@ -799,7 +831,7 @@ class DevclusterStatusTest < Minitest::Test
         )
 
         _stdout, stderr, result = Open3.capture3(
-          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+          {'DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -821,7 +853,7 @@ class DevclusterStatusTest < Minitest::Test
         )
 
         _stdout, stderr, result = Open3.capture3(
-          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+          {'DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -837,7 +869,7 @@ class DevclusterStatusTest < Minitest::Test
         write_lifecycle(workspace, slug, 'active')
 
         _stdout, stderr, result = Open3.capture3(
-          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+          {'DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'config', slug
         )
 
@@ -872,7 +904,7 @@ class DevclusterStatusTest < Minitest::Test
         File.write(File.join(directory, 'runner.pid'), "#{child}\n")
         begin
           _stdout, stderr, result = Open3.capture3(
-            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+            {'DEVCLUSTER_WORKSPACE' => workspace},
             helper, 'status', slug, '--json'
           )
           refute(result.success?)
@@ -881,7 +913,7 @@ class DevclusterStatusTest < Minitest::Test
           assert(Process.kill(0, child))
 
           _stdout, stderr, result = Open3.capture3(
-            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+            {'DEVCLUSTER_WORKSPACE' => workspace},
             helper, 'reset', slug
           )
           assert(result.success?, stderr)
@@ -906,7 +938,7 @@ class DevclusterStatusTest < Minitest::Test
         FileUtils.mkdir_p(directory)
 
         _stdout, stderr, result = Open3.capture3(
-          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+          {'DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -935,7 +967,7 @@ class DevclusterStatusTest < Minitest::Test
         held = File.open(File.join(legacy, 'held'), File::WRONLY | File::CREAT, 0o600)
 
         _stdout, stderr, result = Open3.capture3(
-          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+          {'DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -962,7 +994,7 @@ class DevclusterStatusTest < Minitest::Test
         child = spawn_marker_process('--sock-dir', legacy)
         begin
           _stdout, stderr, result = Open3.capture3(
-            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+            {'DEVCLUSTER_WORKSPACE' => workspace},
             helper, 'transition-adopt', slug
           )
 
@@ -997,7 +1029,7 @@ class DevclusterStatusTest < Minitest::Test
         File.write(File.join(directory, 'runner.pid'), "#{child}\n")
         begin
           _stdout, stderr, result = Open3.capture3(
-            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+            {'DEVCLUSTER_WORKSPACE' => workspace},
             helper, 'transition-adopt', slug
           )
 
@@ -1027,7 +1059,7 @@ class DevclusterStatusTest < Minitest::Test
         File.write(File.join(directory, 'legacy-socket-owner'), "#{owner}\n")
 
         _stdout, stderr, result = Open3.capture3(
-          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+          {'DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -1197,7 +1229,7 @@ class DevclusterStatusTest < Minitest::Test
             File.write(File.join(directory_a, 'runner.pid'), "#{child}\n")
             File.write(File.join(directory_b, 'runner.pid'), "#{child}\n")
             _stdout, stderr, result = Open3.capture3(
-              {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace_b}, helper, 'reset', slug
+              {'DEVCLUSTER_WORKSPACE' => workspace_b}, helper, 'reset', slug
             )
             refute(result.success?)
             assert_includes(stderr, 'process ownership cannot be proven')
@@ -1373,7 +1405,7 @@ class DevclusterStatusTest < Minitest::Test
 
   def runtime_contract
     @runtime_contract ||= JSON.parse(
-      File.read(File.join(ROOT, 'portal/internal/session/runtime-contract.json'))
+      File.read(ENV.fetch('DEVCLUSTER_RUNTIME_CONTRACT'))
     )
   end
 
@@ -1396,10 +1428,10 @@ class DevclusterStatusTest < Minitest::Test
   def run_lifecycle_reset(helper, workspace, slug, lock, lock_path, extra_environment = {})
     Open3.capture3(
       {
-        'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-        'VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION' => 'archive',
-        'VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_FD' => lock.fileno.to_s,
-        'VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock_path
+        'DEVCLUSTER_WORKSPACE' => workspace,
+        'DEV_SESSION_LIFECYCLE_OPERATION' => 'archive',
+        'DEV_SESSION_LIFECYCLE_LOCK_FD' => lock.fileno.to_s,
+        'DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock_path
       }.merge(extra_environment),
       helper, 'reset', slug,
       lock.fileno => lock.fileno
@@ -1438,7 +1470,7 @@ class DevclusterStatusTest < Minitest::Test
 
   def read_status(kind, workspace, slug)
     stdout, stderr, result = Open3.capture3(
-      { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+      { 'DEVCLUSTER_WORKSPACE' => workspace },
       HELPERS.fetch(kind), 'status', slug, '--json'
     )
     assert(result.success?, stderr)
@@ -1475,7 +1507,7 @@ class DevclusterStatusTest < Minitest::Test
           arguments = [HELPERS.fetch(kind), command, slug]
           arguments << '--json' if command == 'status'
           _stdout, stderr, result = Open3.capture3(
-            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace }, *arguments
+            { 'DEVCLUSTER_WORKSPACE' => workspace }, *arguments
           )
           refute(result.success?, "#{kind} #{command} accepted #{component} symlink")
           assert_includes(stderr, 'unsafe')

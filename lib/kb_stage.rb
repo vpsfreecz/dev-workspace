@@ -14,7 +14,7 @@ module KbStage
 
   ROOT = File.expand_path('..', __dir__)
   CONTAINER = 'kb-staging'
-  CONTAINERCTL = '/run/current-system/sw/bin/kb-staging-containerctl'
+  CONTAINERCTL = ENV.fetch('KB_STAGE_CONTAINERCTL')
   SITES = %w[cz org].freeze
   DEFAULT_STATE_DIR = File.expand_path('~/.local/state/kb-stage')
   DEFAULT_CODEX_DIR = File.expand_path('~/.codex')
@@ -51,12 +51,12 @@ module KbStage
   end
 
   def current_slug
-    slug = ENV['VPSFREE_DEV_SESSION_SLUG']
-    raise Error, 'VPSFREE_DEV_SESSION_SLUG is not set' if slug.nil? || slug.empty?
+    slug = ENV['DEV_SESSION_SLUG']
+    raise Error, 'DEV_SESSION_SLUG is not set' if slug.nil? || slug.empty?
 
     output, status = Open3.capture2('dev-session', 'current')
     unless status.success? && output.strip == slug
-      raise Error, 'the active dev-session does not match VPSFREE_DEV_SESSION_SLUG'
+      raise Error, 'the active dev-session does not match DEV_SESSION_SLUG'
     end
 
     slug
@@ -132,7 +132,7 @@ module KbStage
     FileUtils.mkdir_p(codex_dir, mode: 0o700)
 
     SITES.each do |site|
-      password_path = File.join(codex_dir, "codex-kb-staging-#{site}-aither-password")
+      password_path = ENV.fetch("VPSFREE_KB_#{site.upcase}_STAGING_PASSWORD_PATH")
       users_path = File.join(credentials_dir, "#{site}.users.auth.php")
       next if File.exist?(password_path) && File.exist?(users_path)
 
@@ -141,7 +141,8 @@ module KbStage
       raise Error, 'openssl failed to hash the staging password' unless status.success?
 
       atomic_write(password_path, "#{password}\n", 0o600)
-      user = "aither:#{hash.strip}:Codex staging API:codex@localhost:admin,user\n"
+      user = "#{ENV.fetch('VPSFREE_KB_STAGING_USERNAME')}:#{hash.strip}:" \
+             "Codex staging API:codex@localhost:admin,user\n"
       atomic_write(users_path, user, 0o644)
     end
   end
@@ -183,6 +184,7 @@ module KbStage
   end
 
   def atomic_write(path, content, mode)
+    temporary = nil
     FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
     temporary = "#{path}.#{Process.pid}.tmp"
     File.open(temporary, File::WRONLY | File::CREAT | File::TRUNC, mode) do |file|
@@ -192,13 +194,13 @@ module KbStage
     end
     File.rename(temporary, path)
   ensure
-    FileUtils.rm_f(temporary) if defined?(temporary)
+    FileUtils.rm_f(temporary) if temporary
   end
 
   class LanguageLinks
     SITE_URLS = {
-      'cz' => 'http://kb-cs.aitherdev.int.vpsfree.cz',
-      'org' => 'http://kb-en.aitherdev.int.vpsfree.cz'
+      'cz' => ENV.fetch('VPSFREE_KB_CZ_STAGING_URL'),
+      'org' => ENV.fetch('VPSFREE_KB_ORG_STAGING_URL')
     }.freeze
     PAGE_TAG = /<page>\s*([^<]+?)\s*<\/page>/
 

@@ -42,8 +42,8 @@ class KbPageTest < Minitest::Test
   end
 
   def test_wiki_config_selects_known_kbs
-    assert_equal('https://kb.vpsfree.cz', KbPage.wiki_config('cz').fetch(:url))
-    assert_equal('https://kb.vpsfree.org', KbPage.wiki_config('org').fetch(:url))
+    assert_equal(ENV.fetch('VPSFREE_KB_CZ_URL'), KbPage.wiki_config('cz').fetch(:url))
+    assert_equal(ENV.fetch('VPSFREE_KB_ORG_URL'), KbPage.wiki_config('org').fetch(:url))
 
     assert_raises(KbPage::Error) { KbPage.wiki_config('missing') }
   end

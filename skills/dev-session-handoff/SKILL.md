@@ -7,7 +7,7 @@ description: Prepare a handoff for a vpsFree.cz development initiative and inclu
 
 Use the initiative tracked by the current process through the user-profile
 `dev-session` command. Run `dev-session current` and accept its result only when
-`VPSFREE_DEV_SESSION_SLUG` has the same value, as required by the workspace
+`DEV_SESSION_SLUG` has the same value, as required by the workspace
 `AGENTS.md`. Do not use or modify another concurrent session. If no initiative
 belongs to the process, create one before making changes or ask for the
 intended slug when choosing one would change the task.

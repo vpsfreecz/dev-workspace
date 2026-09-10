@@ -3,14 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-WORKSPACE_INPUT="${VPSFREE_DEVCLUSTER_WORKSPACE:-$CLUSTER_DIR/../..}"
+WORKSPACE_INPUT="${DEVCLUSTER_WORKSPACE:-$CLUSTER_DIR/../..}"
 WORKSPACE="$(cd -- "$WORKSPACE_INPUT" && pwd -P)"
 DEVCLUSTER_KIND=vpsadminos
 DEVCLUSTER_SOCKET_PREFIX=vpsadminos-devcluster
 STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadminos"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
-DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
+DEFAULT_CONFIG_FILE="${VPSADMINOS_DEVCLUSTER_DEFAULT_CONFIG:?VPSADMINOS_DEVCLUSTER_DEFAULT_CONFIG is not configured}"
 DEV_SESSION_BIN=dev-session
 source "$SCRIPT_DIR/../../lib/runtime.sh"
 

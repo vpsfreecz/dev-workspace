@@ -8,27 +8,34 @@ require 'uri'
 require 'base64'
 
 module KbPage
+  def self.required_environment(name)
+    value = ENV[name]
+    raise "#{name} is not configured" if value.nil? || value.empty?
+
+    value
+  end
+
   WIKIS = {
     'cz' => {
-      url: 'https://kb.vpsfree.cz',
-      token_path: '/home/aither/.codex/codex-kb-vpsfree-cz-aither-key',
+      url: required_environment('VPSFREE_KB_CZ_URL'),
+      token_path: required_environment('VPSFREE_KB_CZ_TOKEN_PATH'),
       environment: :production
     },
     'org' => {
-      url: 'https://kb.vpsfree.org',
-      token_path: '/home/aither/.codex/codex-kb-vpsfree-org-aither-key',
+      url: required_environment('VPSFREE_KB_ORG_URL'),
+      token_path: required_environment('VPSFREE_KB_ORG_TOKEN_PATH'),
       environment: :production
     },
     'cz-staging' => {
-      url: 'http://kb-cs.aitherdev.int.vpsfree.cz',
-      username: 'aither',
-      password_path: '/home/aither/.codex/codex-kb-staging-cz-aither-password',
+      url: required_environment('VPSFREE_KB_CZ_STAGING_URL'),
+      username: required_environment('VPSFREE_KB_STAGING_USERNAME'),
+      password_path: required_environment('VPSFREE_KB_CZ_STAGING_PASSWORD_PATH'),
       environment: :staging
     },
     'org-staging' => {
-      url: 'http://kb-en.aitherdev.int.vpsfree.cz',
-      username: 'aither',
-      password_path: '/home/aither/.codex/codex-kb-staging-org-aither-password',
+      url: required_environment('VPSFREE_KB_ORG_STAGING_URL'),
+      username: required_environment('VPSFREE_KB_STAGING_USERNAME'),
+      password_path: required_environment('VPSFREE_KB_ORG_STAGING_PASSWORD_PATH'),
       environment: :staging
     }
   }.freeze

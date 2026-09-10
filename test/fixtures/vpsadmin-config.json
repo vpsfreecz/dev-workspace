@@ -1,22 +1,22 @@
 {
   "domains": {
-    "api": "api.aitherdev.int.vpsfree.cz",
-    "adminer": "adminer.aitherdev.int.vpsfree.cz",
-    "auth": "auth.aitherdev.int.vpsfree.cz",
-    "console": "console.aitherdev.int.vpsfree.cz",
-    "download": "download.aitherdev.int.vpsfree.cz",
-    "frontend": "frontend.aitherdev.int.vpsfree.cz",
-    "mailpit": "mailpit.aitherdev.int.vpsfree.cz",
-    "status": "status.aitherdev.int.vpsfree.cz",
-    "webCs": "web-cs.aitherdev.int.vpsfree.cz",
-    "webEn": "web-en.aitherdev.int.vpsfree.cz",
-    "webui": "webui.aitherdev.int.vpsfree.cz"
+    "api": "api.devhost.int.vpsfree.cz",
+    "adminer": "adminer.devhost.int.vpsfree.cz",
+    "auth": "auth.devhost.int.vpsfree.cz",
+    "console": "console.devhost.int.vpsfree.cz",
+    "download": "download.devhost.int.vpsfree.cz",
+    "frontend": "frontend.devhost.int.vpsfree.cz",
+    "mailpit": "mailpit.devhost.int.vpsfree.cz",
+    "status": "status.devhost.int.vpsfree.cz",
+    "webCs": "web-cs.devhost.int.vpsfree.cz",
+    "webEn": "web-en.devhost.int.vpsfree.cz",
+    "webui": "webui.devhost.int.vpsfree.cz"
   },
   "tmpDomains": {
-    "api": "api-tmp.aitherdev.int.vpsfree.cz",
-    "auth": "auth-tmp.aitherdev.int.vpsfree.cz",
-    "console": "console-tmp.aitherdev.int.vpsfree.cz",
-    "webui": "webui-tmp.aitherdev.int.vpsfree.cz"
+    "api": "api-tmp.devhost.int.vpsfree.cz",
+    "auth": "auth-tmp.devhost.int.vpsfree.cz",
+    "console": "console-tmp.devhost.int.vpsfree.cz",
+    "webui": "webui-tmp.devhost.int.vpsfree.cz"
   },
   "network": {
     "bridge": "br0",
@@ -109,7 +109,7 @@
       "dns-primary": {
         "id": 301,
         "name": "dev-dns-primary",
-        "serverName": "ns-hidden.aitherdev.int.vpsfree.cz",
+        "serverName": "ns-hidden.devhost.int.vpsfree.cz",
         "ip": "172.16.106.61",
         "hidden": true,
         "enableUserDnsZones": true,
@@ -121,7 +121,7 @@
       "dns-secondary": {
         "id": 302,
         "name": "dev-dns-secondary",
-        "serverName": "ns-public.aitherdev.int.vpsfree.cz",
+        "serverName": "ns-public.devhost.int.vpsfree.cz",
         "ip": "172.16.106.62",
         "hidden": false,
         "enableUserDnsZones": true,

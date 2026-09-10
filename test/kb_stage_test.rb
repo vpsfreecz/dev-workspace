@@ -104,10 +104,10 @@ class KbStageTest < Minitest::Test
     with_state do |state, codex|
       KbStage.ensure_credentials!
       %w[cz org].each do |site|
-        password = File.join(codex, "codex-kb-staging-#{site}-aither-password")
+        password = ENV.fetch("VPSFREE_KB_#{site.upcase}_STAGING_PASSWORD_PATH")
         users = File.join(state, 'credentials', "#{site}.users.auth.php")
         assert(File.size?(password))
-        assert_match(/\Aaither:\$6\$/, File.read(users))
+        assert_match(/\A#{Regexp.escape(ENV.fetch('VPSFREE_KB_STAGING_USERNAME'))}:\$6\$/, File.read(users))
         assert_equal(0o600, File.stat(password).mode & 0o777)
         assert_equal(0o644, File.stat(users).mode & 0o777)
       end
@@ -154,8 +154,8 @@ class KbStageTest < Minitest::Test
       'informace:novacci' => "<page>information:new_members</page>\ntext\n",
       'navody:server:ssh' => "unpaired\n"
     }
-    czech = 'http://kb-cs.aitherdev.int.vpsfree.cz/informace/novacci'
-    english = 'http://kb-en.aitherdev.int.vpsfree.cz/information/new_members'
+    czech = "#{ENV.fetch('VPSFREE_KB_CZ_STAGING_URL')}/informace/novacci"
+    english = "#{ENV.fetch('VPSFREE_KB_ORG_STAGING_URL')}/information/new_members"
     html = %(<a href="#{czech}">cs</a><a href="#{english}">en</a>)
     links = KbStage::LanguageLinks.new(
       fetcher: ->(url) { calls << url; html },
@@ -176,8 +176,8 @@ class KbStageTest < Minitest::Test
 
   def test_language_links_can_verify_explicit_pairs_for_english_releases
     calls = []
-    czech = 'http://kb-cs.aitherdev.int.vpsfree.cz/navody/vps/zalohy'
-    english = 'http://kb-en.aitherdev.int.vpsfree.cz/manuals/vps/backups'
+    czech = "#{ENV.fetch('VPSFREE_KB_CZ_STAGING_URL')}/navody/vps/zalohy"
+    english = "#{ENV.fetch('VPSFREE_KB_ORG_STAGING_URL')}/manuals/vps/backups"
     html = %(<a href="#{czech}">cs</a><a href="#{english}">en</a>)
     links = KbStage::LanguageLinks.new(
       fetcher: ->(url) { calls << url; html },
@@ -1720,12 +1720,18 @@ class KbStageTest < Minitest::Test
       codex = File.join(dir, 'codex')
       old_state = ENV['KB_STAGE_STATE_DIR']
       old_codex = ENV['KB_STAGE_CODEX_DIR']
+      old_cz_password = ENV['VPSFREE_KB_CZ_STAGING_PASSWORD_PATH']
+      old_org_password = ENV['VPSFREE_KB_ORG_STAGING_PASSWORD_PATH']
       ENV['KB_STAGE_STATE_DIR'] = state
       ENV['KB_STAGE_CODEX_DIR'] = codex
+      ENV['VPSFREE_KB_CZ_STAGING_PASSWORD_PATH'] = File.join(codex, 'cz-password')
+      ENV['VPSFREE_KB_ORG_STAGING_PASSWORD_PATH'] = File.join(codex, 'org-password')
       yield state, codex
     ensure
       ENV['KB_STAGE_STATE_DIR'] = old_state
       ENV['KB_STAGE_CODEX_DIR'] = old_codex
+      ENV['VPSFREE_KB_CZ_STAGING_PASSWORD_PATH'] = old_cz_password
+      ENV['VPSFREE_KB_ORG_STAGING_PASSWORD_PATH'] = old_org_password
     end
   end
 end

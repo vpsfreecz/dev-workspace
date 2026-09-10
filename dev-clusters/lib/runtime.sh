@@ -7,6 +7,7 @@ devcluster_load_runtime_contract() {
   runtime_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
   contract=""
   for candidate in \
+    "${DEVCLUSTER_RUNTIME_CONTRACT:-}" \
     "$runtime_directory/../../portal/internal/session/runtime-contract.json" \
     "$runtime_directory/../runtime-contract.json"; do
     [ -n "$candidate" ] || continue
@@ -679,9 +680,9 @@ devcluster_require_active_session() {
 devcluster_require_lifecycle_lock_owner() {
   local slug="$1"
   local owner="$2"
-  local lock_fd="${VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_FD:-}"
-  local lock_path="${VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_PATH:-}"
-  local workspace_name="${VPSFREE_WORKSPACE_NAME:-}"
+  local lock_fd="${DEV_SESSION_LIFECYCLE_LOCK_FD:-}"
+  local lock_path="${DEV_SESSION_LIFECYCLE_LOCK_PATH:-}"
+  local workspace_name="${DEV_WORKSPACE_NAME:-}"
   local runtime_root
   local fallback_path="$WORKSPACE/worktrees/.locks/$slug.lock"
   local authority_path=""
@@ -691,10 +692,10 @@ devcluster_require_lifecycle_lock_owner() {
     || die "development session lifecycle lock is unavailable"
   [ -n "$lock_path" ] && [ "${lock_path:0:1}" = / ] \
     || die "development session lifecycle lock path is invalid"
-  if [ -n "${VPSFREE_WORKSPACES_RUNTIME_DIR:-}" ]; then
-    runtime_root="$VPSFREE_WORKSPACES_RUNTIME_DIR"
+  if [ -n "${DEV_WORKSPACES_RUNTIME_DIR:-}" ]; then
+    runtime_root="$DEV_WORKSPACES_RUNTIME_DIR"
   else
-    runtime_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vpsfree-workspaces"
+    runtime_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dev-workspaces"
   fi
   if [[ "$workspace_name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
     authority_path="$runtime_root/$workspace_name/authority/$slug.lock"
@@ -742,7 +743,7 @@ devcluster_require_lifecycle_lock_owner() {
 devcluster_require_lifecycle_mutation_allowed() {
   local slug="$1"
   local operation_name="$2"
-  local owner="${VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION:-}"
+  local owner="${DEV_SESSION_LIFECYCLE_OPERATION:-}"
   local entry operation _command journal
 
   devcluster_load_runtime_contract

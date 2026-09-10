@@ -20,7 +20,7 @@ dev-clusters/vpsadmin/bin/devcluster gcroots --cleanup
 ```
 
 When running inside a `dev-session` shell, `ssh` can use
-`VPSFREE_DEV_SESSION_SLUG` automatically:
+`DEV_SESSION_SLUG` automatically:
 
 ```sh
 dev-clusters/vpsadmin/bin/devcluster ssh node1
@@ -35,8 +35,8 @@ Topologies:
 - `storage`: services VM, two regular nodes, and one storage node.
 
 Only one VPN-visible dev cluster should be active at a time. The cluster uses
-the existing `aitherdev` dev-network names and IPs, especially
-`webui.aitherdev.int.vpsfree.cz`. The `*-tmp.aitherdev.int.vpsfree.cz`
+the existing the development host dev-network names and IPs, especially
+`webui.staging.example.test`. The `*-tmp.staging.example.test`
 names are configured as secondary frontend entries for internal/maintenance
 access tests.
 
@@ -44,7 +44,7 @@ Network modes:
 
 - `bridge` is the default. It attaches VMs to `br0` and uses the predictable
   `172.16.106.*` dev addresses. The current user needs access to `/dev/kvm` and
-  a usable `qemu-bridge-helper`. On `aitherdev`, deploy the host configuration
+  a usable `qemu-bridge-helper`. On the development host, deploy the host configuration
   that provides `/run/wrappers/bin/qemu-bridge-helper` and keeps
   `/etc/qemu/bridge.conf` restricted to the allowed bridges.
 - `local` runs without bridge privileges. VMs talk to each other on a QEMU
@@ -94,12 +94,12 @@ The default seed creates:
 - mail recipients for admin daily reports;
 - vpsfree mail templates, when the matching worktree exists;
 - Adminer database browser, exposed as
-  `https://adminer.aitherdev.int.vpsfree.cz/`;
-- vpsFree.cz web, exposed as `https://web-cs.aitherdev.int.vpsfree.cz/`
-  and `https://web-en.aitherdev.int.vpsfree.cz/`, when the matching
+  `https://adminer.staging.example.test/`;
+- vpsFree.cz web, exposed as `https://web-cs.staging.example.test/`
+  and `https://web-en.staging.example.test/`, when the matching
   worktree exists;
 - a vpsf-status instance on the services VM, exposed as
-  `https://status.aitherdev.int.vpsfree.cz/`.
+  `https://status.staging.example.test/`.
 
 The plugin set is configured with `plugins.enabled`. The default value is
 `"all"`, which enables every plugin directory bundled in the selected vpsAdmin
@@ -125,7 +125,7 @@ dev-clusters/vpsadmin/bin/devcluster start 2026-05-29-security-advisories --topo
 
 For browser testing in `local` mode, resolve the printed dev hostnames to
 `127.0.0.1` and use port `10443`, for example
-`https://webui.aitherdev.int.vpsfree.cz:10443/`.
+`https://webui.staging.example.test:10443/`.
 
 ## HTTPS
 
@@ -159,7 +159,7 @@ to print the CA certificate path and fingerprint for browser trust setup.
 Outgoing vpsAdmin mail is captured by Mailpit in the mailer container. The
 Mailpit UI is exposed through the services nginx frontend at the HTTPS URL
 printed by `devcluster urls`, currently
-`https://mailpit.aitherdev.int.vpsfree.cz/`, and is protected with the
+`https://mailpit.staging.example.test/`, and is protected with the
 configured development basic-auth credentials. The raw Mailpit HTTP listener is
 bound to `127.0.0.1` inside the services VM.
 
