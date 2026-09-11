@@ -59,9 +59,8 @@ module DevClusters
       FileUtils.mkdir_p(opts[:sock_dir])
       FileUtils.mkdir_p(File.dirname(opts[:pid_file]))
       FileUtils.rm_f(opts[:ready_file])
-      File.write(opts[:pid_file], "#{Process.pid}\n")
-
       machines = build_machines(opts)
+      File.write(opts[:pid_file], "#{Process.pid}\n")
       stopping = false
 
       stop_all = proc do
@@ -141,9 +140,16 @@ module DevClusters
     def build_machines(opts)
       config = JSON.parse(File.read(opts[:config]))
 
+      if config.fetch('machines').values.any? { |machine| machine['spin'] == 'nixos' } \
+          && !OsVm::NixosMachine.method_defined?(:preserve_root_disk)
+        raise 'The vpsAdminOS input does not support persistent NixOS root disks. Update the vpsAdminOS worktree before starting this cluster.'
+      end
+
       config.fetch('machines').map do |name, machine_cfg|
         osvm_cfg = OsVm::MachineConfig.from_config(machine_cfg)
         klass = machine_class(osvm_cfg)
+        machine_opts = { default_timeout: opts[:timeout], hash_base: }
+        machine_opts[:preserve_root_disk] = true if osvm_cfg.spin == 'nixos'
 
         MachineState.new(
           name: name,
@@ -152,8 +158,7 @@ module DevClusters
             osvm_cfg,
             opts[:state_dir],
             opts[:sock_dir],
-            default_timeout: opts[:timeout],
-            hash_base:
+            **machine_opts
           )
         )
       end

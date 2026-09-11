@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     dev-workspace.url = "github:aither64/dev-workspace/bcbaf825d71285cbbd05b56e78bc386f2df480bd";
-    devcluster-vpsadminos.url = "github:vpsfreecz/vpsadminos/staging";
+    devcluster-vpsadminos.url = "github:vpsfreecz/vpsadminos/e6c4c5cfa27ce3b139bba6475be80cfead4b8df4";
     devcluster-vpsadmin = {
       url = "github:vpsfreecz/vpsadmin/master";
       inputs.vpsadminos.follows = "devcluster-vpsadminos";
@@ -281,6 +281,7 @@
               export RUNTIME_AUTHORITY_CORPUS=${dev-workspace.lib.runtimeAuthorityCorpus}
               ruby test/devcluster_status_test.rb
               ruby test/devcluster_commands_test.rb
+              ruby test/devcluster_runner_test.rb
               ruby test/kb_cleanup_test.rb
               ruby test/kb_contract_tools_test.rb
               ruby test/kb_page_test.rb
