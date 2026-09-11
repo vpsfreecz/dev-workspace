@@ -4,6 +4,17 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     dev-workspace.url = "github:aither64/dev-workspace/bcbaf825d71285cbbd05b56e78bc386f2df480bd";
+    devcluster-vpsadminos.url = "github:vpsfreecz/vpsadminos/staging";
+    devcluster-vpsadmin = {
+      url = "github:vpsfreecz/vpsadmin/master";
+      inputs.vpsadminos.follows = "devcluster-vpsadminos";
+    };
+    devcluster-vpsf-status = {
+      url = "github:vpsfreecz/vpsf-status/master";
+      inputs.nixpkgs.follows = "devcluster-vpsadminos/nixpkgs";
+      inputs.vpsadmin.follows = "devcluster-vpsadmin";
+      inputs.vpsadminos.follows = "devcluster-vpsadminos";
+    };
   };
 
   outputs =
@@ -123,6 +134,26 @@
         inherit pkgs;
         siteConfig = testSiteConfig;
       };
+      devclusterCheck = pkgs.writeShellApplication {
+        name = "devcluster-check";
+        runtimeInputs = [
+          pkgs.ruby
+          pkgs.nix
+          pkgs.openssh
+        ];
+        text = ''
+          exec ruby ${./test/devcluster_nix_smoke.rb} \
+            ${
+              mkOrganizationTools {
+                inherit pkgs;
+                siteConfig = testSiteConfig;
+              }
+            } \
+            ${inputs.devcluster-vpsadmin} \
+            ${inputs.devcluster-vpsadminos} \
+            ${inputs.devcluster-vpsf-status} "$@"
+        '';
+      };
       testCompatibilityPackage = mkPackage {
         activationEnvironmentAliases = [ "VPSFREE_WORKSPACE_ACTIVATION" ];
         inherit pkgs;
@@ -181,6 +212,10 @@
     {
       lib = {
         inherit mkPackage;
+      };
+      apps.${system}.devcluster-check = {
+        type = "app";
+        program = "${devclusterCheck}/bin/devcluster-check";
       };
       packages.${system}.host-migration-test = import ./nix/tests/host-migration.nix {
         inherit pkgs;
@@ -245,6 +280,7 @@
               ${testEnvironment}
               export RUNTIME_AUTHORITY_CORPUS=${dev-workspace.lib.runtimeAuthorityCorpus}
               ruby test/devcluster_status_test.rb
+              ruby test/devcluster_commands_test.rb
               ruby test/kb_cleanup_test.rb
               ruby test/kb_contract_tools_test.rb
               ruby test/kb_page_test.rb

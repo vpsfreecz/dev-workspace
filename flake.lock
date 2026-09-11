@@ -76,6 +76,83 @@
         "type": "github"
       }
     },
+    "devcluster-vpsadmin": {
+      "inputs": {
+        "nixpkgs": [
+          "devcluster-vpsadmin",
+          "vpsadminos",
+          "nixpkgs"
+        ],
+        "vpsadminos": [
+          "devcluster-vpsadminos"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789125776,
+        "narHash": "sha256-QNs42PTrwpZAsPuuPmmfFbQf5tHtYtSPAPociIwOTik=",
+        "owner": "vpsfreecz",
+        "repo": "vpsadmin",
+        "rev": "8d0ccafd5b307115ddc4b1f24152ba30ed52e893",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vpsfreecz",
+        "ref": "master",
+        "repo": "vpsadmin",
+        "type": "github"
+      }
+    },
+    "devcluster-vpsadminos": {
+      "inputs": {
+        "impermanence": "impermanence",
+        "netlinkrb": "netlinkrb",
+        "nixpkgs": "nixpkgs_4",
+        "nixpkgsUnstable": "nixpkgsUnstable",
+        "ruby-lxc": "ruby-lxc"
+      },
+      "locked": {
+        "lastModified": 1789111495,
+        "narHash": "sha256-P1o6WVoBguu3/JaQ1GSYqnUIgRXHNwA3abMGUdfuMfo=",
+        "owner": "vpsfreecz",
+        "repo": "vpsadminos",
+        "rev": "3eaf7b7320754715b38fc629e7f0ce23d13402cd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vpsfreecz",
+        "ref": "staging",
+        "repo": "vpsadminos",
+        "type": "github"
+      }
+    },
+    "devcluster-vpsf-status": {
+      "inputs": {
+        "nixpkgs": [
+          "devcluster-vpsadminos",
+          "nixpkgs"
+        ],
+        "vpsadmin": [
+          "devcluster-vpsadmin"
+        ],
+        "vpsadminos": [
+          "devcluster-vpsadminos"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788260265,
+        "narHash": "sha256-4iun0P87K5kKG2vYi6Beio/1iWlHmNYFjD8Hlg2qGgk=",
+        "owner": "vpsfreecz",
+        "repo": "vpsf-status",
+        "rev": "587cd65bb02e6dddea7f6b6409e42a15f36ab4fb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vpsfreecz",
+        "ref": "master",
+        "repo": "vpsf-status",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": [
@@ -95,6 +172,47 @@
       "original": {
         "owner": "hercules-ci",
         "repo": "flake-parts",
+        "type": "github"
+      }
+    },
+    "home-manager": {
+      "inputs": {
+        "nixpkgs": [
+          "devcluster-vpsadminos",
+          "impermanence",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1768598210,
+        "narHash": "sha256-kkgA32s/f4jaa4UG+2f8C225Qvclxnqs76mf8zvTVPg=",
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "c47b2cc64a629f8e075de52e4742de688f930dc6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "type": "github"
+      }
+    },
+    "impermanence": {
+      "inputs": {
+        "home-manager": "home-manager",
+        "nixpkgs": "nixpkgs_3"
+      },
+      "locked": {
+        "lastModified": 1769548169,
+        "narHash": "sha256-03+JxvzmfwRu+5JafM0DLbxgHttOQZkUtDWBmeUkN8Y=",
+        "owner": "nix-community",
+        "repo": "impermanence",
+        "rev": "7b1d382faf603b6d264f58627330f9faa5cba149",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "impermanence",
         "type": "github"
       }
     },
@@ -121,6 +239,22 @@
         "type": "github"
       }
     },
+    "netlinkrb": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1562850306,
+        "narHash": "sha256-0bXTWUdUDr2XP+bEIfIbxXap8Niva/IoPXTxFeXXImg=",
+        "owner": "vpsfreecz",
+        "repo": "netlinkrb",
+        "rev": "d9de53d843d2586ffa5b7b404887fa801c697ddf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vpsfreecz",
+        "repo": "netlinkrb",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788982683,
@@ -133,6 +267,22 @@
       "original": {
         "owner": "NixOS",
         "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgsUnstable": {
+      "locked": {
+        "lastModified": 1789006805,
+        "narHash": "sha256-xB8mKMOx1IA9vTDNLmJZ6n4wCMq/cuWBBOzGCRnqxrU=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "8ce4ef6cb6f871616146b9fe26d2a5ae594e94fe",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
         "repo": "nixpkgs",
         "type": "github"
       }
@@ -155,6 +305,38 @@
     },
     "nixpkgs_3": {
       "locked": {
+        "lastModified": 1768564909,
+        "narHash": "sha256-Kell/SpJYVkHWMvnhqJz/8DqQg2b6PguxVWOuadbHCc=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "e4bae1bd10c9c57b2cf517953ab70060a828ee6f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_4": {
+      "locked": {
+        "lastModified": 1789009968,
+        "narHash": "sha256-GB16oaxpsrnGNnGIE+0uYBqMRzB9X6FYDUvjvnJAYew=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "d58a46e3bc02d91ebe04667f8397752a749c0024",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_5": {
+      "locked": {
         "lastModified": 1789009968,
         "narHash": "sha256-GB16oaxpsrnGNnGIE+0uYBqMRzB9X6FYDUvjvnJAYew=",
         "owner": "NixOS",
@@ -172,7 +354,27 @@
     "root": {
       "inputs": {
         "dev-workspace": "dev-workspace",
-        "nixpkgs": "nixpkgs_3"
+        "devcluster-vpsadmin": "devcluster-vpsadmin",
+        "devcluster-vpsadminos": "devcluster-vpsadminos",
+        "devcluster-vpsf-status": "devcluster-vpsf-status",
+        "nixpkgs": "nixpkgs_5"
+      }
+    },
+    "ruby-lxc": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1780499941,
+        "narHash": "sha256-guAdOSP9MyCL3BQ1LGXAhcCoXgEU1fUE69d2ATMqUGE=",
+        "owner": "vpsfreecz",
+        "repo": "ruby-lxc",
+        "rev": "004bf35eb90d41ba60b347b5b1e73d868a4f95d9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vpsfreecz",
+        "ref": "2026-06-03-nixos-26-05-port",
+        "repo": "ruby-lxc",
+        "type": "github"
       }
     },
     "systems": {

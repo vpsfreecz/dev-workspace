@@ -50,6 +50,17 @@ Run the regular package and contract checks with:
 nix flake check --print-build-logs
 ```
 
+Check the installed development-cluster flakes and runner dependencies with:
+
+```sh
+nix run .#devcluster-check
+```
+
+This check uses locked test inputs and temporary configuration. It evaluates
+both network modes with package defaults and per-cluster overrides, then builds
+and loads both Ruby runners. It does not build VM closures or start VMs. Run it
+outside a Nix build sandbox so it can access the Nix daemon.
+
 The migration helper is intentionally not automatic or linked into `~/bin`.
 Invoke it through the package's private
 `libexec/vpsfree-dev-workspace-migrate` path, read its `--help` output and
