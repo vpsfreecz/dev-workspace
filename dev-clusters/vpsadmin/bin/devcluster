@@ -714,11 +714,43 @@ ssh_cmd() {
   ssh $(ssh_opts "$slug" "$machine") "root@$host" "$@"
 }
 
+wait_for_machine_ssh() {
+  local slug="$1" machine="$2"
+  local deadline=$((SECONDS + 120)) result host remaining probe_timeout
+
+  host="$(machine_host "$slug" "$machine")" || return
+
+  printf 'Waiting for SSH on %s\n' "$machine"
+  while true; do
+    remaining=$((deadline - SECONDS))
+    if [ "$remaining" -le 0 ]; then
+      printf 'error: SSH on %s was not ready within 120 seconds\n' "$machine" >&2
+      return 255
+    fi
+    probe_timeout=5
+    [ "$remaining" -ge "$probe_timeout" ] || probe_timeout="$remaining"
+    # shellcheck disable=SC2046
+    if timeout --kill-after=1 "$probe_timeout" ssh $(ssh_opts "$slug" "$machine") \
+      -n -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=3 "root@$host" true >/dev/null 2>&1; then
+      return 0
+    else
+      result=$?
+    fi
+
+    if [ "$result" -ne 255 ]; then
+      printf 'error: SSH readiness probe for %s failed with status %s\n' "$machine" "$result" >&2
+      return "$result"
+    fi
+    sleep 1 || return
+  done
+}
+
 wait_for_seeded_pool() {
   local slug="$1"
   local pool_fs
   pool_fs="$(config_get "$slug" '.seed.pools.filesystem')"
 
+  wait_for_machine_ssh "$slug" services || return
   printf 'Waiting for services seed to publish pool %s\n' "$pool_fs"
   ssh_cmd "$slug" services sh -s -- "$pool_fs" <<'EOF'
 set -eu
@@ -754,6 +786,7 @@ refresh_nodes_after_seed() {
     role="$(jq -r --arg machine "$machine" '.nodes[$machine].role // empty' "$cfg")"
     [ "$role" = "node" ] || continue
 
+    wait_for_machine_ssh "$slug" "$machine" || return
     printf 'Preparing %s pool runtime and restarting nodectld\n' "$machine"
     ssh_cmd "$slug" "$machine" sh -s -- "$pool_fs" <<'EOF' || return
 set -eu

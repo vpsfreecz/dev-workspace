@@ -124,6 +124,9 @@ After a services seed has changed pool data, `devcluster refresh <slug>` prepare
 the vpsAdmin pool working directories and default pool device grants on regular
 nodes, then restarts nodectld so DB-seeded pools are usable by node transactions.
 `start` and `update ... services` run the same refresh automatically.
+Refresh waits up to two minutes for SSH on each machine before checking the seed
+or preparing a node. Probes cannot prompt for credentials; a stalled probe fails
+after five seconds. A failed remote action stops refresh immediately.
 
 Example local start:
 

@@ -76,8 +76,31 @@ class DevclusterCommandsTest < Minitest::Test
       with_workspace('vpsadmin') do |env, _directory|
         result = run_helper('vpsadmin', env.merge('FAIL_AT' => 'ssh'), command)
         assert_equal(23, result.exitstatus)
+        assert_equal(1, events(env).count { |event| event['event'] == 'ssh' })
         assert_locks_released(env)
       end
+    end
+  end
+
+  def test_refresh_waits_for_node_ssh_before_running_remote_actions
+    with_workspace('vpsadmin') do |env, _directory|
+      result = run_helper('vpsadmin', env.merge('RETRY_NODE_SSH' => '1'), 'start')
+      assert(result.success?, @last_output)
+      assert_equal(4, events(env).count { |event| event['event'] == 'ssh-ready' })
+      assert_equal(3, events(env).count { |event| event['event'] == 'ssh' })
+      assert_locks_released(env)
+    end
+  end
+
+  def test_stalled_ssh_probe_times_out_without_running_remote_actions
+    with_workspace('vpsadmin') do |env, _directory|
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = run_helper('vpsadmin', env.merge('HANG_SSH_PROBE' => '1'), 'refresh')
+      assert_equal(124, result.exitstatus)
+      assert_operator(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 15)
+      assert_equal(1, events(env).count { |event| event['event'] == 'ssh-ready' })
+      assert_equal(0, events(env).count { |event| event['event'] == 'ssh' })
+      assert_locks_released(env)
     end
   end
 
@@ -186,7 +209,14 @@ class DevclusterCommandsTest < Minitest::Test
       event = case command
               when 'nix' then ARGV.first
               when 'ssh-keygen' then 'keygen'
-              when 'ssh' then ARGV.any? { |arg| arg.include?('switch-to-configuration') } ? 'activate' : 'ssh'
+              when 'ssh'
+                if ARGV.any? { |arg| arg.include?('switch-to-configuration') }
+                  'activate'
+                elsif ARGV.last == 'true'
+                  'ssh-ready'
+                else
+                  'ssh'
+                end
               when 'openssl' then ARGV.first
               else command
               end
@@ -222,6 +252,17 @@ class DevclusterCommandsTest < Minitest::Test
           File.write(output, 'fixture')
         end
       when 'ssh'
+        if event == 'ssh-ready'
+          exit 24 unless ARGV.include?('BatchMode=yes') && ARGV.include?('IdentitiesOnly=yes')
+          sleep 60 if ENV['HANG_SSH_PROBE'] == '1'
+        end
+        if event == 'ssh-ready' && ENV['RETRY_NODE_SSH'] == '1' && value_after('-p') == '10122'
+          marker = File.join(ENV.fetch('DEVCLUSTER_WORKSPACE'), 'ssh-ready-retried')
+          unless File.exist?(marker)
+            File.write(marker, 'retried')
+            exit 255
+          end
+        end
         STDIN.read if ARGV.include?('sh')
       end
     RUBY
