@@ -10,6 +10,11 @@ Runtime state, SSH keys, result links, VM disks, sockets, and logs are stored
 under `.dev-clusters/vpsadminos/` at the workspace root and are intentionally
 not tracked by git.
 
+The selected vpsAdminOS source must include commit `6f9b2c755` (June 12,
+2026) or a compatible newer revision exposing `overlays.all` and
+`vpsadminosRubyGemConfig`. Rebase older development worktrees before `start` or
+`update`. Existing VM disks need no conversion.
+
 ## Basic Usage
 
 ```sh

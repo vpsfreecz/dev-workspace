@@ -57,13 +57,6 @@
         name = "devcluster-runner-lib";
       };
 
-      pkgs = import nixpkgs {
-        inherit system;
-        overlays = import (vpsadminos.outPath + "/os/overlays") {
-          inherit (vpsadminos.inputs) netlinkrb ruby-lxc;
-        };
-      };
-
       clusterTest = import ./nix/test.nix {
         inherit
           lib
@@ -93,34 +86,27 @@
           ;
       };
 
-      clusterConfig = import (vpsadminos.outPath + "/tests/make-test.nix") clusterTest {
-        inherit system;
-        pkgs = nixpkgs.outPath;
-        extraArgs = {
-          inherit vpsadminos;
-        };
+      # Validate the runner source interface before a configuration build.
+      clusterConfig = builtins.seq runner (
+        import (vpsadminos.outPath + "/tests/make-test.nix") clusterTest {
+          inherit system;
+          pkgs = nixpkgs.outPath;
+          extraArgs = {
+            inherit vpsadminos;
+          };
+        }
+      );
+
+      runner = import ./shared/runner.nix {
+        inherit
+          nixpkgs
+          vpsadminos
+          system
+          sharedRunnerLib
+          ;
+        name = "vpsadmin-devcluster-runner";
+        runnerLib = ./lib;
       };
-
-      ruby = pkgs.ruby_vpsadminos;
-      runnerDeps = pkgs.bundlerEnv {
-        name = "vpsadmin-devcluster-runner-deps";
-
-        gemfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile";
-        lockfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile.lock";
-        gemset = vpsadminos.outPath + "/os/packages/test-runner/gemset.nix";
-        groups = [ "default" ];
-
-        inherit ruby;
-        gemConfig = pkgs.vpsadminosRubyGemConfig;
-      };
-
-      runner = pkgs.writeShellScriptBin "vpsadmin-devcluster-runner" ''
-        export GEM_HOME=${runnerDeps}/${ruby.gemPath}
-        export GEM_PATH=${runnerDeps}/${ruby.gemPath}
-        export RUBYLIB=${./lib}:${sharedRunnerLib}:${vpsadminos.outPath}/test-runner/lib:${vpsadminos.outPath}/osvm/lib:${vpsadminos.outPath}/libosctl/lib
-
-        exec ${ruby}/bin/ruby ${./lib/devcluster-runner.rb} "$@"
-      '';
     in
     {
       packages.${system} = {

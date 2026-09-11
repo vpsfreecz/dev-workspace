@@ -36,11 +36,6 @@
         name = "devcluster-runner-lib";
       };
 
-      pkgs = import nixpkgs {
-        inherit system;
-        overlays = import (vpsadminos.outPath + "/os/overlays");
-      };
-
       clusterTest = import ./nix/test.nix {
         inherit
           lib
@@ -56,31 +51,27 @@
           ;
       };
 
-      clusterConfig = import (vpsadminos.outPath + "/tests/make-test.nix") clusterTest {
-        inherit system;
-        pkgs = nixpkgs.outPath;
-        extraArgs = {
-          inherit vpsadminos;
-        };
+      # Validate the runner source interface before a configuration build.
+      clusterConfig = builtins.seq runner (
+        import (vpsadminos.outPath + "/tests/make-test.nix") clusterTest {
+          inherit system;
+          pkgs = nixpkgs.outPath;
+          extraArgs = {
+            inherit vpsadminos;
+          };
+        }
+      );
+
+      runner = import ./shared/runner.nix {
+        inherit
+          nixpkgs
+          vpsadminos
+          system
+          sharedRunnerLib
+          ;
+        name = "vpsadminos-devcluster-runner";
+        runnerLib = ./lib;
       };
-
-      ruby = pkgs.ruby_vpsadminos;
-      runnerDeps = pkgs.bundlerEnv {
-        name = "vpsadminos-devcluster-runner-deps";
-        gemfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile";
-        lockfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile.lock";
-        gemset = vpsadminos.outPath + "/os/packages/test-runner/gemset.nix";
-        groups = [ "default" ];
-        inherit ruby;
-      };
-
-      runner = pkgs.writeShellScriptBin "vpsadminos-devcluster-runner" ''
-        export GEM_HOME=${runnerDeps}/${ruby.gemPath}
-        export GEM_PATH=${runnerDeps}/${ruby.gemPath}
-        export RUBYLIB=${./lib}:${sharedRunnerLib}:${vpsadminos.outPath}/test-runner/lib:${vpsadminos.outPath}/osvm/lib:${vpsadminos.outPath}/libosctl/lib
-
-        exec ${ruby}/bin/ruby ${./lib/devcluster-runner.rb} "$@"
-      '';
     in
     {
       packages.${system} = {

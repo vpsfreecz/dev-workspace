@@ -89,8 +89,10 @@ stdenvNoCC.mkDerivation {
       "$out/share/vpsfree-dev-workspace/nix/host-paths.json"
     chmod -R u+w "$out/share/vpsfree-dev-workspace"
     for provider in vpsadmin vpsadminos; do
-      install -Dm644 dev-clusters/lib/devcluster_runner.rb \
-        "$out/share/vpsfree-dev-workspace/dev-clusters/$provider/shared/devcluster_runner.rb"
+      for asset in devcluster_runner.rb runner.nix; do
+        install -Dm644 "dev-clusters/lib/$asset" \
+          "$out/share/vpsfree-dev-workspace/dev-clusters/$provider/shared/$asset"
+      done
     done
     install -m644 ${clusterConfigurations.vpsadmin} \
       "$out/share/vpsfree-dev-workspace/dev-clusters/vpsadmin/default-config.json"
@@ -149,9 +151,11 @@ stdenvNoCC.mkDerivation {
       cluster="$out/share/vpsfree-dev-workspace/dev-clusters/$provider"
       test -f "$cluster/default-config.json"
       test ! -L "$cluster/default-config.json"
-      test -f "$cluster/shared/devcluster_runner.rb"
-      test ! -L "$cluster/shared/devcluster_runner.rb"
-      ${diffutils}/bin/cmp dev-clusters/lib/devcluster_runner.rb "$cluster/shared/devcluster_runner.rb"
+      for asset in devcluster_runner.rb runner.nix; do
+        test -f "$cluster/shared/$asset"
+        test ! -L "$cluster/shared/$asset"
+        ${diffutils}/bin/cmp "dev-clusters/lib/$asset" "$cluster/shared/$asset"
+      done
     done
     ${diffutils}/bin/cmp ${clusterConfigurations.vpsadmin} \
       "$out/share/vpsfree-dev-workspace/dev-clusters/vpsadmin/default-config.json"
