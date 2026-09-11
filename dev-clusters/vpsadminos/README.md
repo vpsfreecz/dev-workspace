@@ -121,3 +121,9 @@ The update command copies the new system closure over SSH and runs
 `switch-to-configuration switch` inside the selected VM.
 
 Use `reset <slug>` to remove the per-slug VM state, including persistent disks.
+
+`start` and `update` stop if credential preparation or configuration building
+fails. They retain the previous build result for recovery and do not launch or
+deploy it as a replacement for a failed build. An update stops at the first
+failed copy or activation; machines updated before that failure keep
+their new configuration.

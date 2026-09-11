@@ -246,3 +246,9 @@ updating the cluster:
 cd worktrees/<slug>/vpsadmin
 nix develop -c rake vpsadmin:gems
 ```
+
+`start` and `update` stop if credential preparation or configuration building
+fails. They retain the previous build result for recovery and do not launch or
+deploy it as a replacement for a failed build. An update stops at the first
+failed copy, activation, or refresh; machines updated before that failure keep
+their new configuration.

@@ -107,11 +107,11 @@ ensure_cluster_config() {
   cfg="$(cluster_config_file "$slug")"
 
   need_cmd jq
-  devcluster_initialize_cluster_socket_identity "$slug" "$DEVCLUSTER_SOCKET_PREFIX"
+  devcluster_initialize_cluster_socket_identity "$slug" "$DEVCLUSTER_SOCKET_PREFIX" || return
 
   [ ! -L "$cfg" ] || die "unsafe cluster config symlink: $cfg"
   if [ ! -f "$cfg" ]; then
-    cp "$DEFAULT_CONFIG_FILE" "$cfg"
+    cp "$DEFAULT_CONFIG_FILE" "$cfg" || return
   fi
 
   jq -e . "$cfg" >/dev/null
@@ -208,11 +208,11 @@ node_ssh_port() {
 }
 
 ensure_ssh_key() {
-  devcluster_validate_ssh_directory true
+  devcluster_validate_ssh_directory true || return
 
   if [ ! -f "$SSH_KEY" ]; then
     need_cmd ssh-keygen
-    ssh-keygen -t ed25519 -N '' -C 'vpsadminos-devcluster' -f "$SSH_KEY" >/dev/null
+    ssh-keygen -t ed25519 -N '' -C 'vpsadminos-devcluster' -f "$SSH_KEY" >/dev/null || return
   fi
 }
 
@@ -221,7 +221,7 @@ build_config_with_credentials() {
   local topology="$2"
   local network="$3"
 
-  ensure_ssh_key
+  ensure_ssh_key || return
   build_config "$slug" "$topology" "$network"
 }
 
@@ -275,13 +275,13 @@ build_config() {
   local vpsadminos_input_value
 
   dir="$(cluster_dir "$slug")"
-  mkdir -p "$dir"
-  ensure_cluster_config "$slug"
+  mkdir -p "$dir" || return
+  ensure_cluster_config "$slug" || return
 
   vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
-  vpsadminos_input_value="$(vpsadminos_input "$slug")"
+  vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
 
-  nix_common_env "$slug" "$topology" "$network" "$vpsadminos_path"
+  nix_common_env "$slug" "$topology" "$network" "$vpsadminos_path" || return
 
   local -a overrides=()
   while IFS= read -r -d '' item; do
@@ -365,8 +365,8 @@ start_cluster() {
     esac
   done
 
-  ensure_cluster_config "$slug"
-  node_names "$slug" "$topology" >/dev/null
+  ensure_cluster_config "$slug" || return
+  node_names "$slug" "$topology" >/dev/null || return
   case "$network" in
     bridge|local) ;;
     *) die "unknown network mode '$network'" ;;
@@ -388,14 +388,14 @@ start_cluster() {
     done < <(node_names "$slug" "$topology")
   fi
 
-  kill_socket_processes "$slug"
+  kill_socket_processes "$slug" || return
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
-    build_config_with_credentials "$slug" "$topology" "$network"
-  printf '%s\n' "$topology" > "$(topology_file "$slug")"
-  printf '%s\n' "$network" > "$(network_file "$slug")"
+    build_config_with_credentials "$slug" "$topology" "$network" || return
+  printf '%s\n' "$topology" > "$(topology_file "$slug")" || return
+  printf '%s\n' "$network" > "$(network_file "$slug")" || return
 
   local vpsadminos_input_value
-  vpsadminos_input_value="$(vpsadminos_input "$slug")"
+  vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
 
   local -a runner_overrides=()
   while IFS= read -r -d '' item; do
@@ -407,10 +407,10 @@ start_cluster() {
   log="$dir/runner.log"
   ready="$(ready_file "$slug")"
   sock_dir="$(socket_dir "$slug")"
-  rm -f "$ready" "$pid_path"
-  rm -rf "$sock_dir"
-  mkdir -p "$sock_dir"
-  printf '\n=== devcluster start %s ===\n' "$(date -Is)" >>"$log"
+  rm -f "$ready" "$pid_path" || return
+  rm -rf "$sock_dir" || return
+  mkdir -p "$sock_dir" || return
+  printf '\n=== devcluster start %s ===\n' "$(date -Is)" >>"$log" || return
 
   local -a command=(
     nix run
@@ -428,7 +428,7 @@ start_cluster() {
   )
 
   (
-    cd "$WORKSPACE"
+    cd "$WORKSPACE" || exit
     devcluster_exec_without_lifecycle_lock nohup setsid "${command[@]}"
   ) >>"$log" 2>&1 &
 
@@ -573,7 +573,7 @@ config_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
 
-  ensure_cluster_config "$slug"
+  ensure_cluster_config "$slug" || return
   printf 'Config: %s\n' "$(cluster_config_file "$slug")"
   cat "$(cluster_config_file "$slug")"
 }
@@ -587,7 +587,7 @@ update_cluster() {
   network="$(cluster_network "$slug")"
 
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
-    build_config_with_credentials "$slug" "$topology" "$network"
+    build_config_with_credentials "$slug" "$topology" "$network" || return
 
   need_cmd jq
 
@@ -600,19 +600,19 @@ update_cluster() {
   fi
 
   local cfg
-  cfg="$(config_path "$slug")"
+  cfg="$(config_path "$slug")" || return
 
   local node host toplevel opts
   for node in "${machines[@]}"; do
     host="$(node_host "$slug" "$node")"
-    toplevel="$(jq -r --arg node "$node" '.machines[$node].toplevel // empty' "$cfg")"
+    toplevel="$(jq -r --arg node "$node" '.machines[$node].toplevel // empty' "$cfg")" || return
     [ -n "$toplevel" ] || die "no toplevel found for $node in $cfg"
     opts="$(ssh_opts "$slug" "$node")"
 
     printf 'Updating %s (%s) to %s\n' "$node" "$host" "$toplevel"
-    NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$toplevel"
+    NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$toplevel" || return
     # shellcheck disable=SC2086
-    ssh $opts "root@$host" "$toplevel/bin/switch-to-configuration" switch
+    ssh $opts "root@$host" "$toplevel/bin/switch-to-configuration" switch || return
   done
 }
 
