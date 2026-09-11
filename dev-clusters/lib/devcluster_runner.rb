@@ -140,16 +140,14 @@ module DevClusters
     def build_machines(opts)
       config = JSON.parse(File.read(opts[:config]))
 
-      if config.fetch('machines').values.any? { |machine| machine['spin'] == 'nixos' } \
-          && !OsVm::NixosMachine.method_defined?(:preserve_root_disk)
-        raise 'The vpsAdminOS input does not support persistent NixOS root disks. Update the vpsAdminOS worktree before starting this cluster.'
+      unless OsVm::MachineConfig::Disk.method_defined?(:preserve) && OsVm::MachineConfig.method_defined?(:all_disks)
+        raise 'The vpsAdminOS input does not support per-disk preservation. Update the selected vpsAdminOS source before starting this cluster.'
       end
 
       config.fetch('machines').map do |name, machine_cfg|
         osvm_cfg = OsVm::MachineConfig.from_config(machine_cfg)
         klass = machine_class(osvm_cfg)
         machine_opts = { default_timeout: opts[:timeout], hash_base: }
-        machine_opts[:preserve_root_disk] = true if osvm_cfg.spin == 'nixos'
 
         MachineState.new(
           name: name,

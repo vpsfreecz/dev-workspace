@@ -2,74 +2,74 @@ require 'json'
 require 'minitest/autorun'
 require 'tmpdir'
 
-# Minimal OSVM constructors expose the cross-repository keyword contract.
+# Minimal OSVM types expose the consumer's required disk API.
 module OsVm
   class MachineConfig
+    class Disk
+      attr_reader :preserve
+    end
+
+    def all_disks
+      []
+    end
+
     def self.from_config(config)
+      raise 'constructed an unsupported machine' unless Disk.method_defined?(:preserve)
+
       Struct.new(:spin).new(config.fetch('spin'))
     end
   end
 
   class NixosMachine
-    attr_reader :preserve_root_disk
-
-    def initialize(*_args, preserve_root_disk: false, **_options)
-      @preserve_root_disk = preserve_root_disk
-    end
-  end
-
-  class VpsadminosMachine
     attr_reader :options
 
     def initialize(*_args, **options)
       @options = options
     end
   end
+
+  class VpsadminosMachine < NixosMachine; end
 end
 $LOADED_FEATURES << 'osvm.rb'
 require_relative '../dev-clusters/lib/devcluster_runner'
 
 class DevclusterRunnerTest < Minitest::Test
-  def test_only_nixos_guests_request_root_disk_preservation
+  def test_both_guests_use_the_generic_disk_defaults
     with_runner do |runner, options|
       machines = runner.send(:build_machines, options)
-      assert(machines[0].machine.preserve_root_disk)
-      refute(machines[1].machine.options.key?(:preserve_root_disk))
+      assert_equal(2, machines.length)
+      machines.each do |entry|
+        assert_equal({ default_timeout: 30, hash_base: 'test' }, entry.machine.options)
+      end
     end
   end
 
   def test_old_osvm_is_rejected_before_machine_construction
     with_runner do |runner, options|
-      with_legacy_nixos_machine do
+      with_legacy_disk do
         error = assert_raises(RuntimeError) { runner.send(:build_machines, options) }
-        assert_includes(error.message, 'persistent NixOS root disks')
+        assert_includes(error.message, 'per-disk preservation')
       end
     end
   end
 
-  def test_vpsadminos_only_clusters_do_not_require_the_nixos_disk_option
+  def test_vpsadminos_only_clusters_also_require_the_disk_api
     with_runner do |runner, options|
       File.write(options.fetch(:config), JSON.generate('machines' => { 'node1' => { 'spin' => 'vpsadminos' } }))
-      with_legacy_nixos_machine do
-        machines = runner.send(:build_machines, options)
-        assert_equal(1, machines.length)
-        refute(machines.first.machine.options.key?(:preserve_root_disk))
+      with_legacy_disk do
+        error = assert_raises(RuntimeError) { runner.send(:build_machines, options) }
+        assert_includes(error.message, 'per-disk preservation')
       end
     end
   end
 
-  def with_legacy_nixos_machine
-    original = OsVm.send(:remove_const, :NixosMachine)
-    legacy = Class.new do
-      def initialize(*)
-        raise 'constructed an unsupported machine'
-      end
-    end
-    OsVm.const_set(:NixosMachine, legacy)
+  def with_legacy_disk
+    original = OsVm::MachineConfig.send(:remove_const, :Disk)
+    OsVm::MachineConfig.const_set(:Disk, Class.new)
     yield
   ensure
-    OsVm.send(:remove_const, :NixosMachine)
-    OsVm.const_set(:NixosMachine, original)
+    OsVm::MachineConfig.send(:remove_const, :Disk)
+    OsVm::MachineConfig.const_set(:Disk, original)
   end
 
   def with_runner

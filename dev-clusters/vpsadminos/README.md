@@ -1,5 +1,12 @@
 # vpsAdminOS Dev Clusters
 
+The selected vpsAdminOS source must provide OSVM's per-disk `preserve` setting
+and `overlays.all`. The runner checks the disk API before constructing any VM.
+Writable disks are preserved by default; the squashfs boot image and temporary
+root filesystem keep their usual boot behavior. Update older selected OS sources
+before starting the cluster.
+
+
 The installed `vpsadminos-devcluster` command runs vpsAdminOS development
 clusters. Run it from the registered workspace or pass `--workspace NAME` before
 the command.

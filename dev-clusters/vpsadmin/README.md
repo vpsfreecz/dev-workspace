@@ -7,10 +7,11 @@ workspace or pass `--workspace NAME` before the command.
 Runtime state, certificates, SSH keys, result links, and logs are stored under
 `.dev-clusters/` at the workspace root and are intentionally not tracked by git.
 
-The selected vpsAdminOS source must include commit `e6c4c5cfa` or a compatible
-newer revision with OSVM's `preserve_root_disk` option, `overlays.all` and
-`vpsadminosRubyGemConfig`. Update older development worktrees before starting the
-cluster. Existing complete VM disk images need no conversion.
+The selected vpsAdminOS source must provide OSVM's per-disk `preserve` setting,
+`rootDisk` descriptors, `overlays.all` and `vpsadminosRubyGemConfig`. The runner
+checks the disk API before constructing any VM. Update older selected OS
+sources before starting the cluster. Existing complete VM disk images need no
+conversion.
 
 Services and DNS root disks are retained across stop/start. Apply configuration
 changes with `update` while the VMs are running so their root disks contain the
