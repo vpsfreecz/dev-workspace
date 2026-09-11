@@ -1,6 +1,8 @@
 # vpsAdminOS Dev Clusters
 
-This directory provides workspace-local vpsAdminOS-only development clusters.
+The installed `vpsadminos-devcluster` command runs vpsAdminOS development
+clusters. Run it from the registered workspace or pass `--workspace NAME` before
+the command.
 It boots vpsAdminOS VMs directly, without vpsAdmin services, database, web UI,
 DNS services, mail capture, or seeded API data.
 
@@ -11,21 +13,21 @@ not tracked by git.
 ## Basic Usage
 
 ```sh
-dev-clusters/vpsadminos/bin/devcluster start 2026-05-31-example
-dev-clusters/vpsadminos/bin/devcluster info 2026-05-31-example
-dev-clusters/vpsadminos/bin/devcluster ssh 2026-05-31-example node1
-dev-clusters/vpsadminos/bin/devcluster update 2026-05-31-example node1
-dev-clusters/vpsadminos/bin/devcluster stop 2026-05-31-example
-dev-clusters/vpsadminos/bin/devcluster gcroots --cleanup
+vpsadminos-devcluster start 2026-05-31-example
+vpsadminos-devcluster info 2026-05-31-example
+vpsadminos-devcluster ssh 2026-05-31-example node1
+vpsadminos-devcluster update 2026-05-31-example node1
+vpsadminos-devcluster stop 2026-05-31-example
+vpsadminos-devcluster gcroots --cleanup
 ```
 
 When running inside a `dev-session` shell, `ssh` can use
 `DEV_SESSION_SLUG` automatically:
 
 ```sh
-dev-clusters/vpsadminos/bin/devcluster ssh node1
-dev-clusters/vpsadminos/bin/devcluster ssh node1 -- hostname
-dev-clusters/vpsadminos/bin/devcluster ssh node1 -t -- bash -l
+vpsadminos-devcluster ssh node1
+vpsadminos-devcluster ssh node1 -- hostname
+vpsadminos-devcluster ssh node1 -t -- bash -l
 ```
 
 Topologies:
@@ -56,8 +58,8 @@ Default SSH forwards are:
 Example:
 
 ```sh
-dev-clusters/vpsadminos/bin/devcluster start 2026-05-31-example --topology dual --network local
-dev-clusters/vpsadminos/bin/devcluster ssh 2026-05-31-example node1
+vpsadminos-devcluster start 2026-05-31-example --topology dual --network local
+vpsadminos-devcluster ssh 2026-05-31-example node1
 ```
 
 Some vpsAdminOS boots can spend several minutes without console output after
@@ -70,7 +72,7 @@ access to `/dev/kvm` and a usable QEMU bridge helper. The helper path defaults t
 
 ```sh
 VPSADMINOS_DEVCLUSTER_BRIDGE_HELPER=/path/to/helper \
-  dev-clusters/vpsadminos/bin/devcluster start 2026-05-31-example --network bridge
+  vpsadminos-devcluster start 2026-05-31-example --network bridge
 ```
 
 Use an empty helper value to omit the QEMU `helper=` option.
@@ -83,7 +85,10 @@ Each cluster gets an editable config at:
 .dev-clusters/vpsadminos/clusters/<slug>/config.json
 ```
 
-It is copied from `dev-clusters/vpsadminos/default-config.json` on first use.
+The package receives its defaults from the consuming workspace through
+`siteConfig.clusterDefaults.vpsadminos`. On first use, the helper copies them to
+the cluster config. Nix merges this config over the packaged defaults, preserving
+per-cluster overrides.
 Use it to change node names, bridge/local IPs, SSH forward ports, memory, CPU,
 disk sizes, topology membership, bridge name, gateway, local socket multicast
 port, local resolvers, or upstream resolvers.
@@ -94,8 +99,8 @@ Otherwise it is built from `repos/vpsadminos.git` `origin/staging`.
 `start` and `update` keep the built cluster config rooted at
 `.dev-clusters/vpsadminos/clusters/<slug>/result-config` while the cluster is in
 use. `stop` removes that root after the runner exits, and `reset` removes it
-with the rest of the cluster state. Use `devcluster gcroots` to list retained
-cluster config roots and `devcluster gcroots --cleanup` to remove roots for
+with the rest of the cluster state. Use `vpsadminos-devcluster gcroots` to list retained
+cluster config roots and `vpsadminos-devcluster gcroots --cleanup` to remove roots for
 stopped clusters left by older tooling.
 
 ## Runtime Updates
@@ -103,8 +108,8 @@ stopped clusters left by older tooling.
 After changing vpsAdminOS code or configuration, rebuild and switch a running VM:
 
 ```sh
-dev-clusters/vpsadminos/bin/devcluster update <slug> node1
-dev-clusters/vpsadminos/bin/devcluster update <slug> all
+vpsadminos-devcluster update <slug> node1
+vpsadminos-devcluster update <slug> all
 ```
 
 The update command copies the new system closure over SSH and runs

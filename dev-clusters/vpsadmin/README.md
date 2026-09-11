@@ -1,7 +1,8 @@
 # vpsAdmin Dev Clusters
 
-This directory provides workspace-local vpsAdmin development clusters selected
-from feature worktrees under `worktrees/<slug>/`.
+The installed `vpsadmin-devcluster` command runs vpsAdmin development clusters
+from feature worktrees under `worktrees/<slug>/`. Run it from the registered
+workspace or pass `--workspace NAME` before the command.
 
 Runtime state, certificates, SSH keys, result links, and logs are stored under
 `.dev-clusters/` at the workspace root and are intentionally not tracked by git.
@@ -9,23 +10,23 @@ Runtime state, certificates, SSH keys, result links, and logs are stored under
 ## Basic Usage
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster start 2026-05-29-security-advisories --topology dual
-dev-clusters/vpsadmin/bin/devcluster urls 2026-05-29-security-advisories
-dev-clusters/vpsadmin/bin/devcluster config 2026-05-29-security-advisories
-dev-clusters/vpsadmin/bin/devcluster refresh 2026-05-29-security-advisories
-dev-clusters/vpsadmin/bin/devcluster update 2026-05-29-security-advisories services
-dev-clusters/vpsadmin/bin/devcluster ssh 2026-05-29-security-advisories services
-dev-clusters/vpsadmin/bin/devcluster stop 2026-05-29-security-advisories
-dev-clusters/vpsadmin/bin/devcluster gcroots --cleanup
+vpsadmin-devcluster start 2026-05-29-security-advisories --topology dual
+vpsadmin-devcluster urls 2026-05-29-security-advisories
+vpsadmin-devcluster config 2026-05-29-security-advisories
+vpsadmin-devcluster refresh 2026-05-29-security-advisories
+vpsadmin-devcluster update 2026-05-29-security-advisories services
+vpsadmin-devcluster ssh 2026-05-29-security-advisories services
+vpsadmin-devcluster stop 2026-05-29-security-advisories
+vpsadmin-devcluster gcroots --cleanup
 ```
 
 When running inside a `dev-session` shell, `ssh` can use
 `DEV_SESSION_SLUG` automatically:
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster ssh node1
-dev-clusters/vpsadmin/bin/devcluster ssh services -- hostname
-dev-clusters/vpsadmin/bin/devcluster ssh node1 -t -- bash -l
+vpsadmin-devcluster ssh node1
+vpsadmin-devcluster ssh services -- hostname
+vpsadmin-devcluster ssh node1 -t -- bash -l
 ```
 
 Topologies:
@@ -59,8 +60,8 @@ to an empty value to omit the QEMU `helper=` option.
 `start` and `update` keep the built cluster config rooted at
 `.dev-clusters/vpsadmin/clusters/<slug>/result-config` while the cluster is in
 use. `stop` removes that root after the runner exits, and `reset` removes it
-with the rest of the cluster state. Use `devcluster gcroots` to list retained
-cluster config roots and `devcluster gcroots --cleanup` to remove roots for
+with the rest of the cluster state. Use `vpsadmin-devcluster gcroots` to list retained
+cluster config roots and `vpsadmin-devcluster gcroots --cleanup` to remove roots for
 stopped clusters left by older tooling.
 
 Resolver behavior is configured in `config.json` under `resolver`. The default
@@ -80,8 +81,10 @@ Each cluster gets its own editable config at:
 .dev-clusters/vpsadmin/clusters/<slug>/config.json
 ```
 
-It is copied from `dev-clusters/vpsadmin/default-config.json` on first use and
-is merged over the tracked defaults. Use it to change domains, service and node
+The package receives its defaults from the consuming workspace through
+`siteConfig.clusterDefaults.vpsadmin`. On first use, the helper copies them to
+the cluster config. Nix merges this config over the packaged defaults, preserving
+per-cluster overrides. Use it to change domains, service and node
 IP addresses, topology membership, seeded users, resource packages, pool
 settings, networks, IP addresses, and mail recipients.
 
@@ -120,7 +123,7 @@ nodes, then restarts nodectld so DB-seeded pools are usable by node transactions
 Example local start:
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster start 2026-05-29-security-advisories --topology single --network local
+vpsadmin-devcluster start 2026-05-29-security-advisories --topology single --network local
 ```
 
 For browser testing in `local` mode, resolve the printed dev hostnames to
@@ -135,7 +138,7 @@ certificate, import a directory containing `vpsadmin-ca.crt`,
 `vpsadmin-ca.key`, `vpsadmin-cert.crt`, and `vpsadmin-cert.key`:
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster cert import /path/to/certs
+vpsadmin-devcluster cert import /path/to/certs
 ```
 
 Set `VPSADMIN_DEVCLUSTER_CERT_IMPORT_DIR=/path/to/certs` to have `start`
@@ -149,7 +152,7 @@ an encrypted imported CA instead.
 Use:
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster cert show-ca
+vpsadmin-devcluster cert show-ca
 ```
 
 to print the CA certificate path and fingerprint for browser trust setup.
@@ -170,7 +173,7 @@ before the repeatable development seed attaches configured mail recipients.
 Both steps complete before the API or supervisor starts. Re-run:
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster update <slug> services
+vpsadmin-devcluster update <slug> services
 ```
 
 after changing template files or the cluster mail config. Runtime virtiofs
@@ -205,7 +208,7 @@ package for local generated-client testing.
 Re-run:
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster update <slug> services
+vpsadmin-devcluster update <slug> services
 ```
 
 after changing vpsf-status or the generated Go client.
@@ -224,8 +227,8 @@ devcluster API.
 Ruby services and system-level changes use:
 
 ```sh
-dev-clusters/vpsadmin/bin/devcluster update <slug> services
-dev-clusters/vpsadmin/bin/devcluster update <slug> node1
+vpsadmin-devcluster update <slug> services
+vpsadmin-devcluster update <slug> node1
 ```
 
 which rebuilds the machine config, copies the new closure to the running VM,

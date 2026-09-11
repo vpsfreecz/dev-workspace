@@ -1,6 +1,7 @@
 {
   bash,
   coreutils,
+  diffutils,
   gawk,
   git,
   gnugrep,
@@ -87,6 +88,14 @@ stdenvNoCC.mkDerivation {
     install -Dm644 nix/host-paths.json \
       "$out/share/vpsfree-dev-workspace/nix/host-paths.json"
     chmod -R u+w "$out/share/vpsfree-dev-workspace"
+    for provider in vpsadmin vpsadminos; do
+      install -Dm644 dev-clusters/lib/devcluster_runner.rb \
+        "$out/share/vpsfree-dev-workspace/dev-clusters/$provider/shared/devcluster_runner.rb"
+    done
+    install -m644 ${clusterConfigurations.vpsadmin} \
+      "$out/share/vpsfree-dev-workspace/dev-clusters/vpsadmin/default-config.json"
+    install -m644 ${clusterConfigurations.vpsadminos} \
+      "$out/share/vpsfree-dev-workspace/dev-clusters/vpsadminos/default-config.json"
     install -Dm644 ${runtimeContract} \
       "$out/share/vpsfree-dev-workspace/dev-clusters/runtime-contract.json"
     for source in "$out/share/vpsfree-dev-workspace/bin/"*; do
@@ -136,6 +145,18 @@ stdenvNoCC.mkDerivation {
   doInstallCheck = true;
   installCheckPhase = ''
     mkdir -p "$TMPDIR/workspace"
+    for provider in vpsadmin vpsadminos; do
+      cluster="$out/share/vpsfree-dev-workspace/dev-clusters/$provider"
+      test -f "$cluster/default-config.json"
+      test ! -L "$cluster/default-config.json"
+      test -f "$cluster/shared/devcluster_runner.rb"
+      test ! -L "$cluster/shared/devcluster_runner.rb"
+      ${diffutils}/bin/cmp dev-clusters/lib/devcluster_runner.rb "$cluster/shared/devcluster_runner.rb"
+    done
+    ${diffutils}/bin/cmp ${clusterConfigurations.vpsadmin} \
+      "$out/share/vpsfree-dev-workspace/dev-clusters/vpsadmin/default-config.json"
+    ${diffutils}/bin/cmp ${clusterConfigurations.vpsadminos} \
+      "$out/share/vpsfree-dev-workspace/dev-clusters/vpsadminos/default-config.json"
     ${jq}/bin/jq -e 'type == "object"' \
       ${lib.escapeShellArg (toString clusterConfigurations.vpsadmin)} >/dev/null
     ${jq}/bin/jq -e 'type == "object"' \
