@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    dev-workspace.url = "github:aither64/dev-workspace/ab4f3dd90aaca4330d656111cf848a95f76cf05d";
+    dev-workspace.url = "github:aither64/dev-workspace/bcbaf825d71285cbbd05b56e78bc386f2df480bd";
   };
 
   outputs =
