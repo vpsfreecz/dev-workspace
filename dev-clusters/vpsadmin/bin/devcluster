@@ -793,14 +793,13 @@ set -eu
 pool_fs="$1"
 pool_name="${pool_fs%%/*}"
 
-for _ in $(seq 1 180); do
-  zpool list -H "$pool_name" >/dev/null 2>&1 && break
-  sleep 1
-done
-
-if ! zpool list -H "$pool_name" >/dev/null 2>&1; then
-  echo "pool $pool_name was not ready in time" >&2
-  zpool list || true
+if ! timeout --kill-after=1 180 sh -c '
+  while ! zpool list -H "$1" >/dev/null 2>&1 \
+    || [ "$(osctl pool show -H -o state "$1" 2>/dev/null)" != active ]; do
+    sleep 1
+  done
+' sh "$pool_name"; then
+  echo "pool $pool_name was not ready in ZFS and osctld within 180 seconds" >&2
   exit 1
 fi
 

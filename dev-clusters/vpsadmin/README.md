@@ -127,6 +127,8 @@ nodes, then restarts nodectld so DB-seeded pools are usable by node transactions
 Refresh waits up to two minutes for SSH on each machine before checking the seed
 or preparing a node. Probes cannot prompt for credentials; a stalled probe fails
 after five seconds. A failed remote action stops refresh immediately.
+On each node, refresh also waits up to three minutes for the pool to be imported
+in ZFS and active in osctld before preparing directories and granting devices.
 
 Example local start:
 

@@ -104,6 +104,29 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_node_refresh_waits_for_osctld_to_load_the_pool
+    with_workspace('vpsadmin') do |env, _directory|
+      remote_env = node_refresh_environment(env)
+      result = run_helper('vpsadmin', env.merge(remote_env), 'refresh')
+      assert(result.success?, @last_output)
+      assert_equal(%w[pool-probe pool-probe pool-probe devices devices devices devices restart],
+                   File.readlines(remote_env.fetch('TEST_REMOTE_EVENTS'), chomp: true))
+      assert_locks_released(env)
+    end
+  end
+
+  def test_node_refresh_does_not_mutate_an_unready_pool
+    with_workspace('vpsadmin') do |env, _directory|
+      remote_env = node_refresh_environment(env).merge('FAIL_POOL_WAIT' => '1')
+      result = run_helper('vpsadmin', env.merge(remote_env), 'refresh')
+      assert_equal(1, result.exitstatus)
+      assert_includes(@last_output, 'not ready in ZFS and osctld')
+      assert(File.readlines(remote_env.fetch('TEST_REMOTE_EVENTS'), chomp: true).all? { |event| event == 'pool-probe' })
+      assert_equal(2, events(env).count { |event| event['event'] == 'ssh' })
+      assert_locks_released(env)
+    end
+  end
+
   def test_invalid_retained_configuration_is_not_replaced
     KINDS.each do |kind|
       with_workspace(kind) do |env, directory|
@@ -195,6 +218,52 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def node_refresh_environment(env)
+    directory = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'remote-bin')
+    FileUtils.mkdir_p(directory)
+    %w[zpool zfs mkdir osctl sv nodectl timeout].each do |name|
+      path = File.join(directory, name)
+      File.write(path, "#!#{RbConfig.ruby}\n" + <<~'RUBY')
+        command = File.basename($PROGRAM_NAME)
+        def record(event)
+          File.open(ENV.fetch('TEST_REMOTE_EVENTS'), 'a') { |f| f.puts(event) }
+        end
+        case command
+        when 'timeout'
+          abort 'unexpected pool timeout' unless ARGV[0, 2] == ['--kill-after=1', '180']
+          ARGV[1] = '2.5' if ENV['FAIL_POOL_WAIT'] == '1'
+          exec ENV.fetch('TEST_REAL_TIMEOUT'), *ARGV
+        when 'osctl'
+          if ARGV[0, 2] == %w[pool show]
+            record('pool-probe')
+            path = ENV.fetch('TEST_POOL_PROBES')
+            count = File.exist?(path) ? File.read(path).to_i + 1 : 1
+            File.write(path, count.to_s)
+            exit 1 if count == 1 || ENV['FAIL_POOL_WAIT'] == '1'
+            puts(count == 2 ? 'importing' : 'active')
+          else
+            record('devices')
+            abort 'pool mutation before readiness' if File.read(ENV.fetch('TEST_POOL_PROBES')).to_i < 3
+          end
+        when 'sv'
+          record('restart') if ARGV.first == 'restart'
+        when 'nodectl'
+          puts 'State: running'
+        when 'mkdir', 'zfs'
+          abort 'filesystem mutation before readiness' if File.read(ENV.fetch('TEST_POOL_PROBES')).to_i < 3
+        end
+      RUBY
+      File.chmod(0o755, path)
+    end
+    {
+      'RUN_NODE_REFRESH' => '1',
+      'TEST_REMOTE_BIN' => directory,
+      'TEST_REMOTE_EVENTS' => File.join(directory, 'events'),
+      'TEST_POOL_PROBES' => File.join(directory, 'probes'),
+      'TEST_REAL_TIMEOUT' => ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'timeout') }.find { |path| File.executable?(path) }
+    }
+  end
+
   def command_stub
     <<~'RUBY'
       require 'json'
@@ -263,7 +332,25 @@ class DevclusterCommandsTest < Minitest::Test
             exit 255
           end
         end
-        STDIN.read if ARGV.include?('sh')
+        if ARGV.include?('sh')
+          script = STDIN.read
+          if ENV['RUN_NODE_REFRESH'] == '1' && value_after('-p') == '10122'
+            require 'open3'
+            script = <<~'SH' + script
+              test() {
+                if [ "$1" = -S ] && [ "$2" = /run/nodectl/nodectld.sock ]; then return 0; fi
+                command test "$@"
+              }
+            SH
+            output, errors, result = Open3.capture3(
+              { 'PATH' => "#{ENV.fetch('TEST_REMOTE_BIN')}:#{ENV.fetch('PATH')}" },
+              'sh', '-s', '--', 'tank/ct', stdin_data: script
+            )
+            print output
+            warn errors unless errors.empty?
+            exit result.exitstatus
+          end
+        end
       end
     RUBY
   end
