@@ -1,0 +1,28 @@
+name: Host migration
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/host-migration.yml
+      - bin/vpsfree-dev-workspace-migrate
+      - nix/host-paths.json
+      - nix/tests/host-migration.nix
+      - test/migration_test.rb
+      - docs/namespace-migration.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Enable VM acceleration
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+      - uses: cachix/install-nix-action@v31.11.1
+      - run: nix build --no-link --print-build-logs .#host-migration-test

@@ -44,7 +44,7 @@ generic package constructor. They are intended for a compatibility generation
 during the namespace migration; ordinary packages should keep the generic
 defaults.
 
-Run all checks with:
+Run the regular package and contract checks with:
 
 ```sh
 nix flake check --print-build-logs
@@ -55,3 +55,22 @@ Invoke it through the package's private
 `libexec/vpsfree-dev-workspace-migrate` path, read its `--help` output and
 follow the [namespace migration runbook](docs/namespace-migration.md). Retain
 its private journals until the deployed cutover has been accepted.
+
+The local operator is trusted with host administration for workspace
+integration and namespace migration. Root/user ownership supports their
+operational lifecycle. Remote clients and guests remain untrusted, and KB
+publication still requires its existing approval process.
+
+The Host migration workflow runs the NixOS migration smoke test when migration
+or local host-contract files change on `master`. After review, run the test
+locally on feature branches or when an upstream host-state compatibility change
+needs validation:
+
+```sh
+nix build --no-link --print-build-logs .#host-migration-test
+```
+
+Manual workflow dispatch is also available once the workflow exists on the
+default branch. Regular dependency updates retain the fast Ruby migration and host-path
+contract checks without booting this additional VM. CI requires KVM for the VM
+job and targets normal dependency-update completion within 20 minutes.

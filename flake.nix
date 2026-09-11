@@ -182,13 +182,13 @@
       lib = {
         inherit mkPackage;
       };
+      packages.${system}.host-migration-test = import ./nix/tests/host-migration.nix {
+        inherit pkgs;
+        devWorkspace = dev-workspace;
+        migrationPackage = testPackage;
+      };
       checks.${system} = {
         compatibility-package = testCompatibilityPackage;
-        host-migration = import ./nix/tests/host-migration.nix {
-          inherit pkgs;
-          devWorkspace = dev-workspace;
-          migrationPackage = testPackage;
-        };
         package = testPackage;
         package-metadata = pkgs.runCommand "vpsfree-dev-workspace-package-metadata" { } ''
           ${pkgs.jq}/bin/jq -e \

@@ -82,3 +82,27 @@ completed rollback. Schema 5 is the first deployed journal format; no older
 journal schema is accepted. A retry tolerates a rename or rewrite that reached
 durable storage immediately before its journal update, but it never accepts an
 unrecorded file, path, owner, mode, symlink target or content change.
+
+## Trust and validation
+
+The local operator is trusted to administer the development host. Host and
+user ownership keep the migration's operational responsibilities explicit;
+they do not contain a compromised operator. Preserve the journal, locking,
+state-integrity and rollback requirements above. This assumption does not
+extend to remote clients, guest workloads or KB publication approval.
+
+The regular flake checks run the Ruby migration tests and compare the host-path
+contract with the generic runtime. The additional NixOS smoke test uses
+generated credentials and certificates to verify forward migration, reconciliation and
+reverse migration. Run it after mandatory review when migration behavior or the
+upstream host-state compatibility contract changes:
+
+```sh
+nix build --no-link --print-build-logs .#host-migration-test
+```
+
+The Host migration workflow runs for local migration and contract changes on
+`master`. For feature branches or an upstream contract change, run the local
+command above after review. Manual dispatch is also available once the workflow
+exists on the default branch. Ordinary dependency updates do not need this extra
+VM.
