@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    dev-workspace.url = "github:aither64/dev-workspace/f5d587823368e530c5d9f52a17e1befed9fd54e1";
+    dev-workspace.url = "github:aither64/dev-workspace/d3bfd0f5a7c419c9df0ed53aa5f1acb77f8e10c2";
     devcluster-vpsadminos.url = "github:vpsfreecz/vpsadminos/15802517e2d92dda4ddc07ebac3d1d7ea087b430";
     devcluster-vpsadmin = {
       url = "github:vpsfreecz/vpsadmin/master";
