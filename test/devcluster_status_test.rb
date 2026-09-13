@@ -5,6 +5,7 @@ require 'minitest/autorun'
 require 'open3'
 require 'rbconfig'
 require 'tmpdir'
+require 'timeout'
 
 class DevclusterStatusTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
@@ -296,6 +297,24 @@ class DevclusterStatusTest < Minitest::Test
         assert_empty(Dir.children(external))
       ensure
         FileUtils.remove_entry(external) if external && File.exist?(external)
+      end
+    end
+  end
+
+  def test_status_reports_busy_without_waiting_for_a_mutation
+    HELPERS.each do |kind, helper|
+      with_cluster(kind) do |workspace, _directory, slug|
+        root = File.join(workspace, '.dev-clusters', '.locks')
+        FileUtils.mkdir_p(root)
+        File.open(File.join(root, "#{kind}-#{slug}.lock"), File::RDWR | File::CREAT, 0o600) do |lock|
+          lock.flock(File::LOCK_EX)
+          output, error, status = Timeout.timeout(2) do
+            Open3.capture3({ 'DEVCLUSTER_WORKSPACE' => workspace }, helper, 'status', slug, '--json')
+          end
+          assert_equal(75, status.exitstatus, "#{kind}: #{error}")
+          assert_empty(output)
+        end
+        assert(read_status(kind, workspace, slug).fetch('found'))
       end
     end
   end

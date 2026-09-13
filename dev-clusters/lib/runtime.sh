@@ -42,6 +42,17 @@ devcluster_load_runtime_contract() {
     .[] | [.name, .command] | @tsv
   ' "$contract")" || die "workspace runtime contract has invalid lifecycle journals"
 
+  DEVCLUSTER_STATUS_BUSY_EXIT_CODE="$(jq -er '.clusterProvider.statusBusyExitCode | select(. == 75)' "$contract")" \
+    || die "workspace runtime contract has an invalid busy status code"
+  DEVCLUSTER_RELEASE_TIMEOUT="$(jq -er '.clusterProvider.releaseTimeoutSeconds | select(type == "number" and . == floor and . > 0)' "$contract")" \
+    || die "workspace runtime contract has an invalid release timeout"
+  DEVCLUSTER_RUNNER_SHUTDOWN_SECONDS="$(jq -er '
+    [.graceSeconds, .killSeconds, .cleanupSeconds] |
+    select(all(.[]; type == "number" and . == floor and . > 0)) | add
+  ' "$runtime_directory/shutdown.json")" || die "invalid runner shutdown budgets"
+  [ "$DEVCLUSTER_RUNNER_SHUTDOWN_SECONDS" -lt "$DEVCLUSTER_RELEASE_TIMEOUT" ] \
+    || die "runner shutdown exceeds the workspace release budget"
+
   DEVCLUSTER_TRACKING_MAX_BYTES="$tracking_max"
   mapfile -t DEVCLUSTER_LIFECYCLE_JOURNALS <<< "$journal_rows"
   DEVCLUSTER_RUNTIME_CONTRACT_LOADED=1
@@ -460,11 +471,11 @@ devcluster_reset_socket_dir() {
   printf '%s\n' "$candidate"
 }
 
-# The runner allows 120 seconds for concurrent guest shutdown and ten seconds
-# for forced guest reaping. Leave another twenty seconds for runner cleanup.
+# Leave the provider-owned cleanup budget after concurrent shutdown and reaping.
 devcluster_wait_for_runner_socket() {
   local slug="$1" pid="$2" sock_dir="$3"
-  for _ in $(seq 1 150); do
+  devcluster_load_runtime_contract
+  for _ in $(seq 1 "$DEVCLUSTER_RUNNER_SHUTDOWN_SECONDS"); do
     runner_process_matches_socket "$slug" "$pid" "$sock_dir" || return 0
     sleep 1
   done
@@ -822,7 +833,18 @@ devcluster_with_lock() {
   fd_identity="$(stat -Lc '%d:%i' "/proc/$$/fd/$lock_fd")"
   [ "$path_identity" = "$fd_identity" ] \
     || die "development cluster lock changed while opening: $path"
-  flock -x "$lock_fd"
+  if [ "${DEVCLUSTER_STATUS_LOCK:-false}" = true ]; then
+    devcluster_load_runtime_contract
+    if flock -x -n -E "$DEVCLUSTER_STATUS_BUSY_EXIT_CODE" "$lock_fd"; then
+      :
+    else
+      result=$?
+      exec {lock_fd}>&-
+      return "$result"
+    fi
+  else
+    flock -x "$lock_fd"
+  fi
 
   DEVCLUSTER_LIFECYCLE_LOCK_FD="$lock_fd"
   if "$callback" "$@"; then
@@ -874,6 +896,8 @@ devcluster_with_lifecycle_lock() {
   local callback="$5"
   shift 5
 
+  local DEVCLUSTER_STATUS_LOCK=false
+  [ "$operation_name" != status ] || DEVCLUSTER_STATUS_LOCK=true
   devcluster_with_lock "$DEVCLUSTER_KIND-$slug" \
     devcluster_lifecycle_callback \
     "$slug" "$require_active" "$mutation" "$operation_name" "$callback" "$@"
