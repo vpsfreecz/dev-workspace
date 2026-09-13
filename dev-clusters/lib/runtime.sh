@@ -460,6 +460,17 @@ devcluster_reset_socket_dir() {
   printf '%s\n' "$candidate"
 }
 
+# The runner allows 120 seconds for concurrent guest shutdown and ten seconds
+# for forced guest reaping. Leave another twenty seconds for runner cleanup.
+devcluster_wait_for_runner_socket() {
+  local slug="$1" pid="$2" sock_dir="$3"
+  for _ in $(seq 1 150); do
+    runner_process_matches_socket "$slug" "$pid" "$sock_dir" || return 0
+    sleep 1
+  done
+  ! runner_process_matches_socket "$slug" "$pid" "$sock_dir"
+}
+
 devcluster_reset_cluster_runtime() {
   local slug="$1"
   local prefix="$2"
@@ -475,11 +486,7 @@ devcluster_reset_cluster_runtime() {
     pid="$(cat "$(pid_file "$slug")")"
     if runner_process_matches_socket "$slug" "$pid" "$sock_dir"; then
       signal_cluster_runner_socket "$slug" "$pid" "$sock_dir" TERM stop
-      for _ in $(seq 1 120); do
-        runner_process_matches_socket "$slug" "$pid" "$sock_dir" || break
-        sleep 1
-      done
-      if runner_process_matches_socket "$slug" "$pid" "$sock_dir"; then
+      if ! devcluster_wait_for_runner_socket "$slug" "$pid" "$sock_dir"; then
         signal_cluster_runner_socket "$slug" "$pid" "$sock_dir" KILL kill
       fi
     fi

@@ -484,15 +484,12 @@ stop_cluster() {
 
   signal_cluster_runner "$slug" "$pid" TERM stop
 
-  for _ in $(seq 1 120); do
-    runner_process_matches "$slug" "$pid" || {
-      kill_socket_processes "$slug" "$sock_dir"
-      remove_result_link "$slug"
-      printf 'cluster %s stopped\n' "$slug"
-      return
-    }
-    sleep 1
-  done
+  if devcluster_wait_for_runner_socket "$slug" "$pid" "$sock_dir"; then
+    kill_socket_processes "$slug" "$sock_dir"
+    remove_result_link "$slug"
+    printf 'cluster %s stopped\n' "$slug"
+    return
+  fi
 
   signal_cluster_runner "$slug" "$pid" KILL kill
   kill_socket_processes "$slug" "$sock_dir"

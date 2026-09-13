@@ -89,7 +89,7 @@ stdenvNoCC.mkDerivation {
       "$out/share/vpsfree-dev-workspace/nix/host-paths.json"
     chmod -R u+w "$out/share/vpsfree-dev-workspace"
     for provider in vpsadmin vpsadminos; do
-      for asset in devcluster_runner.rb runner.nix; do
+      for asset in devcluster_runner.rb runner.nix shutdown.json; do
         install -Dm644 "dev-clusters/lib/$asset" \
           "$out/share/vpsfree-dev-workspace/dev-clusters/$provider/shared/$asset"
       done
@@ -151,7 +151,7 @@ stdenvNoCC.mkDerivation {
       cluster="$out/share/vpsfree-dev-workspace/dev-clusters/$provider"
       test -f "$cluster/default-config.json"
       test ! -L "$cluster/default-config.json"
-      for asset in devcluster_runner.rb runner.nix; do
+      for asset in devcluster_runner.rb runner.nix shutdown.json; do
         test -f "$cluster/shared/$asset"
         test ! -L "$cluster/shared/$asset"
         ${diffutils}/bin/cmp "dev-clusters/lib/$asset" "$cluster/shared/$asset"

@@ -34,6 +34,13 @@ $LOADED_FEATURES << 'osvm.rb'
 require_relative '../dev-clusters/lib/devcluster_runner'
 
 class DevclusterRunnerTest < Minitest::Test
+  def test_shutdown_budgets_fit_the_portal_release_contract
+    contract = JSON.parse(File.read(ENV.fetch('DEVCLUSTER_RUNTIME_CONTRACT')))
+    budgets = DevClusters::OsVmRunner::SHUTDOWN.values
+    assert(budgets.all? { |seconds| seconds.is_a?(Integer) && seconds.positive? })
+    assert_operator(budgets.sum, :<, contract.fetch('clusterProvider').fetch('releaseTimeoutSeconds'))
+  end
+
   def test_both_guests_use_the_generic_disk_defaults
     with_runner do |runner, options|
       machines = runner.send(:build_machines, options)
@@ -61,6 +68,34 @@ class DevclusterRunnerTest < Minitest::Test
         assert_includes(error.message, 'per-disk preservation')
       end
     end
+  end
+
+  def test_shutdown_starts_all_guests_before_waiting_for_any_guest
+    entered = Queue.new
+    release = Queue.new
+    machines = 3.times.map do |index|
+      machine = Object.new
+      machine.define_singleton_method(:stop) { |timeout:| entered << index; release.pop }
+      DevClusters::OsVmRunner::MachineState.new(name: index.to_s, machine: machine)
+    end
+    runner = DevClusters::OsVmRunner.new([], hash_base: 'test', priority_machines: [])
+    worker = Thread.new { runner.send(:stop_machines, machines, timeout: 2) }
+    Timeout.timeout(1) { 3.times { entered.pop } }
+    3.times { release << true }
+    worker.value
+  ensure
+    worker&.kill
+  end
+
+  def test_shutdown_bounds_a_stuck_poweroff_and_reaps_the_guest
+    killed = []
+    machine = Object.new
+    machine.define_singleton_method(:stop) { |timeout:| sleep 10 }
+    machine.define_singleton_method(:kill) { |signal:| killed << signal }
+    entry = DevClusters::OsVmRunner::MachineState.new(name: 'stuck', machine: machine)
+    runner = DevClusters::OsVmRunner.new([], hash_base: 'test', priority_machines: [])
+    Timeout.timeout(1) { runner.send(:stop_machines, [entry], timeout: 0.02) }
+    assert_equal(['KILL'], killed)
   end
 
   def with_legacy_disk

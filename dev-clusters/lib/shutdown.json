@@ -1,0 +1,5 @@
+{
+  "graceSeconds": 120,
+  "killSeconds": 10,
+  "cleanupSeconds": 20
+}

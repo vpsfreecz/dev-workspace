@@ -5,9 +5,11 @@ require 'json'
 require 'optparse'
 require 'osvm'
 require 'time'
+require 'timeout'
 
 module DevClusters
   class OsVmRunner
+    SHUTDOWN = JSON.parse(File.read(File.join(__dir__, 'shutdown.json'))).freeze
     ShutdownRequested = Class.new(StandardError)
     MachineState = Struct.new(:name, :machine, keyword_init: true)
 
@@ -67,19 +69,7 @@ module DevClusters
         next if stopping
 
         stopping = true
-        machines.reverse_each do |entry|
-          begin
-            warn "Stopping #{entry.name}"
-            entry.machine.stop(timeout: 120)
-          rescue StandardError => e
-            warn "Graceful stop failed for #{entry.name}: #{e.class}: #{e.message}"
-            begin
-              entry.machine.kill(signal: 'TERM')
-            rescue StandardError => kill_error
-              warn "Kill failed for #{entry.name}: #{kill_error.class}: #{kill_error.message}"
-            end
-          end
-        end
+        stop_machines(machines)
       end
 
       signal_reader, signal_writer = IO.pipe
@@ -135,6 +125,26 @@ module DevClusters
       end
 
       0
+    end
+
+    # Each guest gets the full grace period, including its poweroff command.
+    # Stop independent guests together so their grace periods do not accumulate.
+    def stop_machines(machines, timeout: SHUTDOWN.fetch('graceSeconds'), kill_timeout: SHUTDOWN.fetch('killSeconds'))
+      machines.map do |entry|
+        Thread.new do
+          begin
+            warn "Stopping #{entry.name}"
+            Timeout.timeout(timeout) { entry.machine.stop(timeout: timeout) }
+          rescue StandardError => e
+            warn "Graceful stop failed for #{entry.name}: #{e.class}: #{e.message}"
+            begin
+              Timeout.timeout(kill_timeout) { entry.machine.kill(signal: 'KILL') }
+            rescue StandardError => kill_error
+              warn "Kill failed for #{entry.name}: #{kill_error.class}: #{kill_error.message}"
+            end
+          end
+        end
+      end.each(&:value)
     end
 
     def build_machines(opts)
