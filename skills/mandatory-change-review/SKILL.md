@@ -13,7 +13,7 @@ review is advisory, but Blocking and Important findings must be addressed as
 described below before continuing.
 
 The coordinating agent launches an adaptive team of one to four standalone
-reviewers with fresh context. Every reviewer must use model `gpt-5.6-sol` with
+reviewers with fresh context. Every reviewer must use model `gpt-6-astra` with
 reasoning effort `xhigh`, perform its assigned review directly, and not launch
 nested reviewers or subagents.
 
@@ -105,7 +105,7 @@ required lane.
      interface, and consumers discovered from imports, dependency pins,
      wrappers, manifests, documentation, and current repository state.
 6. Launch one fresh standalone agent per applicable lane. Set
-   `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and `reasoning_effort:
+   `fork_turns: "none"`, `model: "gpt-6-astra"`, and `reasoning_effort:
    "xhigh"`. Give each agent the review packet, its
    lane, this skill path, and instructions to read the lane reference and
    perform the review itself. Do not pass hidden conclusions or ask for a
