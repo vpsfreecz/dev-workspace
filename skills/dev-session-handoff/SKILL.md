@@ -12,11 +12,18 @@ Use the initiative tracked by the current process through the user-profile
 belongs to the process, create one before making changes or ask for the
 intended slug when choosing one would change the task.
 
+Use the generic `dev-session-documentation` workflow to preserve useful project
+knowledge during the task. The context-owning agent reconciles it before handoff;
+this step summarizes documentation already maintained through development.
+
 Before handing off material work:
 
 1. Update `work/<slug>/state.md` with the current branches, test or CI results,
-   blockers, and next operator action. Commit the checkpoint when the workspace
-   rules require it.
+   blockers, and next operator action. Put the current summary first and link
+   detailed evidence. Include documentation changes and their project paths, or
+   briefly explain why none were useful. Distinguish prepared operations from
+   executed and verified results. Commit the checkpoint when workspace rules
+   require it.
 2. Keep `portal.yml` free of secrets and transient files. Add only useful
    artifacts stored beneath the initiative tracking directory. Repository
    worktrees created with `dev-session worktree add`

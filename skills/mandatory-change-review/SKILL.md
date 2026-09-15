@@ -97,6 +97,9 @@ required lane.
    - explicit non-goals, rejected alternatives, and user decisions that bound
      the implementation or accepted residual behavior;
    - relevant dependency pins or configuration changes;
+   - documentation changed or checked, with paths to the owning project docs,
+     decision rationale, and applicable deployment or recovery instructions;
+     briefly explain when no documentation change was useful;
    - quick verification commands and results;
    - overall risk classification, its rationale, and selected reasoning
      effort;

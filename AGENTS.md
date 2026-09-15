@@ -38,3 +38,12 @@ contract files. After mandatory review, run feature-branch and upstream contract
 checks with the local command above. Manual dispatch is also available once the
 workflow exists on the default branch. Keep normal dependency-update CI within
 the 20-minute target; do not add the migration VM back to every package update.
+
+## Documentation
+
+Use the generic `dev-session-documentation` skill supplied by the runtime for
+substantive development and operational work. Start with this repository's
+README for extension packaging and its linked namespace-migration runbook. Keep
+organization-specific skill guidance here and generic authoring guidance in the
+runtime. Concrete site procedures belong in the consuming workspace or site
+configuration repository.

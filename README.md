@@ -5,6 +5,12 @@ This repository adds vpsFree.cz tools to the reusable
 It owns the KB commands, vpsAdmin and vpsAdminOS development-cluster providers,
 Codex skills, and the one-time namespace migration helper.
 
+The generic runtime supplies the `dev-session-documentation` skill. Its
+[session guide](https://github.com/aither64/dev-workspace/blob/master/docs/dev-sessions.md#documentation-during-development)
+explains document ownership and rationale capture. This extension connects that
+workflow to its review packets and handoffs; each consuming workspace names its
+project and site-specific documentation destinations.
+
 Concrete endpoints, credential paths, and development-cluster defaults are not
 stored here. A consuming workspace passes them to `lib.mkPackage`:
 

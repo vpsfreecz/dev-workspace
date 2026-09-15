@@ -57,6 +57,15 @@ Use these vpsAdmin-specific commit red flags:
   after the transfer. Metadata-only assertions are insufficient.
 - Check that behavior changes update the appropriate documentation, man pages,
   API docs, migration notes, and operational documentation.
+- Check that consequential rationale and constraints have a durable home in the
+  owning project and are discoverable from its documentation entry point.
+  Assess the explanation needed by the change; a short rationale can be enough.
+  Do not require a fixed document bundle or historical backfill.
+- Reconcile design and operational guidance with the final implementation and
+  evidence. Distinguish supported behavior, proposals, historical decisions,
+  inferred rationale, and prepared versus executed rollouts. Check applicable
+  versions, deployment order, verification, and recovery limits when relevant.
+  Evaluate documentation gaps using the existing finding severities.
 - For KB or DokuWiki changes, manually enumerate instructions that perform a
   vpsAdmin WebUI action and require each to be wrapped in a semantic
   `<vpsadmin-nav>` annotation bound to the affected language pages. A green
