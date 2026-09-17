@@ -20,10 +20,12 @@ Before handing off material work:
 
 1. Update `work/<slug>/state.md` with the current branches, test or CI results,
    blockers, and next operator action. Put the current summary first and link
-   detailed evidence. Include documentation changes and their project paths, or
-   briefly explain why none were useful. Distinguish prepared operations from
-   executed and verified results. Commit the checkpoint when workspace rules
-   require it.
+   detailed evidence. Link project explanations and applicable operations or
+   upgrade guidance, with individual rollout records linked separately under
+   the generic documentation skill's placement rules. Briefly explain when no
+   documentation change was useful. Keep temporary branch/review instructions
+   in session records and distinguish prepared operations from executed and
+   verified results. Commit the checkpoint when workspace rules require it.
 2. Keep `portal.yml` free of secrets and transient files. Add only useful
    artifacts stored beneath the initiative tracking directory. Repository
    worktrees created with `dev-session worktree add`

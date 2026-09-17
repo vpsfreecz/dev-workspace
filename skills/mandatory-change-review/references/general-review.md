@@ -61,6 +61,13 @@ Use these vpsAdmin-specific commit red flags:
   owning project and are discoverable from its documentation entry point.
   Assess the explanation needed by the change; a short rationale can be enough.
   Do not require a fixed document bundle or historical backfill.
+- Apply the generic dev-session-documentation skill's placement rules. Feature
+  explanations must remain useful after rollout; temporary branch state and
+  individual deployment checklists belong in operational/session records, even
+  without dates or revision hashes. Check that reusable procedures and supported
+  upgrade paths have discoverable, appropriately scoped guidance. Moving mixed
+  material must preserve lasting feature constraints and recovery requirements.
+  Distinguish application transaction rollback from reverting deployed software.
 - Reconcile design and operational guidance with the final implementation and
   evidence. Distinguish supported behavior, proposals, historical decisions,
   inferred rationale, and prepared versus executed rollouts. Check applicable
