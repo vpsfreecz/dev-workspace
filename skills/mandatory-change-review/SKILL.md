@@ -12,10 +12,18 @@ verification has passed, but before long integration tests are started. The
 review is advisory, but Blocking and Important findings must be addressed as
 described below before continuing.
 
-The coordinating agent launches an adaptive team of one to four standalone
-reviewers with fresh context. Every reviewer must use model `gpt-6-astra` with
-reasoning effort `xhigh`, perform its assigned review directly, and not launch
-nested reviewers or subagents.
+The coordinating agent assigns one independent reviewer the adaptive set of
+applicable review lanes. Resolve that reviewer from the session's pinned team
+catalog and require reasoning effort `xhigh`; never substitute an inherited or
+fallback model. The site's normal policy selects Sol. The reviewer performs the
+review directly and does not launch nested reviewers or subagents.
+
+Create the reviewer with fresh context for the first review of a coherent
+change. Retain that independent thread for findings, requested fixes and later
+relevant revisions so it does not repeatedly rediscover the same code and
+decisions. Replace it only when the change is unrelated, independence was lost,
+the reviewer authored substantive fixes, its native identity cannot be
+validated, or the pinned catalog requires an incompatible reviewer.
 
 ## Invocation Mode
 
@@ -28,9 +36,9 @@ First decide which role you are in:
 
 ## Reasoning Effort
 
-Before launching reviewers, classify the overall change at the highest risk
+Before launching the reviewer, classify the overall change at the highest risk
 present in any affected component. The classification informs the packet and
-lane selection; all reviewers still use reasoning effort `xhigh`:
+lane selection; the reviewer always uses reasoning effort `xhigh`:
 
 - **Low:** a simple, localized, readily reversible change with no security,
   persisted-state, public-contract, destructive-operation, deployment, or
@@ -42,15 +50,15 @@ lane selection; all reviewers still use reasoning effort `xhigh`:
   contracts, protocols, host/node behavior, destructive or irreversible
   operations, deployment ordering, rollback, or mixed-version operation.
 
-Use reasoning effort `xhigh` for every risk classification. Do not use `max`;
-its additional latency is disproportionate for this workflow. When uncertain,
-choose the higher risk classification so the packet and specialist lanes still
-cover the relevant concerns.
+Use reasoning effort `xhigh` for every risk classification and every review or
+review rerun. Do not use `max` or `ultra`. When uncertain, choose the higher
+risk classification so the packet and selected lanes still cover the relevant
+concerns.
 
 ## Review Lanes
 
-Launch the general reviewer for every required review. Add each specialist when
-its trigger applies:
+The reviewer always covers the general lane. Add each specialist lane to the
+same assignment when its trigger applies:
 
 - **General:** always. Read
   [references/general-review.md](references/general-review.md).
@@ -71,10 +79,9 @@ its trigger applies:
   mixed-version operation. Read
   [references/risk-review.md](references/risk-review.md).
 
-Documentation-only changes normally use only the general lane. If more than one
-lane applies, launch the reviewers concurrently when capacity permits and
-sequentially otherwise; lack of a free parallel slot is not a reason to omit a
-required lane.
+Documentation-only changes normally use only the general lane. Combining lanes
+does not permit omitting their references or collapsing their distinct concerns
+into a superficial general review.
 
 ## Main Agent Workflow
 
@@ -109,12 +116,18 @@ required lane.
    - for reusable or cross-project components, the owning component, public
      interface, and consumers discovered from imports, dependency pins,
      wrappers, manifests, documentation, and current repository state.
-6. Launch one fresh standalone agent per applicable lane. Set
-   `fork_turns: "none"`, `model: "gpt-6-astra"`, and `reasoning_effort:
-   "xhigh"`. Give each agent the review packet, its
-   lane, this skill path, and instructions to read the lane reference and
-   perform the review itself. Do not pass hidden conclusions or ask for a
-   rubber stamp.
+6. For the first review of this coherent change, launch the pinned reviewer as
+   one fresh standalone agent with `fork_turns: "none"`. Select the native role
+   identifier qualified by the pinned catalog digest, then pass its exact catalog
+   model and reasoning effort `xhigh` explicitly. Native role TOMLs define
+   behavior only; they do not establish model, effort, or permission settings.
+   Observe the created child and fail the review gate unless its native identity,
+   model, and effort match the pinned catalog. Give it the review packet, all
+   applicable lanes, this skill path, and instructions to read every selected
+   lane reference and perform the review itself. Do not pass hidden conclusions
+   or ask for a rubber stamp. For related follow-ups, address the retained
+   reviewer by its verified catalog-digest-qualified native identity and trigger
+   a real follow-up turn; a queued status message alone is insufficient.
 7. Collect all findings. Investigate conflicts using the code and repository
    evidence; do not decide by majority vote. Merge duplicates, retain the
    highest severity supported by evidence, and identify the originating lane.
@@ -127,6 +140,7 @@ required lane.
 10. Rerun only the lanes affected when a remediation introduces a new design,
    expands the accepted boundary, changes a public or cross-project contract,
    or resolves a finding through behavior the completed review did not assess.
+   Reuse the independent reviewer unless a replacement condition above applies.
    Do not rerun unaffected lanes.
 11. Record the risk classification and rationale, reviewer lanes, model and
    effort, reviewed commits, findings, decisions, fixes, and any reruns in the

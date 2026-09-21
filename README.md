@@ -43,7 +43,23 @@ vpsfree-dev-workspace.lib.mkPackage {
 ```
 
 Each registered workspace keeps its portal identity and selected cluster
-providers in the `.dev-workspace.json` file at its own root.
+providers in the `.dev-workspace.json` file at its own root. This extension
+exports `vpsadmin` and `vpsadminos`; a workspace can select either or both
+only while its package is built through this extension.
+
+## Catalog composition
+
+The installed `extensions.json` is a composed catalog: it contains the generic
+runtime's skills as well as this extension's site skills. Consumers and tests
+must require the vpsFree skills they need, without asserting an exact global
+skill list. The generic runtime currently supplies `dev-session-documentation`
+and `dev-session-monitor`, and it may add compatible foundational skills.
+
+The vpsFree package must continue to provide `dev-session-handoff`,
+`mandatory-change-review`, and `vpsfree-user-facing-writing` alongside its
+other site skills. Its catalog must list the `vpsadmin` and `vpsadminos`
+providers, whose recorded commands and portal helper executables must be
+present in the installed package.
 
 The optional `userNamespace` and `routerSocket` arguments are passed to the
 generic package constructor. They are intended for a compatibility generation

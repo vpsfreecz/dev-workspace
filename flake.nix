@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    dev-workspace.url = "github:aither64/dev-workspace/b52a2363be8bb9985e4b9f254fb43e8cade4551d";
+    dev-workspace.url = "github:aither64/dev-workspace/59c4ba30fd49bf0f03408e9f16e6280c10b7f0d4";
     devcluster-vpsadminos.url = "github:vpsfreecz/vpsadminos/15802517e2d92dda4ddc07ebac3d1d7ea087b430";
     devcluster-vpsadmin = {
       url = "github:vpsfreecz/vpsadmin/master";
@@ -27,7 +27,8 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      validateSiteConfig = import ./nix/site-config.nix { lib = nixpkgs.lib; };
+      lib = nixpkgs.lib;
+      validateSiteConfig = import ./nix/site-config.nix { inherit lib; };
       migrationHostPaths = builtins.fromJSON (builtins.readFile ./nix/host-paths.json);
       hostPathContractMatches = migrationHostPaths == dev-workspace.lib.hostPaths;
       skillNames = builtins.attrNames (
@@ -61,6 +62,7 @@
           pkgs,
           routerSocket ? dev-workspace.lib.hostPaths.routerSocket,
           siteConfig,
+          teamConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         let
@@ -70,38 +72,41 @@
             siteConfig = validatedSiteConfig;
           };
         in
-        (dev-workspace.lib.mkPackage {
-          inherit
-            activationEnvironmentAliases
-            pkgs
-            routerSocket
-            userNamespace
-            ;
-          extensions = {
-            commands = builtins.listToAttrs (
-              map (name: {
-                inherit name;
-                value = "${tools}/bin/${name}";
-              }) commandNames
-            );
-            skills = builtins.listToAttrs (
-              map (name: {
-                inherit name;
-                value = "${self}/skills/${name}";
-              }) skillNames
-            );
-            clusterProviders = {
-              vpsadmin = {
-                label = "vpsAdmin";
-                command = "${tools}/bin/vpsadmin-devcluster";
-              };
-              vpsadminos = {
-                label = "vpsAdminOS";
-                command = "${tools}/bin/vpsadminos-devcluster";
+        (dev-workspace.lib.mkPackage (
+          {
+            inherit
+              activationEnvironmentAliases
+              pkgs
+              routerSocket
+              userNamespace
+              ;
+            extensions = {
+              commands = builtins.listToAttrs (
+                map (name: {
+                  inherit name;
+                  value = "${tools}/bin/${name}";
+                }) commandNames
+              );
+              skills = builtins.listToAttrs (
+                map (name: {
+                  inherit name;
+                  value = "${self}/skills/${name}";
+                }) skillNames
+              );
+              clusterProviders = {
+                vpsadmin = {
+                  label = "vpsAdmin";
+                  command = "${tools}/bin/vpsadmin-devcluster";
+                };
+                vpsadminos = {
+                  label = "vpsAdminOS";
+                  command = "${tools}/bin/vpsadminos-devcluster";
+                };
               };
             };
-          };
-        }).overrideAttrs
+          }
+          // lib.optionalAttrs (teamConfig != null) { inherit teamConfig; }
+        )).overrideAttrs
           (previous: {
             postInstall = (previous.postInstall or "") + ''
               ln -s ${tools}/bin/vpsfree-dev-workspace-migrate \
@@ -249,6 +254,39 @@
               "kb-stage"
             ]' \
           ${testPackage}/share/dev-workspace/extensions.json >/dev/null
+          ${pkgs.jq}/bin/jq -e '
+            [.skills[].name] as $skills |
+            [
+              "dev-session-handoff",
+              "humanizer-cs",
+              "humanizer-en",
+              "mandatory-change-review",
+              "vpsfree-user-facing-writing"
+            ] | all(. as $skill | $skills | index($skill) != null)
+          ' \
+          ${testPackage}/share/dev-workspace/extensions.json >/dev/null
+          for skill in \
+            dev-session-handoff \
+            humanizer-cs \
+            humanizer-en \
+            mandatory-change-review \
+            vpsfree-user-facing-writing; do
+            test -d ${testPackage}/share/codex/skills/"$skill"
+          done
+          ${pkgs.jq}/bin/jq -e '
+            [.clusterProviders[] | { id, label }] == [
+              { id: "vpsadmin", label: "vpsAdmin" },
+              { id: "vpsadminos", label: "vpsAdminOS" }
+            ]
+          ' ${testPackage}/share/dev-workspace/extensions.json >/dev/null
+          for provider in vpsadmin vpsadminos; do
+            command=$(${pkgs.jq}/bin/jq -er \
+              --arg provider "$provider" \
+              '.clusterProviders[] | select(.id == $provider) | .command' \
+              ${testPackage}/share/dev-workspace/extensions.json)
+            test -x "$command"
+            test -x ${testPackage}/libexec/workspace-portal/"$provider"-devcluster
+          done
           test ! -e ${testPackage}/bin/vpsfree-dev-workspace-migrate
           test -x ${testPackage}/libexec/vpsfree-dev-workspace-migrate
           touch "$out"
