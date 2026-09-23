@@ -13,11 +13,14 @@ review is advisory, but Blocking and Important findings must be addressed as
 described below before continuing.
 
 The coordinating agent assigns one independent reviewer the adaptive set of
-applicable review lanes. Prefer an eligible retained `reviewerN` in the current
-session, selecting the lowest index. Use that member's saved model and reasoning
-effort exactly; do not override either setting for review. If no member is
+applicable review lanes. Prefer an eligible retained member whose saved purpose
+is `review` in the current session. Select the lowest numeric member index,
+breaking ties by address. Legacy `reviewerN` members without a saved purpose
+also qualify. Use that member's saved model and reasoning effort exactly; do
+not override either setting for review. If no member is
 eligible (including a solo session), launch one fresh standalone reviewer using
-the installed catalog's default development reviewer's model and effort. This
+the lexicographically first review-purpose role in the installed catalog's
+default development team and its model and effort. This
 fallback does not add a member or change the roster. If no valid installed
 catalog policy is available, stop and request direction rather than inventing
 a model or accepting self-review. The reviewer performs the review directly
@@ -125,16 +128,18 @@ into a superficial general review.
    - for reusable or cross-project components, the owning component, public
      interface, and consumers discovered from imports, dependency pins,
      wrappers, manifests, documentation, and current repository state.
-6. Check the current session roster and choose the lowest-index eligible
-   `reviewerN`. Send the packet and all selected lanes to that member with
-   `dev-session team assign <slug> --to reviewerN --message-stdin` (or the
+6. Check the current session roster and choose the eligible member with review
+   purpose and the lowest numeric index, breaking ties by address. Send the
+   packet and all selected lanes to that member with
+   `dev-session team assign <slug> --to <member-address> --message-stdin` (or the
    equivalent session-bound assignment), omitting `--model` and `--effort` so
    the saved settings govern the turn. Verify the resulting member identity,
-   model, effort, and completed review report. If no member qualifies, use the
-   installed catalog's default development team reviewer role as one fresh
-   standalone agent with `fork_turns: "none"`, passing its exact model and
-   effort explicitly. Verify its native identity and settings against that
-   catalog. Native role TOMLs define behavior, not model, effort, or permission
+   model, effort, and completed review report. If no member qualifies, select
+   the lexicographically first review-purpose role in the installed catalog's
+   default development team as one fresh standalone agent with
+   `fork_turns: "none"`, passing its exact model and effort explicitly. Verify
+   its native identity and settings against that catalog. Native role TOMLs
+   define behavior, not model, effort, or permission
    settings. Give either reviewer the review packet, this skill path, and
    instructions to read every selected lane reference and perform the review
    itself. Do not pass hidden conclusions or ask for a rubber stamp. For

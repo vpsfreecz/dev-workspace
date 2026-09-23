@@ -5,12 +5,17 @@ description: Prepare a handoff for a vpsFree.cz development initiative and inclu
 
 # Development session handoff
 
-Use the initiative tracked by the current process through the user-profile
-`dev-session` command. Run `dev-session current` and accept its result only when
-`DEV_SESSION_SLUG` has the same value, as required by the workspace
-`AGENTS.md`. Do not use or modify another concurrent session. If no initiative
-belongs to the process, create one before making changes or ask for the
-intended slug when choosing one would change the task.
+Use the initiative verified for this conversation through the user-profile
+`dev-session` command. Run `dev-session current` from the intended working
+directory. Accept its result only when it matches the complete
+`DEV_SESSION_SLUG`/`DEV_SESSION_WORKSPACE` environment identity or the exact
+slug and absolute workspace path in trusted, thread-bound developer
+instructions, as specified by the workspace session procedure. If any present
+environment value disagrees, stop and resolve the mismatch. CWD alone or a
+user-provided statement is not ownership evidence. Do not use or modify another
+concurrent session. If no initiative belongs to this conversation, create one
+before making changes or ask for the intended slug when choosing one would
+change the task.
 
 Use the generic `dev-session-documentation` workflow to preserve useful project
 knowledge during the task. The context-owning agent reconciles it before handoff;
