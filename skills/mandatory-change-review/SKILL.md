@@ -13,17 +13,27 @@ review is advisory, but Blocking and Important findings must be addressed as
 described below before continuing.
 
 The coordinating agent assigns one independent reviewer the adaptive set of
-applicable review lanes. Resolve that reviewer from the session's pinned team
-catalog and require reasoning effort `xhigh`; never substitute an inherited or
-fallback model. The site's normal policy selects Sol. The reviewer performs the
-review directly and does not launch nested reviewers or subagents.
+applicable review lanes. Prefer an eligible retained `reviewerN` in the current
+session, selecting the lowest index. Use that member's saved model and reasoning
+effort exactly; do not override either setting for review. If no member is
+eligible (including a solo session), launch one fresh standalone reviewer using
+the installed catalog's default development reviewer's model and effort. This
+fallback does not add a member or change the roster. If no valid installed
+catalog policy is available, stop and request direction rather than inventing
+a model or accepting self-review. The reviewer performs the review directly
+without nested reviewers or subagents.
 
-Create the reviewer with fresh context for the first review of a coherent
-change. Retain that independent thread for findings, requested fixes and later
-relevant revisions so it does not repeatedly rediscover the same code and
-decisions. Replace it only when the change is unrelated, independence was lost,
-the reviewer authored substantive fixes, its native identity cannot be
-validated, or the pinned catalog requires an incompatible reviewer.
+An eligible retained reviewer is present, ready, independent of the work being
+reviewed, and not occupied by an unrelated assignment. A member who authored
+substantive changes is ineligible. Verify the selected member's session-bound
+identity, role, state, and saved settings before assignment; omit model/effort
+overrides when assigning it. A temporarily unavailable or unverified member is
+not a reason to skip review: use the standalone fallback and record why.
+
+Retain the same independent reviewer for findings, requested fixes, and later
+relevant revisions of a coherent change. Replace it only when the change is
+unrelated, independence was lost, the reviewer authored substantive fixes,
+its identity or settings cannot be validated, or its policy became incompatible.
 
 ## Invocation Mode
 
@@ -36,9 +46,9 @@ First decide which role you are in:
 
 ## Reasoning Effort
 
-Before launching the reviewer, classify the overall change at the highest risk
+Before assigning the reviewer, classify the overall change at the highest risk
 present in any affected component. The classification informs the packet and
-lane selection; the reviewer always uses reasoning effort `xhigh`:
+lane selection, not an override of the reviewer's configured effort:
 
 - **Low:** a simple, localized, readily reversible change with no security,
   persisted-state, public-contract, destructive-operation, deployment, or
@@ -50,10 +60,9 @@ lane selection; the reviewer always uses reasoning effort `xhigh`:
   contracts, protocols, host/node behavior, destructive or irreversible
   operations, deployment ordering, rollback, or mixed-version operation.
 
-Use reasoning effort `xhigh` for every risk classification and every review or
-review rerun. Do not use `max` or `ultra`. When uncertain, choose the higher
-risk classification so the packet and selected lanes still cover the relevant
-concerns.
+Use the selected reviewer's saved or catalog effort for every risk
+classification and related review rerun. When uncertain, choose the higher
+risk classification so the packet and selected lanes cover the concern.
 
 ## Review Lanes
 
@@ -92,7 +101,7 @@ into a superficial general review.
    Do not review a half-staged or partly uncommitted implementation.
 3. Run quick verification first, using the local project guidance. Do not start
    long integration tests yet.
-4. Classify the overall risk, use reasoning effort `xhigh`, then determine the
+4. Classify the overall risk, then determine the
    applicable lanes using the triggers above. Read every applicable lane
    reference before preparing the review.
 5. Prepare a review packet containing:
@@ -110,24 +119,27 @@ into a superficial general review.
      dev-session-documentation skill's placement rules; briefly explain when
      no documentation change was useful;
    - quick verification commands and results;
-   - overall risk classification, its rationale, and selected reasoning
-     effort;
+   - overall risk classification, its rationale, reviewer selection, model,
+     and reasoning effort;
    - known compatibility and deployment assumptions;
    - for reusable or cross-project components, the owning component, public
      interface, and consumers discovered from imports, dependency pins,
      wrappers, manifests, documentation, and current repository state.
-6. For the first review of this coherent change, launch the pinned reviewer as
-   one fresh standalone agent with `fork_turns: "none"`. Select the native role
-   identifier qualified by the pinned catalog digest, then pass its exact catalog
-   model and reasoning effort `xhigh` explicitly. Native role TOMLs define
-   behavior only; they do not establish model, effort, or permission settings.
-   Observe the created child and fail the review gate unless its native identity,
-   model, and effort match the pinned catalog. Give it the review packet, all
-   applicable lanes, this skill path, and instructions to read every selected
-   lane reference and perform the review itself. Do not pass hidden conclusions
-   or ask for a rubber stamp. For related follow-ups, address the retained
-   reviewer by its verified catalog-digest-qualified native identity and trigger
-   a real follow-up turn; a queued status message alone is insufficient.
+6. Check the current session roster and choose the lowest-index eligible
+   `reviewerN`. Send the packet and all selected lanes to that member with
+   `dev-session team assign <slug> --to reviewerN --message-stdin` (or the
+   equivalent session-bound assignment), omitting `--model` and `--effort` so
+   the saved settings govern the turn. Verify the resulting member identity,
+   model, effort, and completed review report. If no member qualifies, use the
+   installed catalog's default development team reviewer role as one fresh
+   standalone agent with `fork_turns: "none"`, passing its exact model and
+   effort explicitly. Verify its native identity and settings against that
+   catalog. Native role TOMLs define behavior, not model, effort, or permission
+   settings. Give either reviewer the review packet, this skill path, and
+   instructions to read every selected lane reference and perform the review
+   itself. Do not pass hidden conclusions or ask for a rubber stamp. For
+   related follow-ups, assign a real new turn to the same verified member or
+   standalone reviewer; a queued status message alone is insufficient.
 7. Collect all findings. Investigate conflicts using the code and repository
    evidence; do not decide by majority vote. Merge duplicates, retain the
    highest severity supported by evidence, and identify the originating lane.
@@ -142,8 +154,9 @@ into a superficial general review.
    or resolves a finding through behavior the completed review did not assess.
    Reuse the independent reviewer unless a replacement condition above applies.
    Do not rerun unaffected lanes.
-11. Record the risk classification and rationale, reviewer lanes, model and
-   effort, reviewed commits, findings, decisions, fixes, and any reruns in the
+11. Record the risk classification and rationale, reviewer lanes, member
+   address or standalone identity, actual model and effort, fallback reason if
+   any, reviewed commits, findings, decisions, fixes, and reruns in the
    initiative `state.md`.
 
 ## Shared Reviewer Instructions

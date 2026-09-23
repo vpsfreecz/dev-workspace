@@ -26,6 +26,12 @@ Before handing off material work:
    documentation change was useful. Keep temporary branch/review instructions
    in session records and distinguish prepared operations from executed and
    verified results. Commit the checkpoint when workspace rules require it.
+   If feature branches are ready but the user has not explicitly directed their
+   integration into the named default branches, keep the initiative active and
+   say "ready, awaiting merge approval". Review, CI, deployment, or plan
+   acceptance does not supply that approval. Record any approval's source and
+   repository/target set; a clean patch-equivalent rebase may retain it, while
+   a material patch or scope change requires renewed direction.
 2. Keep `portal.yml` free of secrets and transient files. Add only useful
    artifacts stored beneath the initiative tracking directory. Repository
    worktrees created with `dev-session worktree add`

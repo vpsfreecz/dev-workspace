@@ -325,6 +325,7 @@
               ruby test/kb_page_test.rb
               ruby test/kb_stage_test.rb
               ruby test/migration_test.rb
+              ruby test/skill_policy_test.rb
               touch "$out"
             '';
         organization-source = pkgs.runCommand "vpsfree-dev-workspace-source" { } ''
