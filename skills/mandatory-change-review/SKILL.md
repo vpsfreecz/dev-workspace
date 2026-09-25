@@ -102,6 +102,12 @@ into a superficial general review.
    lockfile refreshes, or other mechanical metadata updates.
 2. Make sure all intended changes are committed in every affected repository.
    Do not review a half-staged or partly uncommitted implementation.
+   For a final readiness review of an unmerged feature branch, inspect the
+   complete base-to-head series and final diff before sending the packet.
+   Inventory migrations and establish whether each version was merged,
+   released or deployed. Identify superseded commits, code and transitional
+   schema; clean unapplied obsolete history before the review. Earlier reviews
+   of individual commits or incremental ranges do not cover this final gate.
 3. Run quick verification first, using the local project guidance. Do not start
    long integration tests yet.
 4. Classify the overall risk, then determine the
@@ -113,6 +119,9 @@ into a superficial general review.
    - base and head commits for every repository;
    - intended commit split and any deliberately bundled changes, with a
      concrete rationale for why they are inseparable;
+   - for a final readiness review, the complete branch commit list, final
+     base-to-head diff, disposition of superseded approaches and follow-up
+     fixes, and a migration inventory with merge/release/deployment evidence;
    - explicit non-goals, rejected alternatives, and user decisions that bound
      the implementation or accepted residual behavior;
    - relevant dependency pins or configuration changes;
@@ -170,6 +179,12 @@ Review committed changes across all affected projects. Inspect diffs, commit
 history, local `AGENTS.md` files, relevant tests, documentation, and project
 context before forming conclusions. Review the commit series, not only the
 final tree, and compare it with the user request and initiative plan/state.
+For a final readiness review, inspect the complete branch from its merge base,
+even if earlier individual commits were reviewed. Explicitly report whether
+obsolete unmerged approaches and unapplied transitional migrations remain,
+and whether the supplied migration provenance supports their consolidation.
+If the packet lacks the complete series or provenance, request it before
+claiming the final branch was reviewed.
 
 Stay focused on the assigned lane, but report a concrete serious issue from
 another lane if you encounter one. Do not assume that another reviewer will

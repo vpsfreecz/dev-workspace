@@ -18,6 +18,14 @@ rollback, and mixed-version operation.
   schema and reset disposable databases instead. Allow guards only for
   documented supported predecessor schemas with tests for every path; retain
   real data-integrity and conversion checks.
+- For a final review of an unmerged branch, list every new migration in order
+  and verify its stated merge/release/deployment history. Compare each step
+  with the final schema and callers. Flag migrations that exist only to
+  upgrade an earlier, unapplied iteration of the same branch; require the
+  final schema to be introduced directly unless a documented retained
+  database or supported predecessor requires the intermediate step. Check
+  fresh schema load, bootstrap data and upgrade-from-deployed-schema paths
+  separately. State the migration-lineage conclusion in the review report.
 - Require transfer tests for containers, VPS datasets, backups, and replacement
   datasets to prove data integrity with known contents or checksums, not only
   metadata.
