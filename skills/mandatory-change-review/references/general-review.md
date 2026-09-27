@@ -24,6 +24,11 @@ Review scope, correctness, commit history, tests, and documentation.
   versions, migrations, dual-read/write paths, or shims kept only for abandoned
   branch iterations. Preserve compatibility with merged, released, deployed,
   or externally consumed behavior.
+- For final branch review, compare the complete base-to-head commit list with
+  the final diff. Name commits whose approaches were later removed or replaced,
+  or explicitly conclude that no obsolete branch history remains. Check that
+  follow-up fixes were folded into their owning unmerged commits when
+  appropriate. A review of only the latest commit does not complete this gate.
 - Require repeated updates to the same flake input, gem dependency, dependency
   group, lockfile, Bundix output, or generated metadata in one update stream to
   be consolidated into one dependency-update commit.

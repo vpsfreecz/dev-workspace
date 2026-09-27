@@ -17,6 +17,34 @@ class SkillPolicyTest < Minitest::Test
     assert_match(/does not add a member or change the roster/, skill)
   end
 
+  def test_final_review_requires_complete_history_and_explicit_conclusions
+    skill = File.read(File.join(ROOT, 'skills/mandatory-change-review/SKILL.md'))
+    general = File.read(File.join(ROOT, 'skills/mandatory-change-review/references/general-review.md'))
+
+    assert_match(/Before claiming an unmerged feature branch ready, arrange a final review/, skill)
+    assert_match(/complete base-to-head commit series and final diff/, skill)
+    assert_match(/Earlier incremental reviews do not\s+complete this final gate/, skill)
+    assert_match(/complete base-to-head commit list and\s+final diff/, skill)
+    assert_match(/Explicitly conclude whether obsolete\s+unmerged approaches remain/, skill)
+    assert_match(/If the packet lacks the complete\s+series or migration inventory and provenance, request them/, skill)
+    assert_match(/complete base-to-head commit list with\s+the final diff/, general)
+    assert_match(/explicitly conclude that no obsolete branch history remains/, general)
+    assert_match(/narrow fix.*inspect and verify that fix directly/m, skill)
+  end
+
+  def test_final_review_checks_migration_provenance_and_empty_inventory
+    skill = File.read(File.join(ROOT, 'skills/mandatory-change-review/SKILL.md'))
+    risk = File.read(File.join(ROOT, 'skills/mandatory-change-review/references/risk-review.md'))
+
+    assert_match(/each migration version was merged, released, deployed, or\s+externally consumed/, skill)
+    assert_match(/explicitly state when there are no migrations/, skill)
+    assert_match(/state "no\s+migrations" when the inventory is empty/, skill)
+    assert_match(/merge, release, deployment, and external-use provenance/, risk)
+    assert_match(/only upgrade an earlier, unapplied branch iteration/, risk)
+    assert_match(/fresh schema load, bootstrap data, and upgrades\s+from deployed schemas separately/, risk)
+    assert_match(/migration-lineage\s+conclusion, or "no migrations"/, risk)
+  end
+
   def test_handoff_keeps_unapproved_feature_active
     skill = File.read(File.join(ROOT, 'skills/dev-session-handoff/SKILL.md'))
 

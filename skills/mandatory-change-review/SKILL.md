@@ -102,6 +102,13 @@ into a superficial general review.
    lockfile refreshes, or other mechanical metadata updates.
 2. Make sure all intended changes are committed in every affected repository.
    Do not review a half-staged or partly uncommitted implementation.
+   Before claiming an unmerged feature branch ready, arrange a final review of
+   its complete base-to-head commit series and final diff. Identify superseded
+   approaches, follow-up fixes, unused compatibility paths, and migrations.
+   Establish whether each migration version was merged, released, deployed, or
+   externally consumed. Consolidate obsolete, unapplied branch history before
+   review while preserving supported paths. Earlier incremental reviews do not
+   complete this final gate.
 3. Run quick verification first, using the local project guidance. Do not start
    long integration tests yet.
 4. Classify the overall risk, then determine the
@@ -111,6 +118,10 @@ into a superficial general review.
    - requested outcome and acceptance criteria;
    - initiative slug, plan/state files, affected repositories and worktrees;
    - base and head commits for every repository;
+   - for a final readiness review, the complete base-to-head commit list and
+     final diff, disposition of superseded approaches and follow-up fixes,
+     and migration versions with merge, release, deployment, and external-use
+     provenance; explicitly state when there are no migrations;
    - intended commit split and any deliberately bundled changes, with a
      concrete rationale for why they are inseparable;
    - explicit non-goals, rejected alternatives, and user decisions that bound
@@ -159,6 +170,8 @@ into a superficial general review.
    or resolves a finding through behavior the completed review did not assess.
    Reuse the independent reviewer unless a replacement condition above applies.
    Do not rerun unaffected lanes.
+   A completed final branch review does not require another full review for a
+   narrow fix that meets step 9; inspect and verify that fix directly.
 11. Record the risk classification and rationale, reviewer lanes, member
    address or standalone identity, actual model and effort, fallback reason if
    any, reviewed commits, findings, decisions, fixes, and reruns in the
@@ -170,6 +183,12 @@ Review committed changes across all affected projects. Inspect diffs, commit
 history, local `AGENTS.md` files, relevant tests, documentation, and project
 context before forming conclusions. Review the commit series, not only the
 final tree, and compare it with the user request and initiative plan/state.
+For final readiness, inspect each affected branch from its merge base even if
+earlier individual commits were reviewed. Explicitly conclude whether obsolete
+unmerged approaches remain and whether migration lineage is sound; state "no
+migrations" when the inventory is empty. If the packet lacks the complete
+series or migration inventory and provenance, request them before claiming the
+final branch was reviewed.
 
 Stay focused on the assigned lane, but report a concrete serious issue from
 another lane if you encounter one. Do not assume that another reviewer will
