@@ -1134,15 +1134,28 @@ let
         vpsfStatusModule
       ];
 
-      assertions = lib.optional installMailTemplates {
-        assertion =
-          builtins.elem "vpsadmin-notification-templates.service" config.systemd.services.vpsadmin-devcluster-seed.after
-          && builtins.elem "vpsadmin-notification-templates.service" config.systemd.services.vpsadmin-devcluster-seed.requires;
-        message = ''
-          External notification templates must be reconciled before the
-          devcluster seed attaches configured mail recipients.
-        '';
-      };
+      assertions =
+        lib.optional installMailTemplates {
+          assertion =
+            builtins.elem "vpsadmin-notification-templates.service" config.systemd.services.vpsadmin-devcluster-seed.after
+            && builtins.elem "vpsadmin-notification-templates.service" config.systemd.services.vpsadmin-devcluster-seed.requires;
+          message = ''
+            External notification templates must be reconciled before the
+            devcluster seed attaches configured mail recipients.
+          '';
+        }
+        ++ lib.optional newWebuiEnabled {
+          assertion =
+            config.containers.newadmin.autoStart
+            && builtins.elem "machines.target" config.systemd.services."container@newadmin".wantedBy
+            && builtins.elem "vpsadmin-devcluster-webui-seed.service" config.systemd.services."container@newadmin".requires
+            && builtins.elem "vpsadmin-devcluster-webui-seed.service" config.systemd.services."container@newadmin".after;
+          message = "Enabled React WebUI container must auto-start after its OAuth seed";
+        }
+        ++ lib.optional (!newWebuiEnabled) {
+          assertion = !(config.containers ? newadmin) && !(config.systemd.services ? "container@newadmin");
+          message = "Disabled React WebUI must not add the newadmin container unit";
+        };
 
       boot.initrd.kernelModules = [ "virtiofs" ];
       boot.supportedFilesystems.virtiofs = true;
@@ -1666,6 +1679,7 @@ let
       };
 
       containers.newadmin = lib.mkIf newWebuiEnabled {
+        autoStart = true;
         privateNetwork = false;
         bindMounts.${webuiRuntimeCredentials} = {
           hostPath = webuiRuntimeCredentials;
