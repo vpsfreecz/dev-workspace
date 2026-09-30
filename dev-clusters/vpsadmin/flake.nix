@@ -2,8 +2,13 @@
   description = "Workspace-local vpsAdmin development clusters";
 
   inputs = {
-    vpsadmin.url = "github:vpsfreecz/vpsadmin/master";
+    vpsadmin.url = "github:vpsfreecz/vpsadmin/5c76e3290481b297dcd0baa76d246133f0353d8f";
     vpsadminos.url = "github:vpsfreecz/vpsadminos/staging";
+    vpsadminWebui = {
+      url = "github:vpsfreecz/vpsadmin-webui/534caa83a5f97d2b40b4a126886649b14dc9e8d3";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.vpsadmin.follows = "vpsadmin";
+    };
     vpsfStatus = {
       url = "github:vpsfreecz/vpsf-status/master";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -19,6 +24,7 @@
       nixpkgs,
       vpsadmin,
       vpsadminos,
+      vpsadminWebui,
       vpsfStatus,
     }:
     let
@@ -46,6 +52,10 @@
       vpsadminRevisionDirty = env "VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY" "0" == "1";
       vpsadminosRevision = env "VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION" (vpsadminos.rev or "");
       vpsadminosRevisionDirty = env "VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY" "0" == "1";
+      vpsadminWebuiRevision = env "VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION" (vpsadminWebui.rev or "");
+      vpsadminWebuiRevisionDirty = env "VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_DIRTY" "0";
+      vpsadminWebuiSourceKind = env "VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_SOURCE_KIND" "pinned";
+      webuiCredentialsDir = env "VPSADMIN_DEVCLUSTER_WEBUI_CREDENTIALS_DIR" "";
       haveapiSourcePath = env "VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE" "";
       configSourcePath = env "VPSADMIN_DEVCLUSTER_CONFIG_SOURCE" "";
       mailTemplatesSourcePath = env "VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE" "";
@@ -62,6 +72,7 @@
           lib
           vpsadmin
           vpsadminos
+          vpsadminWebui
           vpsfStatus
           workspace
           slug
@@ -77,6 +88,10 @@
           vpsadminRevisionDirty
           vpsadminosRevision
           vpsadminosRevisionDirty
+          vpsadminWebuiRevision
+          vpsadminWebuiRevisionDirty
+          vpsadminWebuiSourceKind
+          webuiCredentialsDir
           haveapiSourcePath
           configSourcePath
           mailTemplatesSourcePath
@@ -109,6 +124,11 @@
       };
     in
     {
+      lib.webuiPackageProvenance = {
+        frontend = vpsadminWebui.packages.${system}.frontend.provenance.buildInfo;
+        bff = vpsadminWebui.packages.${system}.bff.provenance.buildInfo;
+      };
+
       packages.${system} = {
         cluster-config = clusterConfig.json;
         inherit runner;

@@ -115,6 +115,56 @@ The default seed creates:
 - a vpsf-status instance on the services VM, exposed as
   `https://status.staging.example.test/`.
 
+### Optional React Web UI
+
+The legacy PHP Web UI remains available. A separate React Web UI runs on the
+services VM when the cluster config enables it:
+
+```json
+{
+  "newWebui": { "enable": true },
+  "domains": { "newadmin": "newadmin.devhost.example.test" }
+}
+```
+
+Use a distinct DNS name for `domains.newadmin`. The React service is disabled
+when these settings are absent. Enabled clusters require bridge networking;
+`start` and `update` reject an enabled local cluster. The public TLS endpoint
+proxies to the new container's private nginx on loopback port 18082. Its OAuth
+BFF listens on loopback port 3001 inside that container. The
+container uses the cluster CA to validate its HTTPS calls to the auth service.
+
+The enabled service uses API version 7.0 and a separate, nondefault OAuth
+client with 20-minute access tokens and 30-day refresh tokens. Its callback is
+`https://<newadmin-domain>/oauth/callback`; the PHP client's default status,
+credentials and service are retained. The new container keeps BFF sessions in
+its own persistent `/var/lib/vpsadmin-webui/sessions` directory.
+
+The first enabled build generates an OAuth client ID, client secret and session
+secret under
+`.dev-clusters/vpsadmin/clusters/<slug>/webui-credentials/`. It keeps that
+bundle across `stop`, `start` and services updates. An incomplete, malformed or
+unexpected bundle stops the build; the launcher does not replace or rotate it.
+The credentials enter the services VM through a dedicated runtime mount and are
+never copied into Nix source or cluster status. Cluster reset remains a
+separate destructive operation under the normal session rules.
+
+The packaged WebUI source is pinned to reviewed revision
+`534caa83a5f97d2b40b4a126886649b14dc9e8d3`. If the same session owns
+`worktrees/<slug>/vpsadmin-webui`, the launcher uses that source instead and
+records its revision and dirty state in `status --json`. Both frontend and BFF
+packages come from that input and must have matching provenance. Changes to a
+local WebUI worktree require `update <slug> services`; there is no live Vite
+process in the VM. The cluster's selected vpsAdmin worktree supplies the API,
+and the packaged smoke check pins a compatible API revision.
+
+The selected `result-config` JSON records the WebUI source revision, dirty
+state, and whether it came from the pinned input or a session worktree. Status
+reports those values from that selected build, even if `config.json` changes
+afterward. It does not confirm that the services VM has activated the build.
+Older `webui-source.json` files are ignored. A build with only the former
+revision and dirty labels must be rebuilt to record its source kind.
+
 The plugin set is configured with `plugins.enabled`. The default value is
 `"all"`, which enables every plugin directory bundled in the selected vpsAdmin
 worktree. Set it to a JSON array such as `["webui", "payments"]` to test a
@@ -258,8 +308,14 @@ cd worktrees/<slug>/vpsadmin
 nix develop -c rake vpsadmin:gems
 ```
 
-`start` and `update` stop if credential preparation or configuration building
-fails. They retain the previous build result for recovery and do not launch or
-deploy it as a replacement for a failed build. An update stops at the first
-failed copy, activation, or refresh; machines updated before that failure keep
-their new configuration.
+`start` and `update` stop if credential or source preparation fails. A failure
+before Nix publishes `result-config` leaves the previous result selected, or
+no result on a first build. Nix can fail after publishing a complete new
+result, for example while registering its GC root. In that case, status
+describes the selected build; it does not show whether the services VM
+activated it. Record the selected output path and failure phase, then retry
+the normal build to establish rooting and validation before updating a VM.
+Keep the compatible API and database schema, WebUI credentials, and BFF
+session state. Do not reset the cluster or rotate secrets to recover from this
+failure. An update stops at the first failed copy, activation, or refresh.
+Machines updated before that failure keep their new configuration.

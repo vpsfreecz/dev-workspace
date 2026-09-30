@@ -167,6 +167,55 @@ result_link() {
   printf '%s/result-config\n' "$(cluster_dir "$1")"
 }
 
+selected_webui_source_json() {
+  local link target
+  link="$(result_link "$1")"
+  if [ ! -e "$link" ] && [ ! -L "$link" ]; then
+    printf 'null\n'
+    return
+  fi
+  target="$(readlink -e -- "$link")" || {
+    printf 'error: selected cluster result is unreadable\n' >&2
+    return 1
+  }
+  [ -f "$target" ] && [ -r "$target" ] || {
+    printf 'error: selected cluster result is not a readable file\n' >&2
+    return 1
+  }
+
+  jq -cs '
+    if length != 1 or (.[0] | type) != "object" then
+      error("selected cluster result must contain one JSON object")
+    else .[0] end |
+    if (.machines | type) != "object" then
+      error("selected cluster result has no machines")
+    else . end |
+    if has("labels") and (.labels | type) != "object" then
+      error("selected cluster result has invalid labels")
+    else
+      (.labels // {}) as $labels |
+      [ $labels | has("webuiSourceRevision"), has("webuiSourceDirty"), has("webuiSourceKind") ] as $present |
+      if ($present | any) == false then null
+      elif ($present | all) == false then error("selected React WebUI source labels are incomplete")
+      elif ($labels.webuiSourceRevision | type) != "string" or
+           ($labels.webuiSourceRevision | test("^[0-9a-f]{40}$") | not) then
+        error("selected React WebUI source revision is invalid")
+      elif ($labels.webuiSourceDirty != "true" and $labels.webuiSourceDirty != "false") then
+        error("selected React WebUI source dirty value is invalid")
+      elif ($labels.webuiSourceKind != "pinned" and $labels.webuiSourceKind != "worktree") then
+        error("selected React WebUI source kind is invalid")
+      else
+        {revision: $labels.webuiSourceRevision,
+         dirty: ($labels.webuiSourceDirty == "true"),
+         kind: $labels.webuiSourceKind}
+      end
+    end
+  ' "$target" || {
+    printf 'error: selected cluster result has invalid source data\n' >&2
+    return 1
+  }
+}
+
 config_path() {
   readlink -f "$(result_link "$1")"
 }
@@ -290,8 +339,9 @@ cert_common_name() {
 cert_required_domains() {
   local cert_cfg="$1"
   jq -r '
+    . as $cfg |
     [
-      (.domains | values[]),
+      (.domains | to_entries[] | select(.key != "newadmin" or $cfg.newWebui.enable == true) | .value),
       (.tmpDomains | values[])
     ]
     | map(select(. != null and . != ""))
@@ -528,12 +578,98 @@ ensure_shared_credentials() {
   ensure_certs "$slug"
 }
 
+webui_enabled() {
+  local cfg
+  cfg="$(config_json_for_slug "$1")"
+  jq -e '(.newWebui.enable // false) | type == "boolean"' "$cfg" >/dev/null \
+    || die "newWebui.enable must be a boolean"
+  jq -e '.newWebui.enable == true' "$cfg" >/dev/null
+}
+
+validate_webui_domain() {
+  jq -e '
+    . as $cfg | .domains.newadmin as $domain |
+    if ($domain | type) != "string" then false else
+      ($domain | length <= 253 and
+        (split(".") | length >= 2 and all(.[];
+          length <= 63 and test("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+        ))) and
+      ((($cfg.domains | to_entries | map(select(.key != "newadmin") | .value)) +
+        ($cfg.tmpDomains | to_entries | map(.value))) | index($domain) == null)
+    end
+  ' "$(config_json_for_slug "$1")" >/dev/null \
+    || die "enabled React WebUI requires a distinct valid domains.newadmin DNS name"
+}
+
+webui_credentials_dir() {
+  printf '%s/webui-credentials\n' "$(cluster_dir "$1")"
+}
+
+validate_webui_credentials() {
+  local slug="$1" bundle file entry count=0
+  bundle="$(webui_credentials_dir "$slug")"
+  [ ! -L "$bundle" ] && [ -d "$bundle" ] \
+    || die "unsafe React WebUI credential directory"
+  [ "$(stat -c %u:%a "$bundle")" = "$(id -u):700" ] \
+    || die "React WebUI credential directory has invalid ownership or permissions"
+  for file in oauth-client-id oauth-client-secret session-secret; do
+    entry="$bundle/$file"
+    [ ! -L "$entry" ] && [ -f "$entry" ] \
+      || die "incomplete or unsafe React WebUI credential bundle"
+    [ "$(stat -c %u:%a:%s "$entry")" = "$(id -u):600:65" ] \
+      || die "React WebUI credential file has invalid ownership, permissions or length"
+    LC_ALL=C grep -Eq '^[0-9a-f]{64}$' "$entry" \
+      || die "React WebUI credential file has invalid content"
+  done
+  while IFS= read -r -d '' entry; do
+    case "${entry##*/}" in
+      oauth-client-id|oauth-client-secret|session-secret) count=$((count + 1)) ;;
+      *) die "unexpected entry in React WebUI credential bundle" ;;
+    esac
+  done < <(find "$bundle" -mindepth 1 -maxdepth 1 -print0)
+  [ "$count" -eq 3 ] || die "incomplete React WebUI credential bundle"
+}
+
+ensure_webui_credentials() {
+  local slug="$1" bundle parent temp file
+  webui_enabled "$slug" || return 0
+  devcluster_validate_cluster_directory "$slug" true || return
+  parent="$(cluster_dir "$slug")"
+  bundle="$(webui_credentials_dir "$slug")"
+  if [ -e "$bundle" ] || [ -L "$bundle" ]; then
+    validate_webui_credentials "$slug"
+    return
+  fi
+
+  temp="$(umask 077; mktemp -d "$parent/.webui-credentials.XXXXXXXX")" || return
+  for file in oauth-client-id oauth-client-secret session-secret; do
+    if ! openssl rand -hex 32 >"$temp/$file"; then
+      rm -rf -- "$temp"
+      return 1
+    fi
+    if ! chmod 0600 "$temp/$file"; then
+      rm -rf -- "$temp"
+      return 1
+    fi
+  done
+  if ! mv -T -- "$temp" "$bundle"; then
+    rm -rf -- "$temp"
+    return 1
+  fi
+  validate_webui_credentials "$slug"
+}
+
 build_config_with_credentials() {
   local slug="$1"
   local topology="$2"
   local network="$3"
 
+  if webui_enabled "$slug"; then
+    [ "$network" = bridge ] || die "React WebUI requires bridge networking; disable newWebui.enable for local mode"
+    validate_webui_domain "$slug"
+  fi
   ensure_shared_credentials "$slug" || return
+  ensure_webui_credentials "$slug" || return
   build_config "$slug" "$topology" "$network"
 }
 
@@ -572,8 +708,14 @@ source_revision() {
 
 source_dirty() {
   local path="$1"
+  local changes
 
-  if [ -n "$path" ] && [ -n "$(git -C "$path" status --porcelain --untracked-files=normal)" ]; then
+  if [ -n "$path" ]; then
+    changes="$(git -C "$path" status --porcelain --untracked-files=normal)" || return
+  else
+    changes=""
+  fi
+  if [ -n "$changes" ]; then
     printf '1\n'
   else
     printf '0\n'
@@ -592,6 +734,7 @@ nix_common_env() {
   local web_path="$9"
   local vpsf_status_path="${10}"
   local vpsadmin_go_client_path="${11}"
+  local vpsadmin_webui_path="${12}"
 
   export VPSADMIN_DEVCLUSTER_WORKSPACE="$WORKSPACE"
   export VPSADMIN_DEVCLUSTER_SLUG="$slug"
@@ -606,11 +749,27 @@ nix_common_env() {
   export VPSADMIN_DEVCLUSTER_VPSADMIN_REVISION
   VPSADMIN_DEVCLUSTER_VPSADMIN_REVISION="$(source_revision "$vpsadmin_path")" || return
   export VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY
-  VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY="$(source_dirty "$vpsadmin_path")"
+  VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY="$(source_dirty "$vpsadmin_path")" || return
   export VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION
   VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION="$(source_revision "$vpsadminos_path")" || return
   export VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY
-  VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY="$(source_dirty "$vpsadminos_path")"
+  VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY="$(source_dirty "$vpsadminos_path")" || return
+  export VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION
+  if [ -n "$vpsadmin_webui_path" ]; then
+    VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION="$(source_revision "$vpsadmin_webui_path")" || return
+  else
+    VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION=534caa83a5f97d2b40b4a126886649b14dc9e8d3
+  fi
+  export VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_DIRTY
+  VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_DIRTY="$(source_dirty "$vpsadmin_webui_path")" || return
+  export VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_SOURCE_KIND
+  if [ -n "$vpsadmin_webui_path" ]; then
+    VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_SOURCE_KIND=worktree
+  else
+    VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_SOURCE_KIND=pinned
+  fi
+  export VPSADMIN_DEVCLUSTER_WEBUI_CREDENTIALS_DIR
+  VPSADMIN_DEVCLUSTER_WEBUI_CREDENTIALS_DIR="$(webui_credentials_dir "$slug")"
   export VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE="$haveapi_path"
   export VPSADMIN_DEVCLUSTER_CONFIG_SOURCE="$config_path"
   export VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE="$mail_templates_path"
@@ -624,11 +783,17 @@ nix_overrides() {
   local vpsadmin_path="$2"
   local vpsadminos_input_value="$3"
   local vpsf_status_path="$4"
+  local vpsadmin_webui_path="$5"
 
   printf '%s\0%s\0' --override-input vpsadmin
   printf 'path:%s\0' "$vpsadmin_path"
   printf '%s\0%s\0%s\0' --override-input vpsadminos "$vpsadminos_input_value"
   printf '%s\0%s\0%s\0' --override-input vpsadmin/vpsadminos "$vpsadminos_input_value"
+
+  if [ -n "$vpsadmin_webui_path" ]; then
+    printf '%s\0%s\0' --override-input vpsadminWebui
+    printf 'path:%s\0' "$vpsadmin_webui_path"
+  fi
 
   if [ -n "$vpsf_status_path" ]; then
     printf '%s\0%s\0' --override-input vpsfStatus
@@ -649,6 +814,7 @@ build_config() {
   local web_path
   local vpsf_status_path
   local vpsadmin_go_client_path
+  local vpsadmin_webui_path
   local vpsadminos_input_value
 
   dir="$(cluster_dir "$slug")"
@@ -663,24 +829,32 @@ build_config() {
   web_path="$(slug_optional_path "$slug" web || true)"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_go_client_path="$(slug_optional_path "$slug" vpsadmin-go-client || true)"
+  vpsadmin_webui_path="$(slug_optional_path "$slug" vpsadmin-webui || true)"
   vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
 
   if [ -z "$vpsadminos_path" ]; then
     vpsadminos_path=""
   fi
 
-  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path" || return
+  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path" "$vpsadmin_webui_path" || return
 
   local -a overrides=()
   while IFS= read -r -d '' item; do
     overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$vpsadmin_webui_path")
 
   nix build \
     --impure \
     "${overrides[@]}" \
     --out-link "$(result_link "$slug")" \
-    "path:$CLUSTER_DIR#cluster-config"
+    "path:$CLUSTER_DIR#cluster-config" || return
+
+  local selected_source
+  [ -e "$(result_link "$slug")" ] || die "selected cluster result is missing after build"
+  selected_source="$(selected_webui_source_json "$slug")" || return
+  if webui_enabled "$slug" && [ "$selected_source" = null ]; then
+    die "enabled React WebUI is missing source labels in the selected result"
+  fi
 }
 
 ssh_opts() {
@@ -931,15 +1105,16 @@ start_cluster() {
   printf '%s\n' "$topology" > "$(topology_file "$slug")" || return
   printf '%s\n' "$network" > "$(network_file "$slug")" || return
 
-  local vpsadmin_path vpsadminos_input_value vpsf_status_path
+  local vpsadmin_path vpsadminos_input_value vpsf_status_path vpsadmin_webui_path
   vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
   vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
+  vpsadmin_webui_path="$(slug_optional_path "$slug" vpsadmin-webui || true)"
 
   local -a runner_overrides=()
   while IFS= read -r -d '' item; do
     runner_overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$vpsadmin_webui_path")
 
   local dir log ready sock_dir
   dir="$(cluster_dir "$slug")"
@@ -1142,7 +1317,7 @@ devcluster_services_json() {
       field("Password"; .mail.capture.webAuth.password; true)
     ])]) as $mailpitAccounts |
     $links | map(
-      if .label == "Web UI" then . + {accounts: $vpsadminAccounts}
+      if .label == "Web UI" or .label == "React Web UI" then . + {accounts: $vpsadminAccounts}
       elif .label == "Adminer" then . + {accounts: $adminerAccounts}
       elif .label == "Mailpit" then . + {accounts: $mailpitAccounts}
       else . + {accounts: []}
@@ -1156,17 +1331,20 @@ devcluster_services_json() {
 
 devcluster_status_v2_json() {
   local slug="$1"
-  local legacy links services
+  local legacy links services source
   legacy="$(devcluster_status_json vpsadmin "$slug" vpsadmin-devcluster true)"
   links="$(jq -c '.links // []' <<<"$legacy")"
   services='[]'
+  source='null'
   if [ "$(jq -r '.found' <<<"$legacy")" = true ]; then
     services="$(devcluster_services_json "$slug" "$links")"
+    source="$(selected_webui_source_json "$slug")" || return
   fi
 
-  jq -c --argjson services "$services" '
+  jq -c --argjson services "$services" --argjson source "$source" '
     .schema = 2 |
     if .found then .services = $services else . end |
+    if .found and $source != null then .webuiSource = $source else . end |
     del(.links, .credentials)
   ' <<<"$legacy"
 }

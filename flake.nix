@@ -6,8 +6,13 @@
     dev-workspace.url = "github:aither64/dev-workspace/d20bb64c45db1d803fc3b7a8c2956049860d72dd";
     devcluster-vpsadminos.url = "github:vpsfreecz/vpsadminos/15802517e2d92dda4ddc07ebac3d1d7ea087b430";
     devcluster-vpsadmin = {
-      url = "github:vpsfreecz/vpsadmin/master";
+      url = "github:vpsfreecz/vpsadmin/5c76e3290481b297dcd0baa76d246133f0353d8f";
       inputs.vpsadminos.follows = "devcluster-vpsadminos";
+    };
+    devcluster-vpsadminWebui = {
+      url = "github:vpsfreecz/vpsadmin-webui/534caa83a5f97d2b40b4a126886649b14dc9e8d3";
+      inputs.nixpkgs.follows = "devcluster-vpsadminos/nixpkgs";
+      inputs.vpsadmin.follows = "devcluster-vpsadmin";
     };
     devcluster-vpsf-status = {
       url = "github:vpsfreecz/vpsf-status/master";
@@ -156,7 +161,8 @@
             } \
             ${inputs.devcluster-vpsadmin} \
             ${inputs.devcluster-vpsadminos} \
-            ${inputs.devcluster-vpsf-status} "$@"
+            ${inputs.devcluster-vpsf-status} \
+            ${inputs.devcluster-vpsadminWebui} "$@"
         '';
       };
       testCompatibilityPackage = mkPackage {
@@ -319,6 +325,7 @@
               export RUNTIME_AUTHORITY_CORPUS=${dev-workspace.lib.runtimeAuthorityCorpus}
               ruby test/devcluster_status_test.rb
               ruby test/devcluster_commands_test.rb
+              ruby test/devcluster_webui_seed_test.rb
               ruby test/devcluster_runner_test.rb
               ruby test/kb_cleanup_test.rb
               ruby test/kb_contract_tools_test.rb

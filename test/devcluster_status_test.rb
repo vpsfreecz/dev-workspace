@@ -119,6 +119,129 @@ class DevclusterStatusTest < Minitest::Test
     end
   end
 
+  def test_react_webui_link_follows_desired_config_and_source_follows_selected_result
+    with_cluster('vpsadmin') do |workspace, directory, slug|
+      config = {
+        'topologies' => { 'single' => %w[node1] },
+        'domains' => {
+          'webui' => 'webui.example.test',
+          'newadmin' => 'newadmin.example.test'
+        },
+        'seed' => { 'users' => [] }
+      }
+      write_state(directory, 'network', "bridge\n")
+      write_state(directory, 'config.json', JSON.generate(config))
+      refute_includes(read_status('vpsadmin', workspace, slug).fetch('services').map { |item| item.fetch('label') }, 'React Web UI')
+
+      config['newWebui'] = { 'enable' => true }
+      write_state(directory, 'config.json', JSON.generate(config))
+      write_state(directory, 'webui-source.json', '{"revision":"invalid"}')
+      refute(read_status('vpsadmin', workspace, slug).key?('webuiSource'))
+      labels = { 'webuiSourceRevision' => 'a' * 40,
+                 'webuiSourceDirty' => 'true',
+                 'webuiSourceKind' => 'worktree' }
+      select_result(directory, { 'machines' => {}, 'labels' => labels })
+      write_state(directory, 'webui-source.json', JSON.generate(
+        'revision' => 'b' * 40, 'dirty' => false, 'kind' => 'pinned'
+      ))
+      status = read_status('vpsadmin', workspace, slug)
+      assert_includes(status.fetch('services').map { |item| item.fetch('label') }, 'React Web UI')
+      react = status.fetch('services').find { |item| item.fetch('label') == 'React Web UI' }
+      assert_equal('https://newadmin.example.test/', react.fetch('url'))
+      assert_equal('Administrator', react.fetch('accounts').first.fetch('label'))
+      assert_equal({ 'revision' => 'a' * 40, 'dirty' => true, 'kind' => 'worktree' },
+                   status.fetch('webuiSource'))
+
+      write_state(directory, 'webui-source.json', '{"revision":"invalid"}')
+      assert_equal('a' * 40, read_status('vpsadmin', workspace, slug).fetch('webuiSource').fetch('revision'))
+
+      config['newWebui']['enable'] = false
+      write_state(directory, 'config.json', JSON.generate(config))
+      disabled = read_status('vpsadmin', workspace, slug)
+      assert_equal('worktree', disabled.fetch('webuiSource').fetch('kind'))
+      refute_includes(disabled.fetch('services').map { |item| item.fetch('label') }, 'React Web UI')
+
+      select_result(directory, { 'machines' => {} })
+      refute(read_status('vpsadmin', workspace, slug).key?('webuiSource'))
+      FileUtils.rm_f(File.join(directory, 'result-config'))
+      refute(read_status('vpsadmin', workspace, slug).key?('webuiSource'))
+    end
+  end
+
+  def test_selected_result_rejects_partial_and_invalid_source_labels
+    valid = { 'webuiSourceRevision' => 'a' * 40,
+              'webuiSourceDirty' => 'false',
+              'webuiSourceKind' => 'pinned' }
+    invalid = [
+      valid.reject { |key, _| key == 'webuiSourceKind' },
+      valid.merge('webuiSourceRevision' => 'bad'),
+      valid.merge('webuiSourceDirty' => '0'),
+      valid.merge('webuiSourceKind' => 'foreign'),
+      'bad'
+    ]
+    with_cluster('vpsadmin') do |workspace, directory, slug|
+      write_state(directory, 'webui-source.json', JSON.generate(
+        'revision' => 'a' * 40, 'dirty' => false, 'kind' => 'pinned'
+      ))
+      invalid.each_with_index do |labels, index|
+        select_result(directory, { 'machines' => {}, 'labels' => labels }, name: "invalid-#{index}.json")
+        _stdout, stderr, result = Open3.capture3(
+          { 'DEVCLUSTER_WORKSPACE' => workspace }, HELPERS.fetch('vpsadmin'), 'status', slug, '--json'
+        )
+        refute(result.success?, labels.inspect)
+        assert_includes(stderr, 'selected cluster result')
+      end
+      select_result(directory, '{bad', name: 'malformed.json')
+      _stdout, stderr, result = Open3.capture3(
+        { 'DEVCLUSTER_WORKSPACE' => workspace }, HELPERS.fetch('vpsadmin'), 'status', slug, '--json'
+      )
+      refute(result.success?)
+      assert_includes(stderr, 'selected cluster result')
+
+      FileUtils.rm_f(File.join(directory, 'result-config'))
+      File.symlink(File.join(directory, 'missing.json'), File.join(directory, 'result-config'))
+      _stdout, stderr, result = Open3.capture3(
+        { 'DEVCLUSTER_WORKSPACE' => workspace }, HELPERS.fetch('vpsadmin'), 'status', slug, '--json'
+      )
+      refute(result.success?)
+      assert_includes(stderr, 'selected cluster result is unreadable')
+    end
+  end
+
+  def test_status_reads_one_resolved_result_when_link_changes
+    with_cluster('vpsadmin') do |workspace, directory, slug|
+      first = select_result(directory, { 'machines' => {}, 'labels' => {
+        'webuiSourceRevision' => 'a' * 40, 'webuiSourceDirty' => 'false', 'webuiSourceKind' => 'pinned'
+      } }, name: 'first.json')
+      second = File.join(directory, 'second.json')
+      File.write(second, JSON.generate('machines' => {}, 'labels' => {
+        'webuiSourceRevision' => 'b' * 40, 'webuiSourceDirty' => 'true', 'webuiSourceKind' => 'worktree'
+      }))
+      bin = File.join(workspace, 'bin')
+      FileUtils.mkdir_p(bin)
+      jq = File.join(bin, 'jq')
+      real_jq = ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'jq') }.find { |path| File.executable?(path) }
+      File.write(jq, <<~RUBY)
+        #!#{RbConfig.ruby}
+        require 'fileutils'
+        if ARGV.include?(#{first.inspect})
+          link = #{File.join(directory, 'result-config').inspect}
+          FileUtils.rm_f(link)
+          File.symlink(#{second.inspect}, link)
+        end
+        exec #{real_jq.inspect}, *ARGV
+      RUBY
+      File.chmod(0o755, jq)
+      stdout, stderr, result = Open3.capture3(
+        { 'DEVCLUSTER_WORKSPACE' => workspace, 'PATH' => "#{bin}:#{ENV.fetch('PATH')}" },
+        HELPERS.fetch('vpsadmin'), 'status', slug, '--json'
+      )
+      assert(result.success?, stderr)
+      assert_equal('a' * 40, JSON.parse(stdout).fetch('webuiSource').fetch('revision'))
+      assert_equal(second, File.readlink(File.join(directory, 'result-config')))
+    end
+  end
+
   def test_vpsadminos_json_status_keeps_machine_commands_separate
     with_cluster('vpsadminos') do |workspace, directory, slug|
       write_state(directory, 'topology', "dual\n")
@@ -1479,6 +1602,15 @@ class DevclusterStatusTest < Minitest::Test
 
   def write_state(directory, name, content)
     File.write(File.join(directory, name), content)
+  end
+
+  def select_result(directory, content, name: 'selected-result.json')
+    path = File.join(directory, name)
+    File.write(path, content.is_a?(String) ? content : JSON.generate(content))
+    link = File.join(directory, 'result-config')
+    FileUtils.rm_f(link)
+    File.symlink(path, link)
+    path
   end
 
   def write_lifecycle(workspace, slug, lifecycle)

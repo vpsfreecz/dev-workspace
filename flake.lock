@@ -88,17 +88,42 @@
         ]
       },
       "locked": {
-        "lastModified": 1789125776,
-        "narHash": "sha256-QNs42PTrwpZAsPuuPmmfFbQf5tHtYtSPAPociIwOTik=",
+        "lastModified": 1790686487,
+        "narHash": "sha256-R8Fi7PyyMGsdx8804NLNng/RWkJ1Io9si43N9ClUm18=",
         "owner": "vpsfreecz",
         "repo": "vpsadmin",
-        "rev": "8d0ccafd5b307115ddc4b1f24152ba30ed52e893",
+        "rev": "5c76e3290481b297dcd0baa76d246133f0353d8f",
         "type": "github"
       },
       "original": {
         "owner": "vpsfreecz",
-        "ref": "master",
         "repo": "vpsadmin",
+        "rev": "5c76e3290481b297dcd0baa76d246133f0353d8f",
+        "type": "github"
+      }
+    },
+    "devcluster-vpsadminWebui": {
+      "inputs": {
+        "nixpkgs": [
+          "devcluster-vpsadminos",
+          "nixpkgs"
+        ],
+        "vpsadmin": [
+          "devcluster-vpsadmin"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790685797,
+        "narHash": "sha256-/lP+kojPzRPQiiBbuHZB6zNG86+1TySxWmHOBS7hWgo=",
+        "owner": "vpsfreecz",
+        "repo": "vpsadmin-webui",
+        "rev": "534caa83a5f97d2b40b4a126886649b14dc9e8d3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vpsfreecz",
+        "repo": "vpsadmin-webui",
+        "rev": "534caa83a5f97d2b40b4a126886649b14dc9e8d3",
         "type": "github"
       }
     },
@@ -354,6 +379,7 @@
       "inputs": {
         "dev-workspace": "dev-workspace",
         "devcluster-vpsadmin": "devcluster-vpsadmin",
+        "devcluster-vpsadminWebui": "devcluster-vpsadminWebui",
         "devcluster-vpsadminos": "devcluster-vpsadminos",
         "devcluster-vpsf-status": "devcluster-vpsf-status",
         "nixpkgs": "nixpkgs_5"

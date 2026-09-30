@@ -42,6 +42,196 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_react_webui_credentials_are_stable_and_source_is_recorded
+    with_workspace('vpsadmin') do |env, directory|
+      env = enable_react_webui(env, directory)
+      File.write(File.join(directory, 'network'), "bridge\n")
+      FileUtils.mkdir_p(File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadmin-webui'))
+      first = run_helper('vpsadmin', env, 'update', 'services')
+      assert(first.success?, @last_output)
+      bundle = File.join(directory, 'webui-credentials')
+      assert_equal(0o700, File.stat(bundle).mode & 0o777)
+      values = %w[oauth-client-id oauth-client-secret session-secret].to_h do |name|
+        path = File.join(bundle, name)
+        assert_equal(0o600, File.stat(path).mode & 0o777)
+        [name, File.binread(path)]
+      end
+      selected = JSON.parse(File.read(File.realpath(File.join(directory, 'result-config'))))
+      assert_equal({
+        'webuiSourceKind' => 'worktree',
+        'webuiSourceRevision' => '1111111111111111111111111111111111111111',
+        'webuiSourceDirty' => 'false'
+      }, selected.fetch('labels'))
+      refute(File.exist?(File.join(directory, 'webui-source.json')))
+      build = events(env).find { |event| event['event'] == 'build' }
+      assert_includes(build.fetch('argv'), '--override-input')
+      assert_includes(build.fetch('argv'), 'vpsadminWebui')
+      assert_equal(bundle, build.fetch('environment').fetch('VPSADMIN_DEVCLUSTER_WEBUI_CREDENTIALS_DIR'))
+      assert_equal('worktree', build.fetch('environment').fetch('VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_SOURCE_KIND'))
+
+      second = run_helper('vpsadmin', env, 'update', 'services')
+      assert(second.success?, @last_output)
+      values.each { |name, value| assert_equal(value, File.binread(File.join(bundle, name))) }
+      assert_empty(Dir.glob(File.join(directory, '.webui-credentials.*')))
+    end
+  end
+
+  def test_post_publication_failure_keeps_one_selected_result_without_deployment
+    [false, true].product(%w[start update]).each do |retained, command|
+      with_workspace('vpsadmin', retained:) do |env, directory|
+        env = enable_react_webui(env, directory)
+        File.write(File.join(directory, 'network'), "bridge\n")
+        env['TEST_START_NETWORK'] = 'bridge'
+        if retained && command == 'update'
+          source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadmin-webui')
+          FileUtils.mkdir_p(source)
+          env['TEST_GIT_DIRTY'] = '1'
+        end
+        before = retained ? File.readlink(File.join(directory, 'result-config')) : nil
+
+        target = command == 'update' ? 'services' : nil
+        result = run_helper('vpsadmin', env.merge('FAIL_AFTER_LINK' => '1'), command, target)
+        assert_equal(23, result.exitstatus, @last_output)
+        selected = File.readlink(File.join(directory, 'result-config'))
+        refute_equal(before, selected)
+        expected_kind = env['TEST_GIT_DIRTY'] == '1' ? 'worktree' : 'pinned'
+        labels = JSON.parse(File.read(selected)).fetch('labels')
+        assert_equal(expected_kind, labels.fetch('webuiSourceKind'))
+        assert_equal(env['TEST_GIT_DIRTY'] == '1' ? 'true' : 'false', labels.fetch('webuiSourceDirty'))
+        assert_equal(['build'], events(env).map { |event| event.fetch('event') }.grep(/build|run|copy|activate|ssh/))
+        status = read_vpsadmin_status(env)
+        expected_revision = expected_kind == 'worktree' ? '1' * 40 : '534caa83a5f97d2b40b4a126886649b14dc9e8d3'
+        assert_equal({ 'revision' => expected_revision,
+                       'dirty' => env['TEST_GIT_DIRTY'] == '1', 'kind' => expected_kind }, status.fetch('webuiSource'))
+      end
+    end
+  end
+
+  def test_post_build_result_parse_failure_stops_before_deployment
+    %w[TEST_INVALID_RESULT TEST_PARTIAL_LABELS].each do |failure|
+      with_workspace('vpsadmin') do |env, directory|
+        env = enable_react_webui(env, directory)
+        File.write(File.join(directory, 'network'), "bridge\n")
+        result = run_helper('vpsadmin', env.merge(failure => '1'), 'update', 'services')
+        refute(result.success?)
+        assert(File.symlink?(File.join(directory, 'result-config')))
+        assert_equal(['build'], events(env).map { |event| event.fetch('event') }.grep(/build|copy|activate|ssh/))
+      end
+    end
+  end
+
+  def test_disabled_post_publication_failure_has_no_source_labels
+    with_workspace('vpsadmin') do |env, directory|
+      result = run_helper('vpsadmin', env.merge('FAIL_AFTER_LINK' => '1'), 'update', 'services')
+      assert_equal(23, result.exitstatus)
+      selected = JSON.parse(File.read(File.realpath(File.join(directory, 'result-config'))))
+      assert_equal({}, selected.fetch('labels'))
+      status = read_vpsadmin_status(env)
+      refute(status.key?('webuiSource'))
+      assert_equal(['build'], events(env).map { |event| event.fetch('event') }.grep(/build|copy|activate|ssh/))
+    end
+  end
+
+  def test_source_kind_and_dirty_state_come_from_the_selected_source
+    with_workspace('vpsadmin') do |env, directory|
+      env = enable_react_webui(env, directory)
+      File.write(File.join(directory, 'network'), "bridge\n")
+      source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadmin-webui')
+      FileUtils.mkdir_p(source)
+      env['TEST_GIT_DIRTY'] = '1'
+      env['VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_SOURCE_KIND'] = 'pinned'
+      result = run_helper('vpsadmin', env, 'update', 'services')
+      assert(result.success?, @last_output)
+      selected = JSON.parse(File.read(File.realpath(File.join(directory, 'result-config'))))
+      assert_equal('worktree', selected.fetch('labels').fetch('webuiSourceKind'))
+      assert_equal('true', selected.fetch('labels').fetch('webuiSourceDirty'))
+      refute(File.exist?(File.join(directory, 'webui-source.json')))
+    end
+  end
+
+  def test_source_inspection_failure_stops_before_build
+    with_workspace('vpsadmin') do |env, directory|
+      env = enable_react_webui(env, directory)
+      File.write(File.join(directory, 'network'), "bridge\n")
+      source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadmin-webui')
+      FileUtils.mkdir_p(source)
+      result = run_helper('vpsadmin', env.merge('FAIL_GIT_STATUS' => '1'), 'update', 'services')
+      refute(result.success?)
+      refute(events(env).any? { |event| event['event'] == 'build' })
+    end
+  end
+
+  def test_react_webui_rejects_invalid_bundles_before_build
+    %w[missing malformed permissions symlink foreign].each do |failure|
+      with_workspace('vpsadmin') do |env, directory|
+        env = enable_react_webui(env, directory)
+        File.write(File.join(directory, 'network'), "bridge\n")
+        bundle = File.join(directory, 'webui-credentials')
+        FileUtils.mkdir_p(bundle)
+        File.chmod(0o700, bundle)
+        %w[oauth-client-id oauth-client-secret session-secret].each do |name|
+          path = File.join(bundle, name)
+          File.write(path, "#{'a' * 64}\n")
+          File.chmod(0o600, path)
+        end
+        case failure
+        when 'missing' then File.delete(File.join(bundle, 'session-secret'))
+        when 'malformed' then File.write(File.join(bundle, 'session-secret'), "bad\n")
+        when 'permissions' then File.chmod(0o644, File.join(bundle, 'session-secret'))
+        when 'symlink'
+          File.delete(File.join(bundle, 'session-secret'))
+          File.symlink(File.join(bundle, 'oauth-client-secret'), File.join(bundle, 'session-secret'))
+        when 'foreign' then File.write(File.join(bundle, 'unexpected'), 'foreign')
+        end
+        result = run_helper('vpsadmin', env, 'update', 'services')
+        refute(result.success?, failure)
+        refute(events(env).any? { |event| event['event'] == 'build' }, failure)
+        refute(File.exist?(File.join(directory, 'webui-source.json')))
+      end
+    end
+  end
+
+  def test_react_webui_rejects_local_mode_before_credential_generation
+    with_workspace('vpsadmin') do |env, directory|
+      env = enable_react_webui(env, directory)
+      result = run_helper('vpsadmin', env, 'start')
+      refute(result.success?)
+      assert_includes(@last_output, 'requires bridge networking')
+      refute(File.exist?(File.join(directory, 'webui-credentials')))
+      assert_empty(events(env))
+    end
+  end
+
+  def test_react_webui_random_generation_failure_removes_temporary_bundle
+    with_workspace('vpsadmin') do |env, directory|
+      env = enable_react_webui(env, directory)
+      File.write(File.join(directory, 'network'), "bridge\n")
+      result = run_helper('vpsadmin', env.merge('FAIL_AT' => 'rand'), 'update', 'services')
+      assert_equal(1, result.exitstatus)
+      refute(File.exist?(File.join(directory, 'webui-credentials')))
+      assert_empty(Dir.glob(File.join(directory, '.webui-credentials.*')))
+      refute(events(env).any? { |event| event['event'] == 'build' })
+    end
+  end
+
+  def test_react_webui_rejects_invalid_or_duplicate_domain_before_certificates
+    ['bad/host.example.test', 'api.devhost.int.vpsfree.cz'].each do |domain|
+      with_workspace('vpsadmin') do |env, directory|
+        env = enable_react_webui(env, directory)
+        config_path = File.join(directory, 'config.json')
+        config = JSON.parse(File.read(config_path))
+        config.fetch('domains')['newadmin'] = domain
+        File.write(config_path, JSON.generate(config))
+        File.write(File.join(directory, 'network'), "bridge\n")
+        result = run_helper('vpsadmin', env, 'update', 'services')
+        refute(result.success?)
+        assert_includes(@last_output, 'distinct valid domains.newadmin')
+        refute(File.exist?(File.join(directory, 'webui-credentials')))
+        assert_empty(events(env))
+      end
+    end
+  end
+
   def test_failed_copy_or_activation_stops_the_remaining_update
     KINDS.product(%w[copy activate]).each do |kind, failure|
       with_workspace(kind) do |env, _directory|
@@ -57,6 +247,8 @@ class DevclusterCommandsTest < Minitest::Test
   def test_successful_start_keeps_build_environment_for_the_runner
     KINDS.each do |kind|
       with_workspace(kind) do |env, directory|
+        stale_source = File.join(directory, 'webui-source.json')
+        File.write(stale_source, '{invalid') if kind == 'vpsadmin'
         result = run_helper(kind, env, 'start')
         assert(result.success?, "#{kind}: #{result.exitstatus}")
         build = events(env).find { |event| event['event'] == 'build' }
@@ -66,6 +258,7 @@ class DevclusterCommandsTest < Minitest::Test
         assert_equal('local', runner.fetch('environment').fetch("#{kind.upcase}_DEVCLUSTER_NETWORK"))
         assert_equal(File.join(directory, 'config.json'), runner.fetch('environment').fetch("#{kind.upcase}_DEVCLUSTER_CONFIG_FILE"))
         assert(File.exist?(File.join(directory, 'ready')))
+        assert_equal('{invalid', File.read(stale_source)) if kind == 'vpsadmin'
         assert_locks_released(env)
       end
     end
@@ -155,6 +348,15 @@ class DevclusterCommandsTest < Minitest::Test
 
   private
 
+  def enable_react_webui(env, directory)
+    config = JSON.parse(File.read(env.fetch('TEST_CONFIG')))
+    config['newWebui'] = { 'enable' => true }
+    config.fetch('domains')['newadmin'] = 'newadmin.example.test'
+    path = File.join(directory, 'config.json')
+    File.write(path, JSON.generate(config))
+    env.merge('TEST_CONFIG' => path)
+  end
+
   def with_workspace(kind, retained: false)
     Dir.mktmpdir('devcluster-commands') do |workspace|
       slug = '2026-09-11-command-test'
@@ -176,7 +378,7 @@ class DevclusterCommandsTest < Minitest::Test
       File.symlink(File.join(workspace, 'built.json'), File.join(directory, 'result-config')) if retained
       bin = File.join(workspace, 'bin')
       FileUtils.mkdir_p(bin)
-      %w[nix ssh ssh-keygen openssl git rm].each do |name|
+      %w[nix ssh ssh-keygen openssl git rm jq mktemp mv].each do |name|
         path = File.join(bin, name)
         File.write(path, "#!#{RbConfig.ruby}\n" + command_stub)
         File.chmod(0o755, path)
@@ -188,6 +390,9 @@ class DevclusterCommandsTest < Minitest::Test
         'TEST_CONFIG' => config,
         'TEST_EVENTS' => File.join(workspace, 'events.jsonl'),
         'TEST_REAL_RM' => ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'rm') }.find { |path| File.executable?(path) },
+        'TEST_REAL_JQ' => ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'jq') }.find { |path| File.executable?(path) },
+        'TEST_REAL_MKTEMP' => ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'mktemp') }.find { |path| File.executable?(path) },
+        'TEST_REAL_MV' => ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'mv') }.find { |path| File.executable?(path) },
         'PATH' => "#{bin}:#{ENV.fetch('PATH')}",
         "#{kind.upcase}_DEVCLUSTER_DEFAULT_CONFIG" => config
       }
@@ -197,13 +402,23 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
-  def run_helper(kind, env, command)
+  def run_helper(kind, env, command, target = nil)
     argv = [File.join(ROOT, 'dev-clusters', kind, 'bin', 'devcluster'), command, env.fetch('TEST_SLUG')]
-    argv += %w[--network local --topology dual] if command == 'start'
+    argv << target if target
+    argv += ['--network', env.fetch('TEST_START_NETWORK', 'local'), '--topology', 'dual'] if command == 'start'
     stdout, stderr, result = Open3.capture3(env, *argv)
     assert(result.exited?, stderr)
     @last_output = stdout + stderr
     result
+  end
+
+  def read_vpsadmin_status(env)
+    stdout, stderr, result = Open3.capture3(
+      env, File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'),
+      'status', env.fetch('TEST_SLUG'), '--json'
+    )
+    assert(result.success?, stderr)
+    JSON.parse(stdout)
   end
 
   def events(env)
@@ -269,7 +484,20 @@ class DevclusterCommandsTest < Minitest::Test
       require 'json'
       require 'fileutils'
       command = File.basename($PROGRAM_NAME)
+      if command == 'jq'
+        abort 'obsolete source metadata jq write' if ARGV.include?('-n') && ARGV.include?('revision')
+        exec ENV.fetch('TEST_REAL_JQ'), *ARGV
+      end
+      if command == 'mktemp'
+        abort 'obsolete source metadata temporary file' if ARGV.any? { |arg| arg.include?('.webui-source.') }
+        exec ENV.fetch('TEST_REAL_MKTEMP'), *ARGV
+      end
+      if command == 'mv'
+        abort 'obsolete source metadata replacement' if ARGV.any? { |arg| arg.include?('webui-source.json') || arg.include?('.webui-source.') }
+        exec ENV.fetch('TEST_REAL_MV'), *ARGV
+      end
       if command == 'rm'
+        abort 'obsolete source metadata removal' if ARGV.any? { |arg| arg.include?('webui-source.json') }
         if ENV['FAIL_AT'] == 'cleanup' && ARGV.any? { |arg| File.basename(arg) == 'ready' }
           exit 23
         end
@@ -290,11 +518,16 @@ class DevclusterCommandsTest < Minitest::Test
               else command
               end
       if command == 'git'
+        if ENV['FAIL_GIT_STATUS'] == '1' && ARGV.include?('status') &&
+           ARGV.any? { |arg| arg.end_with?('/vpsadmin-webui') }
+          exit 23
+        end
+        puts ' M changed' if ENV['TEST_GIT_DIRTY'] == '1' && ARGV.include?('status')
         puts '1111111111111111111111111111111111111111' if ARGV.include?('rev-parse')
         exit 0
       end
       environment = ENV.select { |key, _| key.start_with?("#{ENV.fetch('TEST_KIND').upcase}_DEVCLUSTER_") }
-      File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => event, 'environment' => environment)) }
+      File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => event, 'environment' => environment, 'argv' => ARGV)) }
       exit 23 if ENV['FAIL_AT'] == event
       def value_after(option)
         index = ARGV.index(option)
@@ -305,8 +538,22 @@ class DevclusterCommandsTest < Minitest::Test
         case event
         when 'build'
           link = value_after('--out-link')
+          workspace = ENV.fetch('DEVCLUSTER_WORKSPACE')
+          config = JSON.parse(File.read(ENV.fetch('TEST_CONFIG')))
+          machines = %w[services node1 node2].to_h { |name| [name, { 'toplevel' => "/fixture/#{name}" }] }
+          labels = if config.dig('newWebui', 'enable') == true
+                     { 'webuiSourceRevision' => environment.fetch('VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION'),
+                       'webuiSourceDirty' => environment.fetch('VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_DIRTY') == '1' ? 'true' : 'false',
+                       'webuiSourceKind' => environment.fetch('VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_SOURCE_KIND') }
+                   else
+                     {}
+                   end
+          labels.delete('webuiSourceKind') if ENV['TEST_PARTIAL_LABELS'] == '1'
+          target = File.join(workspace, "built-#{File.readlines(ENV.fetch('TEST_EVENTS')).length}.json")
+          File.write(target, ENV['TEST_INVALID_RESULT'] == '1' ? '{invalid' : JSON.generate('machines' => machines, 'labels' => labels))
           FileUtils.rm_f(link)
-          File.symlink(File.join(ENV.fetch('DEVCLUSTER_WORKSPACE'), 'built.json'), link)
+          File.symlink(target, link)
+          exit 23 if ENV['FAIL_AFTER_LINK'] == '1'
         when 'run'
           File.write(value_after('--ready-file'), 'ready')
         end
@@ -314,7 +561,9 @@ class DevclusterCommandsTest < Minitest::Test
         File.write(value_after('-f'), 'fixture')
         File.write(value_after('-f') + '.pub', 'fixture')
       when 'openssl'
-        if ARGV.include?('-ext')
+        if ARGV.first == 'rand'
+          puts('a' * 64)
+        elsif ARGV.include?('-ext')
           config = JSON.parse(File.read(ENV.fetch('TEST_CONFIG')))
           puts (config.fetch('domains').values + config.fetch('tmpDomains').values).map { |name| "DNS:#{name}" }.join(', ')
         elsif (output = value_after('-out'))

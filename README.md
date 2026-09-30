@@ -5,6 +5,9 @@ This repository adds vpsFree.cz tools to the reusable
 It owns the KB commands, vpsAdmin and vpsAdminOS development-cluster providers,
 Codex skills, and the one-time namespace migration helper.
 
+The [vpsAdmin development cluster guide](dev-clusters/vpsadmin/README.md)
+documents its configuration, runtime credentials, and recovery steps.
+
 The generic runtime supplies the `dev-session-documentation` skill. Its
 [session guide](https://github.com/aither64/dev-workspace/blob/master/docs/dev-sessions.md#documentation-during-development)
 explains document ownership and rationale capture. This extension connects that

@@ -1099,6 +1099,7 @@ devcluster_vpsadmin_links_json() {
     . as $cfg |
     [
       {key: "webui", label: "Web UI"},
+      {key: "newadmin", label: "React Web UI"},
       {key: "webCs", label: "Czech website"},
       {key: "webEn", label: "English website"},
       {key: "api", label: "API"},
@@ -1110,6 +1111,7 @@ devcluster_vpsadmin_links_json() {
     ] | map(
       . as $item |
       ($cfg.domains[$item.key] // "") as $domain |
+      select($item.key != "newadmin" or $cfg.newWebui.enable == true) |
       select($domain | type == "string" and length > 0) |
       {label: $item.label, url: (
         "https://" + $domain +

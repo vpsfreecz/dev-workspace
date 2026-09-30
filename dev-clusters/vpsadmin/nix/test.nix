@@ -2,6 +2,7 @@
   lib,
   vpsadmin,
   vpsadminos,
+  vpsadminWebui,
   vpsfStatus,
   workspace,
   slug,
@@ -17,6 +18,10 @@
   vpsadminRevisionDirty,
   vpsadminosRevision,
   vpsadminosRevisionDirty,
+  vpsadminWebuiRevision,
+  vpsadminWebuiRevisionDirty,
+  vpsadminWebuiSourceKind,
+  webuiCredentialsDir,
   haveapiSourcePath,
   configSourcePath,
   mailTemplatesSourcePath,
@@ -51,6 +56,57 @@ let
 
   domains = devConfig.domains;
   tmpDomains = devConfig.tmpDomains;
+  newWebuiConfig = devConfig.newWebui or { };
+  newWebuiEnabled =
+    if builtins.isBool (newWebuiConfig.enable or false) then
+      newWebuiConfig.enable or false
+    else
+      throw "newWebui.enable must be a boolean";
+  webuiSourceLabels =
+    if !newWebuiEnabled then
+      { }
+    else if builtins.match "[0-9a-f]{40}" vpsadminWebuiRevision == null then
+      throw "Enabled React WebUI requires a 40-character lowercase source revision"
+    else if !(builtins.elem vpsadminWebuiRevisionDirty [ "0" "1" ]) then
+      throw "React WebUI source dirty value must be 0 or 1"
+    else if !(builtins.elem vpsadminWebuiSourceKind [ "pinned" "worktree" ]) then
+      throw "React WebUI source kind must be pinned or worktree"
+    else
+      {
+        webuiSourceRevision = vpsadminWebuiRevision;
+        webuiSourceDirty = if vpsadminWebuiRevisionDirty == "1" then "true" else "false";
+        webuiSourceKind = vpsadminWebuiSourceKind;
+      };
+  validNewWebuiDomain = domain:
+    builtins.isString domain
+    && builtins.stringLength domain <= 253
+    && (
+      let labels = lib.splitString "." domain; in
+      lib.length labels >= 2
+      && lib.all (label:
+        builtins.stringLength label <= 63
+        && builtins.match "[a-z0-9]([a-z0-9-]*[a-z0-9])?" label != null
+      ) labels
+    );
+  newWebuiDomain =
+    if !newWebuiEnabled then
+      null
+    else if !(domains ? newadmin) || !(builtins.isString domains.newadmin) then
+      throw "Enabled React WebUI requires domains.newadmin"
+    else if !(validNewWebuiDomain domains.newadmin) then
+      throw "domains.newadmin must be a valid DNS name"
+    else if builtins.elem domains.newadmin ((builtins.attrValues (builtins.removeAttrs domains [ "newadmin" ])) ++ builtins.attrValues tmpDomains) then
+      throw "domains.newadmin must differ from the other cluster domains"
+    else if networkMode != "bridge" then
+      throw "React WebUI requires bridge networking; disable newWebui.enable for local mode"
+    else if webuiCredentialsDir == "" then
+      throw "Enabled React WebUI requires the runtime credential directory path"
+    else if !lib.hasPrefix "/" webuiCredentialsDir || lib.hasPrefix "/nix/store/" webuiCredentialsDir then
+      throw "React WebUI credentials must stay outside the Nix store"
+    else
+      domains.newadmin;
+  webuiPublicOrigin = if newWebuiEnabled then "https://${newWebuiDomain}" else null;
+  webuiRuntimeCredentials = "/run/vpsadmin-newadmin-credentials";
   serviceIp = devConfig.services.ip;
   serviceRootDiskMiB = devConfig.services.rootDiskMiB or (12 * 1024);
   zfsTransferStartDelay = devConfig.nodectld.zfsTransferStartDelay or 0;
@@ -861,7 +917,10 @@ let
     end
   '';
 
-  allDomains = builtins.attrValues domains ++ builtins.attrValues tmpDomains;
+  allDomains =
+    builtins.attrValues (builtins.removeAttrs domains [ "newadmin" ])
+    ++ lib.optional newWebuiEnabled newWebuiDomain
+    ++ builtins.attrValues tmpDomains;
   certStoreDir = builtins.path {
     path = certDir;
     name = "vpsadmin-devcluster-certs";
@@ -884,6 +943,9 @@ let
   }
   // optionalAttrs (webSourcePath != "") {
     web = webSourcePath;
+  };
+  servicesSharedFileSystems = sharedFileSystems // optionalAttrs newWebuiEnabled {
+    webuiCredentials = webuiCredentialsDir;
   };
 
   sharedMounts = {
@@ -1008,6 +1070,32 @@ let
       ...
     }:
     let
+      newWebuiProxyHeaders = ''
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host "${newWebuiDomain}";
+        proxy_set_header X-Forwarded-Host "${newWebuiDomain}";
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-Server "";
+        proxy_set_header X-Original-Forwarded-For "";
+        proxy_set_header X-Client-IP "";
+        proxy_set_header True-Client-IP "";
+        proxy_set_header CF-Connecting-IP "";
+      '';
+      newWebuiLocation = {
+        proxyPass = "http://127.0.0.1:18082";
+        recommendedProxySettings = false;
+        extraConfig = newWebuiProxyHeaders;
+      };
+      newWebuiOauthLocation = newWebuiLocation // {
+        extraConfig = newWebuiProxyHeaders + ''
+          access_log off;
+          error_log /dev/null;
+        '';
+      };
       mkVpsfreeWebHost = language: {
         addSSL = true;
         sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
@@ -1129,7 +1217,13 @@ let
         };
       };
 
-      fileSystems = sharedMounts;
+      fileSystems = sharedMounts // optionalAttrs newWebuiEnabled {
+        "/mnt/vpsadmin-webui-credentials" = {
+          device = "webuiCredentials";
+          fsType = "virtiofs";
+          options = [ "nofail" "ro" ];
+        };
+      };
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
 
@@ -1333,6 +1427,18 @@ let
         // optionalAttrs webEnabled {
           "${domains.webCs}" = mkVpsfreeWebHost "cs";
           "${domains.webEn}" = mkVpsfreeWebHost "en";
+        }
+        // optionalAttrs newWebuiEnabled {
+          "${newWebuiDomain}" = {
+            addSSL = true;
+            sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
+            sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
+            locations = {
+              "/" = newWebuiLocation;
+              "= /oauth" = newWebuiOauthLocation;
+              "^~ /oauth/" = newWebuiOauthLocation;
+            };
+          };
         };
 
       systemd.services.vpsadmin-devcluster-seed =
@@ -1368,6 +1474,70 @@ let
             ${dbCfg.package}/ruby-env/bin/bundle exec rake db:seed:file SEED_FILE=${devSeed}
           '';
         };
+
+      systemd.services.vpsadmin-devcluster-webui-credentials = lib.mkIf newWebuiEnabled {
+        description = "Prepare React WebUI runtime credentials";
+        wantedBy = [ "multi-user.target" ];
+        unitConfig.RequiresMountsFor = "/mnt/vpsadmin-webui-credentials";
+        before = [ "vpsadmin-devcluster-webui-seed.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          UMask = "0077";
+        };
+        script = ''
+          set -euo pipefail
+          src=/mnt/vpsadmin-webui-credentials
+          dst=${webuiRuntimeCredentials}
+          ${pkgs.coreutils}/bin/install -d -m 0700 "$dst"
+          for name in oauth-client-id oauth-client-secret session-secret; do
+            test -f "$src/$name" && test ! -L "$src/$name"
+            ${pkgs.coreutils}/bin/install -m 0600 "$src/$name" "$dst/$name"
+          done
+        '';
+      };
+
+      systemd.services.vpsadmin-devcluster-webui-seed = lib.mkIf newWebuiEnabled (
+        let
+          dbCfg = config.vpsadmin.databaseSetup;
+          dependencies = [
+            "vpsadmin-database-setup.service"
+            "vpsadmin-devcluster-seed.service"
+            "vpsadmin-devcluster-webui-credentials.service"
+          ];
+        in
+        {
+          description = "Seed the React WebUI OAuth client";
+          wantedBy = [ "multi-user.target" ];
+          after = dependencies;
+          requires = dependencies;
+          before = [ "container@newadmin.service" ];
+          environment = {
+            RACK_ENV = "production";
+            SCHEMA = "${dbCfg.stateDirectory}/cache/schema.rb";
+            DEVCLUSTER_WEBUI_ORIGIN = webuiPublicOrigin;
+          };
+          serviceConfig = {
+            Type = "oneshot";
+            User = dbCfg.user;
+            Group = dbCfg.group;
+            WorkingDirectory = "${dbCfg.package}/database";
+            LoadCredential = [
+              "oauth-client-id:${webuiRuntimeCredentials}/oauth-client-id"
+              "oauth-client-secret:${webuiRuntimeCredentials}/oauth-client-secret"
+            ];
+          };
+          script = ''
+            set -euo pipefail
+            ${dbCfg.package}/ruby-env/bin/bundle exec rake db:seed:file SEED_FILE=${./webui-oauth-seed.rb}
+          '';
+        }
+      );
+
+      systemd.services."container@newadmin" = lib.mkIf newWebuiEnabled {
+        requires = [ "vpsadmin-devcluster-webui-seed.service" ];
+        after = [ "vpsadmin-devcluster-webui-seed.service" ];
+      };
 
       systemd.services.vpsadmin-api = {
         requires = [ "vpsadmin-devcluster-seed.service" ];
@@ -1493,6 +1663,59 @@ let
               after = [ "vpsadmin-webui-live-root.service" ];
             };
           };
+      };
+
+      containers.newadmin = lib.mkIf newWebuiEnabled {
+        privateNetwork = false;
+        bindMounts.${webuiRuntimeCredentials} = {
+          hostPath = webuiRuntimeCredentials;
+          isReadOnly = true;
+        };
+        config = {
+          imports = [ vpsadminWebui.nixosModules.default ];
+          networking.hosts = devHosts;
+          security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
+          systemd.services.vpsadmin-webui-bff.environment.NODE_EXTRA_CA_CERTS = "${certStoreDir}/vpsadmin-ca.crt";
+          services."vpsadmin-webui" = {
+            enable = true;
+            frontendPackage = vpsadminWebui.packages.${pkgs.stdenv.hostPlatform.system}.frontend;
+            bffPackage = vpsadminWebui.packages.${pkgs.stdenv.hostPlatform.system}.bff;
+            publicOrigin = webuiPublicOrigin;
+            api = {
+              url = "https://${domains.api}";
+              version = "7.0";
+            };
+            oauth = {
+              authorizeUrl = "https://${domains.auth}/_auth/oauth2/authorize";
+              tokenUrl = "https://${domains.auth}/_auth/oauth2/token";
+              revokeUrl = "https://${domains.auth}/_auth/oauth2/revoke";
+              passwordRecoveryUrl = "https://${domains.auth}/oauth2/password-reset";
+              scope = "all";
+              type = "web_server";
+            };
+            legacyWebuiUrl = "https://${domains.webui}";
+            haveApi = {
+              authHeader = "X-HaveAPI-OAuth2-Token";
+              metaNamespace = "_meta";
+            };
+            credentialFiles = {
+              oauthClientId = "${webuiRuntimeCredentials}/oauth-client-id";
+              oauthClientSecret = "${webuiRuntimeCredentials}/oauth-client-secret";
+              sessionSecret = "${webuiRuntimeCredentials}/session-secret";
+            };
+            bffPort = 3001;
+            nginx = {
+              listenAddress = "127.0.0.1";
+              port = 18082;
+              trustedProxyAddresses = [ "127.0.0.1/32" ];
+              allowedClientAddresses = [ "127.0.0.1/32" ];
+            };
+            security = {
+              consoleOrigins = [ "wss://${domains.console}" ];
+              frameOrigins = [ "https://${domains.console}" ];
+            };
+          };
+        };
       };
 
       containers.mailer.config =
@@ -1654,6 +1877,7 @@ in
   description = ''
     Branch-selected vpsAdmin development cluster for ${slug}.
   '';
+  labels = webuiSourceLabels;
 
   machines = {
     services = {
@@ -1663,7 +1887,7 @@ in
       cores = 4;
       diskSize = serviceRootDiskMiB;
       networks = machineNetworks "services";
-      sharedFileSystems = sharedFileSystems;
+      sharedFileSystems = servicesSharedFileSystems;
       config = {
         _module.args = {
           vpsadminRev = if vpsadminRevision == "" then null else vpsadminRevision;
