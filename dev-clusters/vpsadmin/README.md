@@ -226,6 +226,176 @@ The default seed creates:
 - a vpsf-status instance on the services VM, exposed as
   `https://status.staging.example.test/`.
 
+### Storage profile
+
+The storage topology can enable representative member NAS and VPS backup
+policy through the cluster configuration:
+
+```json
+{
+  "storageProfile": { "enable": true, "enrollment": true }
+}
+```
+
+`enrollment` defaults to `true` and must be a boolean. The enabled profile
+preserves existing namespace allocations/maps, personal packages and effective
+resource assignments on repeat seed runs. Incompatible accounting or ambiguous
+ownership refuses the update. Missing namespaces are allocated after services
+and nodes are ready, through normal API chains. The disabled profile retains
+the ordinary fixture seed behavior.
+
+The profile uses the regular hypervisor pools as sources and creates separate
+`tank/backup` and `tank/nas` roots on the storage node. Both have an initial
+limit of 32 datasets. They share the same physical zpool. Provision checks
+catalog and physical root presence before Pool creation and refuses adoption
+of an uncatalogued root. Pool capacity must have fresh allocation evidence.
+
+Future active level-1 members receive a shared package with 4 CPUs, 4096 MiB
+memory, 2048 MiB swap, 8192 MiB disk space, four public IPv4 addresses and
+16 private IPv4 addresses. Their NAS root has a 1024 MiB quota. Existing users
+keep their entitlement; catch-up reports insufficient resources rather than
+changing a personal package. Administrative/service accounts receive no
+automatic member NAS allocation.
+
+After the compatible services generation and Node workers are running, use:
+
+```sh
+vpsadmin-devcluster storage-profile <slug> provision
+```
+
+Provision creates missing configured roots through normal Pool chains, waits
+for readiness, commits shared empty snapshot templates, then enrolls existing
+members and confirmed sources. Its initial admission observation completes in
+a short database transaction. Each chain and template writer checks admission
+again in its own staging transaction; physical waits hold no database
+transaction or freeze lock. A later freeze refuses subsequent work and retains
+previously committed chains and their evidence.
+
+Newly profile-created sources use minimum 2, maximum 3 snapshots and maximum
+age 1800 seconds; new backup copies use minimum
+2, maximum 5 and maximum age 3600 seconds. These are rotation targets after
+successful Backup, not hard growth or physical-space bounds. Failed or locked
+work and snapshot dependencies can retain more history. Existing source
+retention stays unchanged. Catch-up does not Rotate; later normal Backup may
+prune under that unchanged policy. A new backup copy uses only its own
+dataset-create command; existing logical Dataset rows and shared templates do
+not belong to that command's rollback.
+Snapshot tasks use `*/5` minutes and backup tasks use `2-59/10`. Enabled
+profile scheduling reloads tasks every 60 seconds. The selected API must
+support interval syntax and retained shared templates before enrollment.
+
+To retire, keep the overlay enabled and select `enrollment: false`. Complete
+the supported services update/restart so every API, supervisor and scheduler
+process has loaded that selection, then run:
+
+```sh
+vpsadmin-devcluster storage-profile <slug> retire
+```
+
+The loaded helper reports its enrollment value; a desired/deployed mismatch
+refuses the command before effects. Editing the host config alone is not a
+services restart. Retired boot still preserves existing assignments and the
+preserving-seed marker. Static bootstrap only removes the exact owned future
+default-package link, including while storage is read-only. It creates no
+package/default and changes no Environment permissions or existing allocation.
+Hooks skip new enrollment, and explicit provision, template creation, catch-up
+and direct Plan add/verify refuse. Normal Plan removal remains available.
+
+Retirement stops dispatch, requires admitted work to have settled, and removes
+only owned memberships, actions/tasks, templates, Environment plan links and
+the future default link in an atomic configuration transaction. It preserves
+the Plan definition, all packages/assignments and storage catalog/payloads.
+Remaining owned rows indicate pending retirement. Success resumes unrelated
+scheduling; failure keeps the scheduler stopped and evidence available for
+diagnosis. Repeating retirement or a services seed does not reactivate the
+profile. Never disable the overlay on retained disks to retire or recover.
+Re-enrollment requires a compatible services generation with enrollment true,
+then provision. These operations do not establish quiet or repair authority.
+
+### Storage profile verification
+
+The optional no-VM smoke selection evaluates active and retired profile
+closures, their preserving-seed marker and invalid selections. Override the
+API input with the compatible source being tested; setting only a launcher
+source environment variable does not replace the imported Nix module:
+
+```sh
+nix run --no-write-lock-file \
+  --override-input devcluster-vpsadmin path:/absolute/compatible/vpsadmin \
+  .#devcluster-check -- --storage-profile
+```
+
+The real database helper specs use that API's test environment and disposable
+database. Run the wrapper from its `.#api` shell, which already enters `api/`.
+It refuses an inherited `DATABASE_URL` or a configured database and controls
+RSpec's options so the guard runs before schema loading:
+
+```sh
+nix develop /absolute/compatible/vpsadmin#api -c \
+  /absolute/provider/dev-clusters/vpsadmin/tests/run-storage-profile-api-specs.sh
+```
+
+After committing and reviewing the provider, the explicit retained-services
+fixture boots one disposable services guest across old, held and copied
+generations. Its configuration arguments are fixed by the app; it accepts only
+an optional new artifact directory. It checks real seeds, generator masks,
+writer-start counters, interrupted copy/boot recovery and retained assignments
+and payload. It keeps the hold at `starting_copied`: services-only coverage
+cannot prove the full cluster's Node refresh or release.
+
+```sh
+nix run --no-write-lock-file \
+  --override-input devcluster-vpsadmin path:/absolute/compatible/vpsadmin \
+  .#devcluster-maintenance-check
+```
+
+The fixture retains private failure artifacts and stops only its own guest.
+It does not replace registered cluster disks. The existing
+`host-migration-test` remains a separate required check for runtime policy
+compatibility; neither fixture proves the other's contract.
+
+The payload fixture runs against an explicitly selected, owned storage
+cluster after its compatible services generation and profile provision are
+ready. It requires read-write storage, a running scheduler, an active seeded
+`test-admin`, and an enabled compatible OS template. Run its host script with
+a new private artifact directory:
+
+```sh
+ruby dev-clusters/vpsadmin/tests/storage-profile-acceptance.rb \
+  --slug <bound-session-slug> --artifact-dir /private/new-profile-fixture \
+  --os-template-id <enabled-template-id>
+```
+
+Enabled services package the fixed `vpsadmin-storage-profile-acceptance`
+guest wrapper from the same profile selection as the preserving seed. The
+host script uses public provider SSH, provision and services-update commands;
+the guest wrapper invokes only its packaged fixture through the ordinary
+database task. It accepts no arbitrary script path and exports no credentials.
+
+The fixture creates its own member, VPS and NAS child through normal chains.
+Immediately before each payload write, a fresh guest `info` request checks
+read-write mode, settled evidence and the bound source/destination routing.
+The trial requires no concurrent operator freeze change during these direct
+file writes: the observation is not an atomic interlock across DB and SSH.
+It writes only those new objects, verifies full and incremental sends, and
+checks both historical payload versions through normal `UseClone` read-only
+views. Each view must have `readonly=on`, matching checksums and the expected
+file absence. Cleanup uses normal `FreeClone` and `RemoveClone` operations
+restricted to that returned, owned clone ID; it never runs the global inactive
+clone sweep. Rotation and an actual scheduled cycle check the configured
+retention targets and a common base for both cross-node VPS and same-node NAS
+copies. Repeat provision and services seed must preserve other users'
+allocations and task identities.
+
+The host prints a numeric summary and keeps mode-0600 IDs, projections and
+diagnostic files in private mode-0700 artifact directories. Guest failures
+retain private mode-0700 diagnostic directories with chain and object IDs
+recorded before waiting. A timeout or failure does not cancel admitted chains,
+delete fixture objects, change storage mode or reset disks.
+Inspect that evidence before retrying; scheduling may remain stopped. Successful
+fixtures remain available for inspection and do not establish storage quiet,
+repair readiness or APPLY authority.
+
 ### Optional React Web UI
 
 The legacy PHP Web UI remains available. A separate React Web UI runs on the

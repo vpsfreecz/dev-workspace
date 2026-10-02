@@ -47,6 +47,7 @@ Usage:
   devcluster urls <slug>
   devcluster config <slug>
   devcluster refresh <slug>
+  devcluster storage-profile <slug> provision|retire
   devcluster update <slug> [services|node1|node2|storage1|all]
   devcluster update <slug> services --copy-only
   devcluster restart <slug> <machine> <service>
@@ -1775,6 +1776,67 @@ update_dispatch() {
   fi
 }
 
+# Pool::Create can adopt a named ZFS root. Refuse unexpected physical roots
+# before staging missing Pools through the ordinary API chain.
+storage_profile_cluster() {
+  local slug="$1" operation="${2:-}"
+  [ "$#" -eq 2 ] && [[ "$operation" = provision || "$operation" = retire ]] || die "storage-profile requires provision or retire"
+  [ "$(config_get "$slug" '.storageProfile.enable // false')" = true ] || die "storage profile is not enabled"
+  local desired_enrollment
+  desired_enrollment="$(config_get "$slug" '.storageProfile | if has("enrollment") then .enrollment else true end')" || return
+  [[ "$desired_enrollment" = true || "$desired_enrollment" = false ]] || die "storage profile enrollment must be a boolean"
+  if [ "$operation" = provision ]; then
+    [ "$desired_enrollment" = true ] || die "storage profile provisioning requires enrollment enabled"
+  else
+    [ "$desired_enrollment" = false ] || die "storage profile retirement requires enrollment disabled"
+  fi
+  [ "$(cluster_topology "$slug")" = storage ] || die "storage profile requires storage topology"
+  local profile_pid_file
+  profile_pid_file="$(pid_file "$slug")"
+  [ -f "$profile_pid_file" ] && runner_process_matches "$slug" "$(cat "$profile_pid_file")" || die "storage profile requires the owned running cluster"
+  wait_for_machine_ssh "$slug" services || return
+  ssh_cmd "$slug" services 'systemctl is-active --quiet vpsadmin-api.service vpsadmin-supervisor.service' || return
+
+  local profile_dir report cfg node root present machine roots pool_name
+  profile_dir="$(mktemp -d "$(cluster_dir "$slug")/.profile-check.XXXXXXXX")" || return
+  chmod 0700 "$profile_dir" || return
+  report="$profile_dir/inspection.json"
+  cfg="$(config_json_for_slug "$slug")" || return
+  if ! ssh_cmd "$slug" services 'timeout --kill-after=1 60 /run/current-system/sw/bin/vpsadmin-storage-profile inspect' | head -c 8193 >"$report"; then
+    die "storage profile inspection failed; private evidence: $profile_dir"
+  fi
+  [ "$(wc -c <"$report")" -le 8192 ] || die "storage profile inspection exceeded its bound"
+  jq -e '.version == 1 and (.enrollment | type == "boolean") and (.pools | length >= 1 and length <= 10) and
+    all(.pools[]; (.node_id | type == "number" and . == floor and . > 0) and
+      (.filesystem | type == "string" and test("^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")) and
+      (.present | type == "boolean"))' "$report" >/dev/null || die "invalid storage profile inspection"
+  [ "$(jq -r '.enrollment' "$report")" = "$desired_enrollment" ] || die "storage profile desired and deployed enrollment differ; complete the services replacement first"
+  while IFS=$'\t' read -r node root present; do
+    [[ "$root" != */. && "$root" != */.. && "$root" != ./* && "$root" != ../* ]] || die "invalid storage profile root"
+    machine="$(jq -r --argjson node "$node" '.nodes | to_entries | map(select(.value.id == $node)) | if length == 1 then .[0].key else empty end' "$cfg")" || return
+    [[ "$machine" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "storage profile node is outside owned configuration"
+    wait_for_machine_ssh "$slug" "$machine" || return
+    roots="$profile_dir/node-$node.txt"
+    pool_name="${root%%/*}"
+    ssh_cmd "$slug" "$machine" "timeout --kill-after=1 45 bash -o pipefail -c \"zfs list -H -r -t filesystem -o name '$pool_name' | awk 'NR <= 4096 {print} NR == 4097 {exit 2}'\"" >"$roots" || die "storage profile root inspection failed"
+    [ -s "$roots" ] && [ "$(wc -c <"$roots")" -le 524288 ] || die "storage profile root inspection is incomplete"
+    if grep -Fx -- "$root" "$roots" >/dev/null; then
+      [ "$present" = true ] || die "uncatalogued storage profile root exists; refusing adoption"
+    else
+      [ "$present" = false ] || die "catalogued storage profile root is physically absent"
+    fi
+  done < <(jq -r '.pools[] | [.node_id, .filesystem, .present] | @tsv' "$report")
+
+  # Failure leaves scheduling stopped and admitted work available for diagnosis.
+  ssh_cmd "$slug" services 'systemctl stop vpsadmin-scheduler.service' || return
+  if ! ssh_cmd "$slug" services "timeout --kill-after=5 1800 /run/current-system/sw/bin/vpsadmin-storage-profile '$operation'"; then
+    die "storage profile operation failed; scheduling remains stopped, inspect admitted chains before retry"
+  fi
+  ssh_cmd "$slug" services 'systemctl start vpsadmin-scheduler.service' || return
+  rm -f -- "$profile_dir"/* || return
+  rmdir -- "$profile_dir"
+}
+
 main() {
   local cmd="${1:-}"
   [ -n "$cmd" ] || {
@@ -1801,6 +1863,8 @@ main() {
     gcroots) gcroots_cluster "$@" ;;
     urls) devcluster_with_lifecycle_lock "$1" true true urls urls_cluster "${@:2}" ;;
     config) devcluster_with_lifecycle_lock "$1" true true config config_cluster "${@:2}" ;;
+    storage-profile) devcluster_with_lifecycle_lock \
+      "$1" true true storage-profile ordinary_cluster_operation storage_profile_cluster "${@:2}" ;;
     refresh) devcluster_with_lifecycle_lock \
       "$1" true true refresh ordinary_cluster_operation refresh_nodes_after_seed "${@:2}" ;;
     update) devcluster_with_lifecycle_lock "$1" true true update update_dispatch "${@:2}" ;;

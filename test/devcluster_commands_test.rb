@@ -380,7 +380,151 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_storage_profile_refuses_disabled_or_stopped_clusters_before_guest_effects
+    with_workspace('vpsadmin', retained: true) do |env, directory|
+      result = run_helper('vpsadmin', env, 'storage-profile', 'provision')
+      refute(result.success?)
+      assert_includes(@last_output, 'not enabled')
+      refute(events(env).any? { |event| event['event'] == 'ssh' })
+
+      env = enable_storage_profile(env, directory)
+      result = run_helper('vpsadmin', env, 'storage-profile', 'provision')
+      refute(result.success?)
+      assert_includes(@last_output, 'owned running cluster')
+      refute(events(env).any? { |event| event['event'] == 'ssh' })
+    end
+  end
+
+  def test_storage_profile_checks_all_roots_before_provisioning_and_restarts_only_after_success
+    with_workspace('vpsadmin', retained: true) do |env, directory|
+      env = enable_storage_profile(env, directory)
+      with_profile_runner(env, directory) do
+        result = run_helper('vpsadmin', env, 'storage-profile', 'provision')
+        assert(result.success?, @last_output)
+        commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+        inspection = commands.index { |command| command.include?('vpsadmin-storage-profile inspect') }
+        probes = commands.each_index.select { |index| commands[index].include?('zfs list -H -r') }
+        stop = commands.index('systemctl stop vpsadmin-scheduler.service')
+        provision = commands.index { |command| command.include?("vpsadmin-storage-profile 'provision'") }
+        restart = commands.index('systemctl start vpsadmin-scheduler.service')
+        assert_equal(3, probes.size)
+        assert(probes.all? { |index| index > inspection && index < stop })
+        assert_operator(stop, :<, provision)
+        assert_operator(provision, :<, restart)
+        assert_empty(Dir.glob(File.join(directory, '.profile-check.*')))
+        refute(events(env).any? { |event| %w[build run copy activate].include?(event['event']) })
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_storage_profile_refuses_uncatalogued_or_missing_roots_before_stopping_scheduling
+    %w[TEST_PROFILE_ORPHAN TEST_PROFILE_MISSING_ROOT].each do |failure|
+      with_workspace('vpsadmin', retained: true) do |env, directory|
+        env = enable_storage_profile(env, directory).merge(failure => '1')
+        with_profile_runner(env, directory) do
+          result = run_helper('vpsadmin', env, 'storage-profile', 'provision')
+          refute(result.success?)
+          commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+          refute_includes(commands, 'systemctl stop vpsadmin-scheduler.service')
+          refute(commands.any? { |command| command.include?("vpsadmin-storage-profile 'provision'") })
+          assert_equal(1, Dir.glob(File.join(directory, '.profile-check.*')).size)
+          assert_locks_released(env)
+        end
+      end
+    end
+  end
+
+  def test_storage_profile_failure_leaves_scheduling_stopped
+    %w[provision retire].each do |operation|
+      with_workspace('vpsadmin', retained: true) do |env, directory|
+        env = enable_storage_profile(env, directory, enrollment: operation == 'provision')
+        env['FAIL_PROFILE_OPERATION'] = '1'
+        with_profile_runner(env, directory) do
+          result = run_helper('vpsadmin', env, 'storage-profile', operation)
+          refute(result.success?, @last_output)
+          commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+          assert_includes(commands, 'systemctl stop vpsadmin-scheduler.service')
+          refute_includes(commands, 'systemctl start vpsadmin-scheduler.service')
+          assert_locks_released(env)
+        end
+      end
+    end
+  end
+
+  def test_successful_retirement_resumes_unrelated_scheduling_after_cleanup
+    with_workspace('vpsadmin', retained: true) do |env, directory|
+      env = enable_storage_profile(env, directory, enrollment: false)
+      with_profile_runner(env, directory) do
+        result = run_helper('vpsadmin', env, 'storage-profile', 'retire')
+        assert(result.success?, @last_output)
+        commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+        stop = commands.index('systemctl stop vpsadmin-scheduler.service')
+        retire = commands.index { |command| command.include?("vpsadmin-storage-profile 'retire'") }
+        restart = commands.index('systemctl start vpsadmin-scheduler.service')
+        assert_operator(stop, :<, retire)
+        assert_operator(retire, :<, restart)
+        assert_empty(Dir.glob(File.join(directory, '.profile-check.*')))
+      end
+    end
+  end
+
+  def test_storage_profile_requires_the_correct_desired_and_deployed_enrollment
+    [[true, 'retire'], [false, 'provision'], [nil, 'retire'], %w[false retire]].each do |enrollment, operation|
+      with_workspace('vpsadmin', retained: true) do |env, directory|
+        env = enable_storage_profile(env, directory, enrollment: enrollment)
+        result = run_helper('vpsadmin', env, 'storage-profile', operation)
+        refute(result.success?)
+        refute(events(env).any? { |event| event['event'] == 'ssh' })
+      end
+    end
+    [true, false].each do |enrollment|
+      with_workspace('vpsadmin', retained: true) do |env, directory|
+        env = enable_storage_profile(env, directory, enrollment: enrollment)
+              .merge('TEST_PROFILE_EFFECTIVE_ENROLLMENT' => (!enrollment).to_s)
+        with_profile_runner(env, directory) do
+          result = run_helper('vpsadmin', env, 'storage-profile', enrollment ? 'provision' : 'retire')
+          refute(result.success?)
+          assert_includes(@last_output, 'desired and deployed enrollment differ')
+          commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+          refute(commands.any? { |command| command.include?('zfs list') || command.include?('systemctl stop') })
+        end
+      end
+    end
+  end
+
   private
+
+  def enable_storage_profile(env, directory, enrollment: :omitted)
+    config = JSON.parse(File.read(env.fetch('TEST_CONFIG')))
+    config['storageProfile'] = { 'enable' => true }
+    config['storageProfile']['enrollment'] = enrollment unless enrollment == :omitted
+    path = File.join(directory, 'config.json')
+    File.write(path, JSON.generate(config))
+    File.write(File.join(directory, 'topology'), "storage\n")
+    env.merge('TEST_CONFIG' => path, 'TEST_STORAGE_PROFILE' => '1')
+  end
+
+  def with_profile_runner(_env, directory)
+    socket = File.read(File.join(directory, 'socket-dir')).strip
+    pid = Process.spawn(RbConfig.ruby, '-e', 'sleep 60', '--', '--sock-dir', socket,
+                        out: File::NULL, err: File::NULL)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+    until File.read("/proc/#{pid}/cmdline").split("\0").include?(socket)
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        raise 'Fixture runner did not publish its socket argument'
+      end
+
+      sleep 0.01
+    end
+    File.write(File.join(directory, 'runner.pid'), "#{pid}\n")
+    yield
+  ensure
+    if pid
+      Process.kill('TERM', pid)
+      Process.wait(pid)
+    end
+  end
 
   def enable_react_webui(env, directory)
     config = JSON.parse(File.read(env.fetch('TEST_CONFIG')))
@@ -604,6 +748,26 @@ class DevclusterCommandsTest < Minitest::Test
           File.write(output, 'fixture')
         end
       when 'ssh'
+        if ENV['TEST_STORAGE_PROFILE'] == '1'
+          remote = ARGV.last
+          if remote.include?('vpsadmin-storage-profile inspect')
+            selection = JSON.parse(File.read(ENV.fetch('TEST_CONFIG'))).fetch('storageProfile')
+            enrollment = selection.fetch('enrollment', true)
+            enrollment = JSON.parse(ENV.fetch('TEST_PROFILE_EFFECTIVE_ENROLLMENT')) if ENV.key?('TEST_PROFILE_EFFECTIVE_ENROLLMENT')
+            puts JSON.generate('version' => 1, 'enrollment' => enrollment, 'pools' => [
+              { 'node_id' => 101, 'filesystem' => 'tank/ct', 'present' => true },
+              { 'node_id' => 201, 'filesystem' => 'tank/backup', 'present' => false },
+              { 'node_id' => 201, 'filesystem' => 'tank/nas', 'present' => false }
+            ])
+          elsif remote.include?('zfs list -H -r')
+            roots = ['tank']
+            roots << 'tank/ct' if value_after('-p') == '10122' && ENV['TEST_PROFILE_MISSING_ROOT'] != '1'
+            roots << 'tank/backup' if value_after('-p') == '10322' && ENV['TEST_PROFILE_ORPHAN'] == '1'
+            puts roots
+          elsif remote.match?(/vpsadmin-storage-profile '(provision|retire)'/) && ENV['FAIL_PROFILE_OPERATION'] == '1'
+            exit 23
+          end
+        end
         if event == 'ssh-ready'
           exit 24 unless ARGV.include?('BatchMode=yes') && ARGV.include?('IdentitiesOnly=yes')
           sleep 60 if ENV['HANG_SSH_PROBE'] == '1'
