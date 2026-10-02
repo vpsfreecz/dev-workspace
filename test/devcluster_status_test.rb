@@ -119,6 +119,44 @@ class DevclusterStatusTest < Minitest::Test
     end
   end
 
+  def test_maintenance_status_hides_private_evidence_and_never_claims_application_readiness
+    with_cluster('vpsadmin') do |workspace, directory, slug|
+      evidence = {
+        'version' => 1, 'workspace' => workspace, 'slug' => slug,
+        'resident_config' => '/nix/store/fixture-resident-config', 'resident_config_sha256' => 'a' * 64,
+        'services_toplevel' => '/nix/store/fixture-services', 'evidence_kind' => 'prior_activation',
+        'evidence_reference' => 'private-operator-reference'
+      }
+      record = {
+        'version' => 1, 'mode' => 'maintenance', 'phase' => 'held', 'workspace' => workspace, 'slug' => slug,
+        'resident_config' => evidence.fetch('resident_config'), 'resident_config_sha256' => 'a' * 64,
+        'services_toplevel' => evidence.fetch('services_toplevel'), 'evidence' => evidence,
+        'evidence_sha256' => 'b' * 64, 'mask_policy' => 1, 'runner_pid' => nil, 'runner_start' => nil,
+        'boot_id' => nil, 'candidate' => nil, 'candidate_sha256' => nil, 'next_config' => nil,
+        'next_config_sha256' => nil, 'copied_toplevel' => nil, 'preserving_seed' => nil
+      }
+      path = File.join(directory, 'maintenance-hold.json')
+      write_state(directory, 'maintenance-hold.json', JSON.generate(record))
+      File.chmod(0o600, path)
+      write_state(directory, 'ready', 'stale readiness')
+      status = read_status('vpsadmin', workspace, slug)
+      assert_equal(false, status.fetch('ready'))
+      assert_empty(status.fetch('services'))
+      assert_equal({ 'version' => 1, 'mode' => 'maintenance', 'phase' => 'held',
+                     'pending' => true, 'copied' => false, 'active' => false }, status.fetch('maintenance'))
+      %w[private-operator-reference fixture-resident-config fixture-services].each do |value|
+        refute_includes(JSON.generate(status), value)
+      end
+      write_state(directory, 'maintenance-hold.json', '{"version":99}')
+      File.chmod(0o600, path)
+      output, error, result = Open3.capture3({ 'DEVCLUSTER_WORKSPACE' => workspace },
+                                           HELPERS.fetch('vpsadmin'), 'status', slug, '--json')
+      refute(result.success?)
+      assert_empty(output)
+      refute_includes(error, 'private-operator-reference')
+    end
+  end
+
   def test_react_webui_link_follows_desired_config_and_source_follows_selected_result
     with_cluster('vpsadmin') do |workspace, directory, slug|
       config = {

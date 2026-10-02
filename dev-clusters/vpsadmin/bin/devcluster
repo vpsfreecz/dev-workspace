@@ -39,6 +39,8 @@ usage() {
   cat <<'EOF'
 Usage:
   devcluster start <slug> [--topology single|dual|storage] [--network bridge|local] [--force]
+  devcluster start <slug> --copied-config
+  devcluster maintenance-start <slug> --resident-config PATH --expect-services-toplevel PATH --residency-evidence PATH
   devcluster stop <slug>
   devcluster status <slug>
   devcluster gcroots [--cleanup] [<slug>...]
@@ -46,6 +48,7 @@ Usage:
   devcluster config <slug>
   devcluster refresh <slug>
   devcluster update <slug> [services|node1|node2|storage1|all]
+  devcluster update <slug> services --copy-only
   devcluster restart <slug> <machine> <service>
   devcluster ssh [<slug>] <machine> [ssh-options...] [-- <remote-command>...]
   devcluster reset <slug>
@@ -1220,6 +1223,13 @@ status_cluster() {
     return
   fi
 
+  local maintenance pending
+  maintenance="$(maintenance_state "$slug" status)" || return
+  pending="$(jq -r '.pending // false' <<<"$maintenance")" || return
+  if [ "$maintenance" != null ]; then
+    printf 'maintenance: %s\n' "$(jq -r '.phase' <<<"$maintenance")"
+  fi
+
   local pid_path
   pid_path="$(pid_file "$slug")"
 
@@ -1233,7 +1243,9 @@ status_cluster() {
 
   [ -f "$(topology_file "$slug")" ] && printf 'topology: %s\n' "$(cluster_topology "$slug")"
   [ -f "$(network_file "$slug")" ] && printf 'network: %s\n' "$(cluster_network "$slug")"
-  if [ -f "$(ready_file "$slug")" ]; then
+  if [ "$pending" = true ]; then
+    printf 'ready: maintenance hold\n'
+  elif [ -f "$(ready_file "$slug")" ]; then
     if [ "$running" = "1" ]; then
       printf 'ready: yes\n'
     else
@@ -1331,7 +1343,8 @@ devcluster_services_json() {
 
 devcluster_status_v2_json() {
   local slug="$1"
-  local legacy links services source
+  local legacy links services source maintenance
+  maintenance="$(maintenance_state "$slug" status)" || return
   legacy="$(devcluster_status_json vpsadmin "$slug" vpsadmin-devcluster true)"
   links="$(jq -c '.links // []' <<<"$legacy")"
   services='[]'
@@ -1341,10 +1354,12 @@ devcluster_status_v2_json() {
     source="$(selected_webui_source_json "$slug")" || return
   fi
 
-  jq -c --argjson services "$services" --argjson source "$source" '
+  jq -c --argjson services "$services" --argjson source "$source" --argjson maintenance "$maintenance" '
     .schema = 2 |
     if .found then .services = $services else . end |
     if .found and $source != null then .webuiSource = $source else . end |
+    if $maintenance != null then .maintenance = $maintenance else . end |
+    if $maintenance.pending == true then .ready = false | .services = [] else . end |
     del(.links, .credentials)
   ' <<<"$legacy"
 }
@@ -1523,6 +1538,243 @@ reset_cluster() {
   printf 'cluster %s state removed\n' "$slug"
 }
 
+maintenance_state() {
+  local slug="$1"
+  shift
+  ruby "$CLUSTER_DIR/lib/maintenance.rb" "$WORKSPACE" "$slug" "$(cluster_dir "$slug")" "$@"
+}
+
+ordinary_cluster_operation() {
+  local slug="$1" callback="$2"
+  shift 2
+  maintenance_state "$slug" ordinary || return
+  "$callback" "$slug" "$@"
+}
+
+maintenance_adopt() {
+  local slug="$1"
+  maintenance_state "$slug" adopt || return
+  devcluster_adopt_package_transition "$slug" "$DEVCLUSTER_SOCKET_PREFIX"
+}
+
+maintenance_require_stopped() {
+  local slug="$1" pid_path sock_dir
+  pid_path="$(pid_file "$slug")"
+  sock_dir="$(socket_dir "$slug")"
+  if [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"; then
+    die "maintenance requires the recorded runner to be stopped"
+  fi
+  local -a pids=()
+  mapfile -t pids < <(socket_processes "$slug" "$sock_dir")
+  [ "${#pids[@]}" -eq 0 ] || die "maintenance socket processes remain; use the supported stop command"
+  [ "$(cluster_network "$slug")" = bridge ] || die "maintenance requires the recorded bridge network"
+  if ping -c 1 -W 1 "$(machine_ip "$slug" services)" >/dev/null 2>&1; then
+    die "maintenance frontend address is occupied"
+  fi
+}
+
+maintenance_root_config() {
+  local slug="$1" name="$2" config="$3"
+  nix-store --add-root "$(cluster_dir "$slug")/maintenance-$name" --indirect --realise "$config" >/dev/null
+}
+
+maintenance_remote() {
+  local slug="$1" command="$2" probe_timeout="${3:-120}" host
+  local -a opts=()
+  host="$(machine_host "$slug" services)" || return
+  # The existing provider transport supplies the owned cluster SSH key.
+  # shellcheck disable=SC2206
+  opts=($(ssh_opts "$slug" services))
+  timeout --kill-after=1 "$probe_timeout" ssh "${opts[@]}" -n -o BatchMode=yes -o IdentitiesOnly=yes \
+    "root@$host" "$command"
+}
+
+maintenance_identity() {
+  local slug="$1" pid stat start boot
+  pid="$(cat "$(pid_file "$slug")")" || return
+  runner_process_matches_socket "$slug" "$pid" "$(socket_dir "$slug")" \
+    || die "maintenance runner identity is unproved"
+  stat="$(cat "/proc/$pid/stat")" || return
+  local -a fields=()
+  read -r -a fields <<<"${stat##*) }"
+  start="${fields[19]:-}"
+  [[ "$start" =~ ^[0-9]+$ ]] || die "maintenance runner start identity is unavailable"
+  boot="$(maintenance_remote "$slug" 'cat /proc/sys/kernel/random/boot_id')" || return
+  [[ "$boot" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || die "maintenance guest boot identity is unavailable"
+  printf '%s %s %s\n' "$pid" "$start" "$boot"
+}
+
+maintenance_check_hold() {
+  local slug="$1" masks
+  masks="$(ruby -r "$CLUSTER_DIR/lib/maintenance.rb" -e 'puts DevClusters::VpsAdminMaintenance::MASKS.join(" ")')" || return
+  maintenance_remote "$slug" "set -eu
+    for unit in $masks; do
+      found=0
+      for dir in /run/systemd/generator.early /run/systemd/generator /run/systemd/generator.late; do
+        if [ \"\$(readlink \"\$dir/\$unit\" 2>/dev/null || true)\" = /dev/null ]; then found=1; fi
+      done
+      [ \"\$found\" = 1 ]
+      [ \"\$(systemctl show \"\$unit\" --property=LoadState --value)\" = masked ]
+      state=\$(systemctl show \"\$unit\" --property=ActiveState --value)
+      [ \"\$state\" = inactive ]
+    done
+    active=\$(systemctl list-units --no-legend --plain --no-pager --state=active,activating --type=service,timer)
+    ! printf '%s\\n' \"\$active\" | grep -Eq '(^|[[:space:]])(vpsadmin[^[:space:]]*\\.(service|timer)|container@(webui|newadmin|mailer)\\.service|[^[:space:]]*\\.timer)[[:space:]]'
+    processes=\$(ps -eo args=)
+    ! printf '%s\\n' \"\$processes\" | grep -Eq '[b]undle exec rake|[r]uby[^[:space:]]* .*vpsadmin'
+  "
+}
+
+launch_recorded_config() {
+  local slug="$1" config="$2" mode="$3"
+  local vpsadmin_path vpsadminos_input_value vpsf_status_path vpsadmin_webui_path
+  vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
+  vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
+  vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
+  vpsadmin_webui_path="$(slug_optional_path "$slug" vpsadmin-webui || true)"
+  local -a overrides=()
+  while IFS= read -r -d '' item; do overrides+=("$item"); done \
+    < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$vpsadmin_webui_path")
+  local dir log ready sock pid_path
+  dir="$(cluster_dir "$slug")"
+  log="$dir/runner.log"
+  ready="$(ready_file "$slug")"
+  sock="$(socket_dir "$slug")"
+  pid_path="$(pid_file "$slug")"
+  rm -f "$ready" "$pid_path" || return
+  mkdir -p "$sock" || return
+  local -a command=(nix run --impure "${overrides[@]}" "path:$CLUSTER_DIR#runner" -- start
+    --config "$config" --state-dir "$dir/state" --sock-dir "$sock" --pid-file "$pid_path" --ready-file "$ready")
+  case "$mode" in
+    maintenance) command+=(--maintenance) ;;
+    copied) command+=(--copied-config) ;;
+    *) die "unsupported recorded boot mode" ;;
+  esac
+  (
+    cd "$WORKSPACE" || exit
+    devcluster_exec_without_lifecycle_lock nohup setsid "${command[@]}"
+  ) >>"$log" 2>&1 &
+  local launcher_pid=$!
+  for _ in $(seq 1 900); do
+    if [ -f "$ready" ]; then return 0; fi
+    if [ -f "$pid_path" ] && ! runner_process_matches "$slug" "$(cat "$pid_path")"; then
+      die "recorded runner exited before readiness; private runner log retained"
+    fi
+    if [ ! -f "$pid_path" ] && ! is_running "$launcher_pid"; then
+      die "recorded launcher exited before readiness; private runner log retained"
+    fi
+    sleep 1
+  done
+  die "recorded runner readiness timed out; maintenance hold retained"
+}
+
+maintenance_start() {
+  local slug="$1" resident="" expected="" evidence=""
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --resident-config) [ -z "$resident" ] && [ -n "${2:-}" ] || die "invalid resident-config argument"; resident="$2"; shift 2 ;;
+      --expect-services-toplevel) [ -z "$expected" ] && [ -n "${2:-}" ] || die "invalid expected-toplevel argument"; expected="$2"; shift 2 ;;
+      --residency-evidence) [ -z "$evidence" ] && [ -n "${2:-}" ] || die "invalid residency-evidence argument"; evidence="$2"; shift 2 ;;
+      *) die "unsupported maintenance-start argument" ;;
+    esac
+  done
+  [ -n "$resident" ] && [ -n "$expected" ] && [ -n "$evidence" ] || die "maintenance-start requires resident config, expected toplevel and residency evidence"
+  devcluster_validate_cluster_directory "$slug" false || die "maintenance requires existing owned cluster state"
+  maintenance_require_stopped "$slug" || return
+  maintenance_state "$slug" prepare "$resident" "$expected" "$evidence" || return
+  maintenance_state "$slug" inspect || return
+  maintenance_root_config "$slug" resident "$resident" || return
+  launch_recorded_config "$slug" "$resident" maintenance || return
+  wait_for_machine_ssh "$slug" services || return
+  maintenance_check_hold "$slug" || return
+  local -a identity=()
+  read -r -a identity <<<"$(maintenance_identity "$slug")" || return
+  [ "${#identity[@]}" -eq 3 ] || die "maintenance boot identity is incomplete"
+  maintenance_state "$slug" ready "${identity[@]}" || return
+  printf 'maintenance hold ready; application writers remain unavailable\n'
+}
+
+maintenance_copy_only() {
+  local slug="$1" status config top host opts next
+  status="$(maintenance_state "$slug" status)" || return
+  [ "$(jq -r '.pending // false' <<<"$status")" = true ] || die "copy-only requires a maintenance hold"
+  maintenance_check_hold "$slug" || return
+  local -a identity=() after=()
+  read -r -a identity <<<"$(maintenance_identity "$slug")" || return
+  [ "${#identity[@]}" -eq 3 ] || die "maintenance boot identity is incomplete"
+  devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
+    build_config_with_credentials "$slug" "$(cluster_topology "$slug")" "$(cluster_network "$slug")" || return
+  config="$(config_path "$slug")" || return
+  maintenance_state "$slug" begin-copy "$config" "${identity[@]}" || return
+  top="$(maintenance_state "$slug" candidate-toplevel)" || return
+  host="$(machine_host "$slug" services)" || return
+  opts="$(ssh_opts "$slug" services)" || return
+  NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$top" || return
+  maintenance_remote "$slug" "set -euo pipefail; test -x '$top/init'; nix-store --query --requisites '$top' | xargs -r nix-store --check-validity; nix-store --add-root '/nix/var/nix/gcroots/vpsadmin-devcluster-maintenance-$slug' --indirect --realise '$top' >/dev/null" || return
+  maintenance_check_hold "$slug" || return
+  read -r -a after <<<"$(maintenance_identity "$slug")" || return
+  [ "${identity[*]}" = "${after[*]}" ] || die "maintenance runner or boot changed during copy"
+  maintenance_state "$slug" build-next "$(cluster_dir "$slug")/maintenance-next.json" || return
+  next="$(nix-store --add "$(cluster_dir "$slug")/maintenance-next.json")" || return
+  maintenance_root_config "$slug" next "$next" || return
+  maintenance_root_config "$slug" candidate "$config" || return
+  maintenance_state "$slug" finish-copy "$next" "${after[@]}" || return
+  printf 'services closure copied; running generation remains held\n'
+}
+
+start_copied_config() {
+  local slug="$1" config
+  maintenance_require_stopped "$slug" || return
+  config="$(maintenance_state "$slug" copied)" || return
+  launch_recorded_config "$slug" "$config" copied || return
+  wait_for_machine_ssh "$slug" services || return
+  maintenance_remote "$slug" 'set -eu
+    for _ in $(seq 1 180); do
+      started=$(systemctl show vpsadmin-devcluster-seed.service --property=ExecMainStartTimestampMonotonic --value)
+      case "$started" in ""|*[!0-9]*) exit 1 ;; esac
+      if [ "$started" -gt 0 ] \
+        && [ "$(systemctl show vpsadmin-devcluster-seed.service --property=Result --value)" = success ] \
+        && [ "$(systemctl show vpsadmin-devcluster-seed.service --property=ExecMainStatus --value)" = 0 ] \
+        && systemctl is-active --quiet vpsadmin-api.service \
+        && systemctl is-active --quiet vpsadmin-supervisor.service; then exit 0; fi
+      sleep 1
+    done
+    exit 1' 190 || return
+  refresh_nodes_after_seed "$slug" || return
+  local -a identity=()
+  read -r -a identity <<<"$(maintenance_identity "$slug")" || return
+  [ "${#identity[@]}" -eq 3 ] || die "copied boot identity is incomplete"
+  maintenance_state "$slug" release "${identity[@]}" || return
+  printf 'copied services configuration ready; maintenance hold released\n'
+}
+
+start_dispatch() {
+  local slug="$1"
+  shift
+  if [ "${1:-}" = --copied-config ]; then
+    [ "$#" -eq 1 ] || die "copied-config accepts no other arguments"
+    start_copied_config "$slug"
+  else
+    ordinary_cluster_operation "$slug" start_cluster "$@"
+  fi
+}
+
+update_dispatch() {
+  local slug="$1"
+  shift
+  local argument copy_only=false
+  for argument in "$@"; do
+    [ "$argument" != --copy-only ] || copy_only=true
+  done
+  if [ "$copy_only" = true ]; then
+    [ "$#" -eq 2 ] && [ "$1" = services ] && [ "$2" = --copy-only ] || die "copy-only requires exactly services"
+    maintenance_copy_only "$slug"
+  else
+    ordinary_cluster_operation "$slug" update_cluster "$@"
+  fi
+}
+
 main() {
   local cmd="${1:-}"
   [ -n "$cmd" ] || {
@@ -1542,22 +1794,23 @@ main() {
   fi
 
   case "$cmd" in
-    start) devcluster_with_lifecycle_lock "$1" true true start start_cluster "${@:2}" ;;
+    start) devcluster_with_lifecycle_lock "$1" true true start start_dispatch "${@:2}" ;;
+    maintenance-start) devcluster_with_lifecycle_lock "$1" true true maintenance-start maintenance_start "${@:2}" ;;
     stop) devcluster_with_lifecycle_lock "$1" false true stop stop_cluster "${@:2}" ;;
     status) devcluster_with_lifecycle_lock "$1" false false status status_cluster "${@:2}" ;;
     gcroots) gcroots_cluster "$@" ;;
     urls) devcluster_with_lifecycle_lock "$1" true true urls urls_cluster "${@:2}" ;;
     config) devcluster_with_lifecycle_lock "$1" true true config config_cluster "${@:2}" ;;
     refresh) devcluster_with_lifecycle_lock \
-      "$1" true true refresh refresh_nodes_after_seed "${@:2}" ;;
-    update) devcluster_with_lifecycle_lock "$1" true true update update_cluster "${@:2}" ;;
-    restart) devcluster_with_lifecycle_lock "$1" true true restart restart_service "${@:2}" ;;
+      "$1" true true refresh ordinary_cluster_operation refresh_nodes_after_seed "${@:2}" ;;
+    update) devcluster_with_lifecycle_lock "$1" true true update update_dispatch "${@:2}" ;;
+    restart) devcluster_with_lifecycle_lock "$1" true true restart ordinary_cluster_operation restart_service "${@:2}" ;;
     ssh) devcluster_with_lifecycle_lock "$1" true true ssh ssh_cluster "${@:2}" ;;
-    reset) devcluster_with_lifecycle_lock "$1" false true reset reset_cluster "${@:2}" ;;
+    reset) devcluster_with_lifecycle_lock "$1" false true reset ordinary_cluster_operation reset_cluster "${@:2}" ;;
     cleanup-paths) need_cmd jq; devcluster_cleanup_paths_json "$1" vpsfree-devcluster ;;
     transition-adopt) devcluster_with_lifecycle_lock \
       "$1" false true transition-adopt \
-      devcluster_adopt_package_transition vpsfree-devcluster ;;
+      maintenance_adopt ;;
     cert)
       local sub="${1:-}"
       [ -n "$sub" ] || {

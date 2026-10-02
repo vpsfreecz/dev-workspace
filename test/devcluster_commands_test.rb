@@ -346,6 +346,40 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_pending_unknown_maintenance_refuses_ordinary_writer_operations
+    %w[start update restart refresh reset].each do |command|
+      with_workspace('vpsadmin') do |env, directory|
+        File.write(File.join(directory, 'maintenance-hold.json'), '{"version":99}')
+        File.chmod(0o600, File.join(directory, 'maintenance-hold.json'))
+        result = run_helper('vpsadmin', env, command)
+        refute(result.success?, command)
+        refute(events(env).any? { |event| %w[build run copy activate ssh].include?(event['event']) })
+        assert_equal('{"version":99}', File.binread(File.join(directory, 'maintenance-hold.json')))
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_maintenance_forms_reject_arbitrary_flags_before_build_or_boot
+    [
+      ['maintenance-start', '--force'],
+      ['maintenance-start', '--kernel-params', 'init=/other'],
+      ['maintenance-start', '--resident-config', '/fixture/resident'],
+      ['start', '--copied-config', '--force'],
+      ['update', 'node1', '--copy-only'],
+      ['update', '--copy-only', 'services'],
+      ['update', 'services', '--force', '--copy-only']
+    ].each do |command, *arguments|
+      with_workspace('vpsadmin') do |env, _directory|
+        stdout, stderr, result = Open3.capture3(env, File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'),
+                                              command, env.fetch('TEST_SLUG'), *arguments)
+        refute(result.success?, stdout + stderr)
+        refute(events(env).any? { |event| %w[build run copy activate ssh].include?(event['event']) })
+        assert_locks_released(env)
+      end
+    end
+  end
+
   private
 
   def enable_react_webui(env, directory)

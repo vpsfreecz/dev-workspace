@@ -18,6 +18,117 @@ changes with `update` while the VMs are running so their root disks contain the
 new system closures before the next boot. Starting retained disks with older
 runner versions can replace them with fresh images and erase their data.
 
+## Maintenance boot for retained disks
+
+When the cluster is stopped and the required services closure has not been
+copied into its retained disk, use a recorded resident configuration to boot
+services with application writers held from initial boot. This requires the
+maintenance-aware provider and runtime transition policy 3. Keep a private
+database backup and positive evidence that the exact services closure is
+resident before beginning. A selected build or stale ready file does not prove
+residency.
+
+```sh
+vpsadmin-devcluster maintenance-start <slug> \
+  --resident-config /nix/store/recorded-config \
+  --expect-services-toplevel /nix/store/recorded-services \
+  --residency-evidence /private/residency-evidence.json
+vpsadmin-devcluster update <slug> services --copy-only
+vpsadmin-devcluster stop <slug>
+vpsadmin-devcluster start <slug> --copied-config
+```
+
+The evidence file must be an operator-owned regular file with mode 0600,
+without a symlink, and at most 8 KiB. Its version-1 JSON has exactly these
+fields:
+
+```json
+{
+  "version": 1,
+  "workspace": "/absolute/registered/workspace",
+  "slug": "bound-session-slug",
+  "resident_config": "/nix/store/recorded-config",
+  "resident_config_sha256": "64-lowercase-hex-digits",
+  "services_toplevel": "/nix/store/recorded-services",
+  "evidence_kind": "prior_copy",
+  "evidence_reference": "private operator evidence reference"
+}
+```
+
+Use SHA-256 of the exact configuration bytes. `evidence_kind` accepts
+`prior_activation`, `prior_copy` or `cold_residency`. The reference records
+trusted operator evidence; the helper does not open the referenced artifact.
+The helper bounds strings to 2048 bytes and the slug to 128 bytes. Retry must
+use the same evidence bytes and resident selection; moving an identical file
+is allowed. Status omits its private reference and paths.
+
+Maintenance requires the existing owned bridge cluster, no live runner or
+socket processes, and all retained managed disks present with positive size
+and `preserve=true`. It starts only services. Fixed kernel masks hold the API,
+seed, scheduler, supervisor, application containers, ingress and timer graph.
+SSH, MariaDB and the Nix daemon remain available. MariaDB recovery and ordinary
+OS bookkeeping can still write; this hold does not establish storage quiet or
+repair authority. Unknown writers, activation triggers, boot parameters or
+generator evidence refuse the boot. The helper passes no arbitrary kernel
+parameters and checks the complete command line against its supported bound.
+
+Copy-only requires the proved masks and the same runner and guest boot identity.
+The candidate must carry the provider's exact preserving-seed contract:
+`labels.vpsadminPreservingSeed` is the JSON string
+`{"version":1,"existingAssignments":"preserve"}`. The enabled profile must
+emit it from the selection that actually preserves existing assignments.
+An old or disabled seed without this marker refuses copy. The marker does not
+replace the separate API schema, scheduler and plan compatibility checks.
+
+Copy-only verifies the complete guest closure and executable `init`, retains a
+guest GC root, then records a matching next configuration. It does not activate
+the closure, restart units, refresh nodes or load the API. The next configuration
+changes only services and keeps every other guest entry, network, mount and
+disk layout. A rebuilt services root image may have a different **source**
+`rootDisk.image`; its retained destination and every other disk field stay
+exact. The helper rechecks disks before machine construction and immediately
+before each start. A missing disk refuses boot before OSVM can create an image.
+
+The copied-config boot uses the recorded configuration without rebuilding it.
+It releases the hold only after the new seed has run successfully, API and
+supervisor are active, and the normal node refresh completes. Pending or
+unknown maintenance state blocks plain start, update, refresh, restart and
+reset. Status and stop remain available. Private hold/copy records and their
+configuration GC roots survive stop and interruption. Failed copy has no
+release receipt; stop and retry the same proved maintenance selection or
+diagnose while stopped. If a new boot may have changed schema or state, verify
+compatibility before selecting an old resident generation for masked recovery.
+Never reset retained state or run an old package to evade a refusal.
+
+Runtime policy 3 permits the supported forward transition from policy 2 with
+schema 1. It conservatively rejects normal transitions to policy 2 while any
+development-cluster state exists, even after maintenance completes. Recover
+with a reviewed compatible package. Old candidate recovery helpers cannot
+prove this maintenance state and are outside the supported procedure.
+
+For focused provider tests, use the pinned Ruby in the repository root. The
+provider has no development shell. Select its canonical runtime contract and
+run each fixture in a separate process. Use the pinned Ruby's bundled gems so
+an inherited user gem directory cannot replace its Minitest version:
+
+```sh
+export DEVCLUSTER_RUNTIME_CONTRACT="$(nix eval --raw --impure --expr \
+  '(builtins.getFlake (toString ./.)).inputs.dev-workspace.lib.runtimeContract')"
+nix shell --inputs-from . nixpkgs#ruby nixpkgs#bash nixpkgs#coreutils \
+  nixpkgs#git nixpkgs#jq nixpkgs#openssl nixpkgs#util-linux -c bash -ec '
+    unset RUBYOPT
+    export GEM_HOME="$(ruby -rrubygems -e "puts Gem.default_dir")"
+    export GEM_PATH="$GEM_HOME"
+    for name in maintenance runner commands status; do
+      ruby "test/devcluster_${name}_test.rb"
+    done
+  '
+```
+
+The normal flake test check also runs these fixtures. They do not boot a guest;
+generator masks, seed preservation and copy/restart interruption require the
+separate disposable VM acceptance check after review.
+
 ## Basic Usage
 
 ```sh

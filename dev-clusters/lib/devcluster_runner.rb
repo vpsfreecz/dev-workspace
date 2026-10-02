@@ -13,14 +13,15 @@ module DevClusters
     ShutdownRequested = Class.new(StandardError)
     MachineState = Struct.new(:name, :machine, keyword_init: true)
 
-    def self.run(argv, hash_base:, priority_machines: [])
-      new(argv, hash_base:, priority_machines:).run
+    def self.run(argv, hash_base:, priority_machines: [], maintenance_policy: nil)
+      new(argv, hash_base:, priority_machines:, maintenance_policy:).run
     end
 
-    def initialize(argv, hash_base:, priority_machines:)
+    def initialize(argv, hash_base:, priority_machines:, maintenance_policy: nil)
       @argv = argv
       @hash_base = hash_base
       @priority_machines = priority_machines
+      @maintenance_policy = maintenance_policy
     end
 
     def run
@@ -51,7 +52,17 @@ module DevClusters
         parser.on('--pid-file PATH') { |v| opts[:pid_file] = v }
         parser.on('--ready-file PATH') { |v| opts[:ready_file] = v }
         parser.on('--timeout SECONDS', Integer) { |v| opts[:timeout] = v }
+        if @maintenance_policy
+          parser.on('--maintenance') { opts[:maintenance] = true }
+          parser.on('--copied-config') { opts[:copied_config] = true }
+        end
       end.parse!(@argv)
+      if opts[:maintenance] && opts[:copied_config]
+        raise ArgumentError, 'maintenance runner modes are mutually exclusive'
+      end
+      if (opts[:maintenance] || opts[:copied_config]) && !@argv.empty?
+        raise ArgumentError, 'unexpected maintenance runner arguments'
+      end
 
       %i[config state_dir sock_dir pid_file ready_file].each do |key|
         raise ArgumentError, "--#{key.to_s.tr('_', '-')} is required" unless opts[key]
@@ -94,7 +105,7 @@ module DevClusters
       Signal.trap('INT', &signal_trap)
 
       begin
-        start_machines(machines, opts[:timeout])
+        start_machines(machines, opts[:timeout], kernel_params: @maintenance_kernel_params)
         File.write(opts[:ready_file], "#{Time.now.utc.iso8601}\n")
 
         loop do
@@ -150,6 +161,20 @@ module DevClusters
     def build_machines(opts)
       config = JSON.parse(File.read(opts[:config]))
 
+      if opts[:maintenance] || opts[:copied_config]
+        raise ArgumentError, 'maintenance mode is unavailable for this provider' unless @maintenance_policy
+        directory = File.expand_path('..', opts.fetch(:state_dir))
+        workspace = File.expand_path('../../../..', directory)
+        @active_maintenance_policy = @maintenance_policy.new(workspace:, slug: File.basename(directory), directory:)
+        if opts[:maintenance]
+          @maintenance_kernel_params = @active_maintenance_policy.validate_runner!(config_path: opts.fetch(:config))
+          config = config.merge('machines' => { 'services' => config.fetch('machines').fetch('services') })
+        else
+          @active_maintenance_policy.validate_copied_runner!(config_path: opts.fetch(:config))
+        end
+        @retained_machine_configs = config.fetch('machines')
+      end
+
       unless OsVm::MachineConfig::Disk.method_defined?(:preserve) && OsVm::MachineConfig.method_defined?(:all_disks)
         raise 'The vpsAdminOS input does not support per-disk preservation. Update the selected vpsAdminOS source before starting this cluster.'
       end
@@ -158,6 +183,7 @@ module DevClusters
         osvm_cfg = OsVm::MachineConfig.from_config(machine_cfg)
         klass = machine_class(osvm_cfg)
         machine_opts = { default_timeout: opts[:timeout], hash_base: }
+        @active_maintenance_policy&.validate_machine_disks!(name:, machine: machine_cfg)
 
         MachineState.new(
           name: name,
@@ -183,19 +209,24 @@ module DevClusters
       end
     end
 
-    def start_machines(machines, timeout)
+    def start_machines(machines, timeout, kernel_params: nil)
       priority_names = priority_machines.each_with_index.to_h
       priority, rest = machines.partition { |entry| priority_names.key?(entry.name) }
       priority.sort_by! { |entry| priority_names.fetch(entry.name) }
 
-      start_machine_group(priority, timeout)
-      start_machine_group(rest, timeout)
+      start_machine_group(priority, timeout, kernel_params:)
+      start_machine_group(rest, timeout, kernel_params:)
     end
 
-    def start_machine_group(machines, timeout)
+    def start_machine_group(machines, timeout, kernel_params: nil)
       machines.each do |entry|
+        @active_maintenance_policy&.validate_machine_disks!(name: entry.name, machine: @retained_machine_configs.fetch(entry.name))
         warn "Starting #{entry.name}"
-        entry.machine.start(wait_for_boot: false)
+        if kernel_params
+          entry.machine.start(kernel_params:, wait_for_boot: false)
+        else
+          entry.machine.start(wait_for_boot: false)
+        end
       end
 
       machines.each do |entry|
