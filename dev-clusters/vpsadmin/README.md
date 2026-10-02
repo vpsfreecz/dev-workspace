@@ -343,6 +343,13 @@ writer-start counters, interrupted copy/boot recovery and retained assignments
 and payload. It keeps the hold at `starting_copied`: services-only coverage
 cannot prove the full cluster's Node refresh or release.
 
+The app evaluates and builds its two fixed fixture configurations only when
+invoked, carrying the selected input sources and their declared follows into
+that build. Ordinary flake checks keep the disabled default API selection.
+An invocation without a compatible API override refuses the enabled candidate
+configuration before starting a guest. The native runner receives only the
+built store JSON files.
+
 ```sh
 nix run --no-write-lock-file \
   --override-input devcluster-vpsadmin path:/absolute/compatible/vpsadmin \

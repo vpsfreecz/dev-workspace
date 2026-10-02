@@ -165,6 +165,13 @@
             ${inputs.devcluster-vpsadminWebui} "$@"
         '';
       };
+      devclusterMaintenanceCheck = import ./nix/tests/retained-services-maintenance.nix {
+        inherit inputs pkgs;
+        organizationTools = mkOrganizationTools {
+          inherit pkgs;
+          siteConfig = testSiteConfig;
+        };
+      };
       testCompatibilityPackage = mkPackage {
         activationEnvironmentAliases = [ "VPSFREE_WORKSPACE_ACTIVATION" ];
         inherit pkgs;
@@ -223,10 +230,18 @@
     {
       lib = {
         inherit mkPackage;
+        # Explicit fixture outputs stay lazy and are not ordinary flake checks.
+        retainedServicesFixtureConfigs = devclusterMaintenanceCheck.configs;
       };
-      apps.${system}.devcluster-check = {
-        type = "app";
-        program = "${devclusterCheck}/bin/devcluster-check";
+      apps.${system} = {
+        devcluster-check = {
+          type = "app";
+          program = "${devclusterCheck}/bin/devcluster-check";
+        };
+        devcluster-maintenance-check = {
+          type = "app";
+          program = "${devclusterMaintenanceCheck.app}/bin/devcluster-maintenance-check";
+        };
       };
       packages.${system}.host-migration-test = import ./nix/tests/host-migration.nix {
         inherit pkgs;
