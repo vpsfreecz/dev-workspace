@@ -79,7 +79,9 @@ module DevStorageProfileProvision
   def provision!(profile)
     profile.require_enrollment!
     @deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + MAX_SECONDS
-    StorageMutationAdmission.check!
+    StorageFreezeControl.transaction(requires_new: true) do
+      StorageMutationAdmission.check!
+    end
     pool_rows(profile)
     [profile.config.fetch('backupPool'), profile.config.fetch('nasPool')].each do |selection|
       check_deadline!

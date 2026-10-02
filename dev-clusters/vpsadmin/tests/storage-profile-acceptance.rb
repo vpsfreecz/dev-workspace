@@ -79,7 +79,9 @@ module StorageProfileAcceptance
 
       profile = DevClusters::VpsAdminStorageProfile.instance
       profile.require_enrollment! unless request.fetch('operation') == 'retired-info'
-      StorageMutationAdmission.check!
+      StorageFreezeControl.transaction(requires_new: true) do
+        StorageMutationAdmission.check!
+      end
       profile
     end
 
@@ -524,6 +526,14 @@ module StorageProfileAcceptance
     end
 
     def write_payload!(version)
+      current = api!('info')
+      identity = %w[source_id destination_id source_node destination_node source_fs]
+      unless current.fetch('settled') == true && current.fetch('source_id') == @request.fetch('source_id') &&
+             identity.all? { |field| current.fetch(field) == @info.fetch(field) }
+        raise Invalid, 'fixture payload source identity changed or is unsettled'
+      end
+
+      @info = current
       files = PAYLOADS.fetch(version)
       body = 'set -eu; mkdir -p /storage-profile-fixture; rm -f /storage-profile-fixture/keep /storage-profile-fixture/remove /storage-profile-fixture/added; '
       files.each { |name, content| body += "printf %s #{Shellwords.escape(content)} > /storage-profile-fixture/#{name}; " }

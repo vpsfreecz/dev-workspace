@@ -15,6 +15,9 @@ raise 'API revision is unavailable' unless status.success?
 
 warn "storage-profile API revision=#{revision.strip} helper=#{api_root}/api/spec/spec_helper.rb"
 require_relative '../dev-clusters/vpsadmin/lib/storage_profile'
+raise 'Storage profile specs refuse guest execution mode' if ENV.key?('STORAGE_PROFILE_ACCEPTANCE_MODE')
+
+require_relative '../dev-clusters/vpsadmin/tests/storage-profile-acceptance'
 
 RSpec.describe DevClusters::VpsAdminStorageProfile do
   let(:source_pool) { SpecSeed.pool }
@@ -703,5 +706,516 @@ RSpec.describe DevClusters::VpsAdminStorageProfile do
     expect(confirmations_for(chain).map(&:attributes)).to eq(rows)
     expect(profile.plan.dataset_plan.dataset_actions.order(:id).map(&:attributes)).to eq(actions)
     expect(DatasetInPoolPlan.where(dataset_in_pool: source).count).to eq(1)
+  end
+end
+
+# These entrypoints run from a database task, without RSpec's rollback wrapper.
+RSpec.describe 'Storage profile autocommit admission', :no_transaction do
+  WaitReached = Class.new(StandardError)
+  PROFILE = DevClusters::VpsAdminStorageProfile
+
+  around do |example|
+    owned_url = VpsAdmin::TestDb.auto_start!
+    uri = URI.parse(owned_url)
+    connection = ActiveRecord::Base.connection_db_config.configuration_hash
+    unless ENV.fetch('DATABASE_URL') == owned_url && uri.scheme == 'mysql2' && uri.host == '127.0.0.1' &&
+           connection.values_at(:adapter, :host, :port, :database) ==
+           ['mysql2', uri.host, uri.port, uri.path.delete_prefix('/')]
+      raise 'Autocommit specs refuse a database outside the automatic harness'
+    end
+
+    expect(ActiveRecord::Base.connection.transaction_open?).to be(false)
+    control = StorageFreezeControl.find(1)
+    @control = control.attributes.except('id')
+    @plan_id = DatasetPlan.find_by(name: PROFILE::PLAN_NAME)&.id
+    plans = VpsAdmin::API::DatasetPlans.plans.dup
+    instance = PROFILE.instance_variable_get(:@instance)
+    actor = User.current
+    session = UserSession.current
+    key = SysConfig.find_by!(category: 'core', name: 'transaction_key')
+    key_attributes = key.attributes.except('id')
+    signer = VpsAdmin::API::TransactionSigner.instance
+    signer_state = signer.instance_variables.to_h { |name| [name, signer.instance_variable_get(name)] }
+    @owned = Hash.new { |hash, model| hash[model] = [] }
+    User.current = SpecSeed.admin
+    UserSession.current = nil
+    example.run
+  ensure
+    if @owned
+      restore_autocommit_fixture do
+        begin
+          cleanup_autocommit_fixtures!
+        ensure
+          control.update_columns(@control)
+          key.update_columns(key_attributes)
+          (signer.instance_variables - signer_state.keys).each { |name| signer.remove_instance_variable(name) }
+          signer_state.each { |name, value| signer.instance_variable_set(name, value) }
+          VpsAdmin::API::DatasetPlans::Registrator.instance_variable_set(:@plans, plans)
+          PROFILE.instance_variable_set(:@instance, instance)
+          User.current = actor
+          UserSession.current = session
+        end
+      end
+    end
+  end
+
+  before do
+    source = File.read(File.expand_path('../dev-clusters/vpsadmin/nix/storage-profile-provision.rb', __dir__))
+    first = source.index('module DevStorageProfileProvision')
+    last = source.index("\nactor = ", first)
+    Object.class_eval(source[first...last], 'storage-profile-provision', 1)
+  end
+
+  def own(row)
+    row.save!
+    @owned[row.class] << row.id
+    row
+  end
+
+  let(:environment) do
+    own(SpecSeed.environment.dup.tap do |row|
+      row.label = "Admission #{SecureRandom.hex(4)}"
+      row.domain = "admission-#{SecureRandom.hex(4)}.test"
+    end)
+  end
+  let(:location) { own(SpecSeed.location.dup.tap { |row| row.environment = environment }) }
+  let(:source_node) do
+    own(SpecSeed.node.dup.tap do |row|
+      row.location = location
+      row.name = "admission-#{SecureRandom.hex(4)}"
+    end)
+  end
+  let(:storage_node) do
+    own(SpecSeed.node.dup.tap do |row|
+      row.location = location
+      row.name = "admission-storage-#{SecureRandom.hex(4)}"
+      row.role = :storage
+    end)
+  end
+  let(:source_pool) { own_pool(:hypervisor, source_node) }
+  let(:nas_pool) { own_pool(:primary, storage_node) }
+  let(:backup_selection) do
+    { 'nodeId' => storage_node.id, 'filesystem' => "tank/admission_backup_#{SecureRandom.hex(4)}",
+      'role' => 'backup', 'maxDatasets' => 32 }
+  end
+  let(:profile) do
+    PROFILE.new(
+      'version' => 1, 'enrollment' => true, 'environmentId' => environment.id,
+      'sourcePools' => [{ 'nodeId' => source_node.id, 'filesystem' => source_pool.filesystem, 'role' => 'hypervisor' }],
+      'backupPool' => backup_selection,
+      'nasPool' => { 'nodeId' => storage_node.id, 'filesystem' => nas_pool.filesystem,
+                     'role' => 'primary', 'maxDatasets' => 32 },
+      'resources' => PROFILE::RESOURCE_DEFAULTS.dup, 'packageVersion' => 1, 'namespaceBlocks' => 2
+    )
+  end
+
+  def own_pool(role, node, filesystem: "tank/admission_#{SecureRandom.hex(4)}")
+    own(Pool.new(node: node, label: 'Admission fixture', filesystem: filesystem, role: role,
+                 state: :online, is_open: 1, max_datasets: 32, maintenance_lock: 0,
+                 checked_at: Time.current, available_space: 10_000, used_space: 100, total_space: 10_100))
+  end
+
+  def existing_backup!
+    own_pool(:backup, storage_node, filesystem: backup_selection.fetch('filesystem'))
+  end
+
+  def source!
+    dataset, dip = create_dataset_with_pool!(user: SpecSeed.user, pool: source_pool,
+                                             name: "admission-#{SecureRandom.hex(4)}")
+    @owned[Dataset] << dataset.id
+    dip
+  end
+
+  def restore_autocommit_fixture
+    return if @reader_unreaped
+
+    yield
+  end
+
+  # Preserve assertion, timeout and signal exceptions over owning cleanup.
+  # rubocop:disable Lint/RescueException
+  def ordinary_reader
+    primary = nil
+    state = { acquired: false, closed: false }
+    expect(ActiveRecord::Base.connection.transaction_open?).to be(false)
+    main_id = ActiveRecord::Base.connection.select_value('SELECT CONNECTION_ID()')
+    reader = Thread.new do
+      Thread.current.report_on_exception = false
+      ActiveRecord::Base.connection_pool.with_connection do |db|
+        state[:acquired] = true
+        reader_error = nil
+        begin
+          expect(db.select_value('SELECT CONNECTION_ID()')).not_to eq(main_id)
+          db.execute('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED')
+          db.execute('SET SESSION innodb_lock_wait_timeout = 2')
+          db.transaction(isolation: :read_committed) do
+            expect(db.select_value('SELECT @@tx_isolation')).to eq('READ-COMMITTED')
+            # The freeze lock must be obtainable before the caller's wait ends.
+            StorageFreezeControl.lock.find(1)
+            yield
+          end
+        rescue Exception => error
+          reader_error = error
+          raise
+        ensure
+          begin
+            db.disconnect!
+            state[:closed] = true
+          rescue Exception
+            raise unless reader_error
+          end
+        end
+      end
+    end
+    reader.report_on_exception = false
+    Timeout.timeout(5) { reader.value }
+  rescue Exception => error
+    primary = error
+    raise
+  ensure
+    if reader
+      cleanup_error = nil
+      begin
+        reader.kill if reader.alive?
+        reader.join(3)
+      rescue Exception => error
+        cleanup_error = error
+      end
+      unless !reader.alive? && (!state[:acquired] || state[:closed])
+        @reader_unreaped = true
+        RSpec.world.wants_to_quit = true
+        cleanup_error ||= StandardError.new('Autocommit reader cleanup is unproved; fixtures retained')
+      end
+      raise cleanup_error if cleanup_error && !primary
+    end
+  end
+  # rubocop:enable Lint/RescueException
+
+  def catalog_counts
+    [Pool, Dataset, DatasetInPool, DatasetPlan, EnvironmentDatasetPlan, DatasetAction,
+     GroupSnapshot, DatasetInPoolPlan, RepeatableTask, TransactionChain, Transaction,
+     TransactionConfirmation, ResourceLock, StorageMutationIntent].map(&:count)
+  end
+
+  def cleanup_autocommit_fixtures!
+    nodes = @owned[Node]
+    pools = Pool.where(node_id: nodes).pluck(:id)
+    dips = DatasetInPool.where(pool_id: pools).pluck(:id)
+    chains = Transaction.where(node_id: nodes).distinct.pluck(:transaction_chain_id)
+    transactions = Transaction.where(transaction_chain_id: chains).pluck(:id)
+    intents = StorageMutationIntent.where(transaction_chain_id: chains).pluck(:id)
+    targets = StorageMutationTarget.where(storage_mutation_intent_id: intents).pluck(:id)
+    attempts = StorageMutationAttempt.where(storage_mutation_intent_id: intents).pluck(:id)
+    StorageMutationTargetObservation.where(storage_mutation_target_id: targets)
+                                    .or(StorageMutationTargetObservation.where(storage_mutation_attempt_id: attempts))
+                                    .delete_all
+    StorageMutationAttempt.where(id: attempts).delete_all
+    StorageMutationTarget.where(id: targets).delete_all
+    StorageMutationIntentScope.where(storage_mutation_intent_id: intents).delete_all
+    StorageMutationIntent.where(id: intents).delete_all
+    StorageIntegrityScope.where(pool_catalog_id: pools).delete_all
+    TransactionConfirmation.where(transaction_id: transactions).delete_all
+    ResourceLock.where(locked_by_type: 'TransactionChain', locked_by_id: chains).delete_all
+    TransactionChainConcern.where(transaction_chain_id: chains).delete_all
+    Transaction.where(id: transactions).delete_all
+    TransactionChain.where(id: chains).delete_all
+    actions = DatasetAction.where(pool_id: pools).pluck(:id)
+    GroupSnapshot.where(dataset_action_id: actions).delete_all
+    RepeatableTask.where(class_name: 'DatasetAction', row_id: actions).delete_all
+    DatasetAction.where(id: actions).delete_all
+    DatasetInPoolPlan.where(dataset_in_pool_id: dips).delete_all
+    EnvironmentDatasetPlan.where(environment_id: @owned[Environment]).delete_all
+    DatasetProperty.where(pool_id: pools).delete_all
+    DatasetInPool.where(id: dips).delete_all
+    Dataset.where(id: @owned[Dataset]).delete_all
+    Pool.where(id: pools).delete_all
+    DatasetPlan.where(name: PROFILE::PLAN_NAME).delete_all unless @plan_id
+    [Node, Location, Environment].each do |model|
+      PaperTrail::Version.where(item_type: model.name, item_id: @owned[model]).delete_all
+      model.where(id: @owned[model]).delete_all
+    end
+  end
+
+  it 'closes the ordinary reader adapter and releases its lease on normal return' do
+    leases = ActiveRecord::Base.connection_pool.stat.fetch(:busy)
+    reader = nil
+    adapter = nil
+    result = ordinary_reader do
+      reader = Thread.current
+      adapter = ActiveRecord::Base.connection
+      expect(StorageFreezeControl.find(1)).to be_read_write
+      :visible
+    end
+    expect(result).to eq(:visible)
+    expect(reader).not_to be_alive
+    expect(adapter).not_to be_active
+    expect(ActiveRecord::Base.connection_pool.stat.fetch(:busy)).to eq(leases)
+  end
+
+  [RSpec::Expectations::ExpectationNotMetError, Interrupt].each do |exception_class|
+    it "preserves the reader's #{exception_class} over a separate join failure" do
+      primary = exception_class.new('controlled reader failure')
+      cleanup_error = StandardError.new('controlled join failure')
+      reader = nil
+      adapter = nil
+      expect do
+        ordinary_reader do
+          reader = Thread.current
+          adapter = ActiveRecord::Base.connection
+          allow(reader).to receive(:join).with(3).and_raise(cleanup_error)
+          raise primary
+        end
+      end.to raise_error(exception_class) { |error| expect(error).to equal(primary) }
+      expect(reader).not_to be_alive
+      expect(adapter).not_to be_active
+    end
+  end
+
+  it 'kills and reaps only its timed-out reader after transaction unwind and adapter close' do
+    entered = Queue.new
+    blocked = Queue.new
+    primary = Timeout::Error.new('controlled parent timeout')
+    leases = ActiveRecord::Base.connection_pool.stat.fetch(:busy)
+    reader = nil
+    adapter = nil
+    allow(Timeout).to receive(:timeout).and_call_original
+    allow(Timeout).to receive(:timeout).with(5) do
+      Timeout.timeout(3) { entered.pop }
+      raise primary
+    end
+    expect do
+      ordinary_reader do
+        reader = Thread.current
+        adapter = ActiveRecord::Base.connection
+        entered << true
+        blocked.pop
+      end
+    end.to raise_error(Timeout::Error) { |error| expect(error).to equal(primary) }
+    expect(reader).not_to be_alive
+    expect(adapter).not_to be_active
+    expect(ActiveRecord::Base.connection_pool.stat.fetch(:busy)).to eq(leases)
+    expect(@reader_unreaped).not_to be(true)
+  end
+
+  [false, true].each do |body_failure|
+    it "retains evidence and stops further examples when close proof fails with body_failure=#{body_failure}" do
+      # A separate instance exercises the refusal guard without poisoning this
+      # example's real restoration. The adapter actually closes before the
+      # controlled error; reset the quit flag only after proving that fact.
+      probe = self.class.new
+      previous_quit = RSpec.world.wants_to_quit
+      primary = StandardError.new('controlled reader failure')
+      close_error = StandardError.new('controlled close failure')
+      reader = nil
+      adapter = nil
+      restoration = double('fixture restoration')
+      expect(restoration).not_to receive(:call)
+      expect do
+        probe.ordinary_reader do
+          reader = Thread.current
+          adapter = ActiveRecord::Base.connection
+          allow(adapter).to receive(:disconnect!).and_wrap_original do |method|
+            method.call
+            raise close_error
+          end
+          raise primary if body_failure
+        end
+      end.to raise_error(StandardError) { |error| expect(error).to equal(body_failure ? primary : close_error) }
+      expect(reader).not_to be_alive
+      expect(adapter).not_to be_active
+      expect(RSpec.world.wants_to_quit).to be(true)
+      probe.restore_autocommit_fixture { restoration.call }
+    ensure
+      if reader && !reader.alive? && adapter && !adapter.active?
+        RSpec.world.wants_to_quit = previous_quit
+      else
+        @reader_unreaped = true
+      end
+    end
+  end
+
+  it 'fails on a cleanup-only join exception after a successfully closed reader' do
+    cleanup_error = StandardError.new('controlled join failure')
+    reader = nil
+    adapter = nil
+    expect do
+      ordinary_reader do
+        reader = Thread.current
+        adapter = ActiveRecord::Base.connection
+        allow(reader).to receive(:join).with(3).and_raise(cleanup_error)
+        :visible
+      end
+    end.to raise_error(StandardError) { |error| expect(error).to equal(cleanup_error) }
+    expect(reader).not_to be_alive
+    expect(adapter).not_to be_active
+    expect(@reader_unreaped).not_to be(true)
+  end
+
+  it 'commits real Pool staging and releases admission before its physical wait' do
+    selected = profile
+    unlock_transaction_signer!
+    allow(DevStorageProfileProvision).to receive(:wait_for_chain!) do |chain|
+      ordinary_reader do
+        expect(TransactionChain.find(chain.id).state).to eq('queued')
+        expect(Transaction.where(transaction_chain_id: chain.id).pluck(:handle))
+          .to eq([Transactions::Storage::CreatePool.t_type])
+        expect(Pool.exists?(node_id: storage_node.id, filesystem: backup_selection.fetch('filesystem'))).to be(true)
+      end
+      raise WaitReached
+    end
+    expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(WaitReached)
+  end
+
+  it 'releases admission before a real capacity-readiness wait' do
+    selected = profile
+    existing_backup!.update_columns(checked_at: nil)
+    allow(DevStorageProfileProvision).to receive(:sleep).with(1) do
+      ordinary_reader { expect(Pool.where(node_id: storage_node.id).count).to eq(2) }
+      raise WaitReached
+    end
+    expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(WaitReached)
+  end
+
+  it 'commits templates and real CatchUp staging before the physical wait' do
+    selected = profile
+    existing_backup!
+    dip = source!
+    selected.install_plan!
+    unlock_transaction_signer!
+    allow(selected).to receive(:bootstrap_templates!).and_wrap_original do |method|
+      method.call
+      ordinary_reader do
+        link = EnvironmentDatasetPlan.find_by!(environment: environment)
+        expect(DatasetAction.where(dataset_plan_id: link.dataset_plan_id, action: :group_snapshot).count).to eq(2)
+      end
+    end
+    allow(DevStorageProfileProvision).to receive(:wait_for_chain!) do |chain|
+      ordinary_reader do
+        expect(TransactionChain.find(chain.id).state).to eq('queued')
+        expect(Transaction.where(transaction_chain_id: chain.id).order(:id).pluck(:handle))
+          .to eq([Transactions::Storage::CreateDataset.t_type, Transactions::Utils::NoOp.t_type])
+        expect(DatasetInPoolPlan.exists?(dataset_in_pool: dip)).to be(true)
+      end
+      raise WaitReached
+    end
+    expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(WaitReached)
+  end
+
+  it 'refuses initially frozen provision before changing catalog, plans or chains' do
+    selected = profile
+    before = catalog_counts
+    StorageFreezeControl.find(1).update_columns(mode: StorageFreezeControl.modes.fetch('read_only'))
+    frozen = StorageFreezeControl.find(1).attributes
+    audits = StorageFreezeTransition.count
+    expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(VpsAdmin::API::Exceptions::StorageReadOnly)
+    expect(catalog_counts).to eq(before)
+    expect(StorageFreezeControl.find(1).attributes).to eq(frozen)
+    expect(StorageFreezeTransition.count).to eq(audits)
+    ordinary_reader { expect(StorageFreezeControl.find(1)).to be_read_only }
+  end
+
+  it 'rechecks staged Pool admission when freeze changes after the initial observation' do
+    selected = profile
+    unlock_transaction_signer!
+    before = catalog_counts
+    expect(DevStorageProfileProvision).not_to receive(:wait_for_chain!)
+    allow(DevStorageProfileProvision).to receive(:pool_rows).and_wrap_original do |method, argument|
+      result = method.call(argument)
+      expect(ActiveRecord::Base.connection.transaction_open?).to be(false)
+      StorageFreezeControl.find(1).update_columns(mode: StorageFreezeControl.modes.fetch('read_only'))
+      result
+    end
+    expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(VpsAdmin::API::Exceptions::StorageReadOnly)
+    expect(catalog_counts).to eq(before)
+  end
+
+  it 'retains committed templates but refuses CatchUp if freeze changes before staging' do
+    selected = profile
+    existing_backup!
+    source!
+    selected.install_plan!
+    unlock_transaction_signer!
+    before = TransactionChain.count
+    allow(selected).to receive(:bootstrap_templates!).and_wrap_original do |method|
+      result = method.call
+      ordinary_reader { expect(EnvironmentDatasetPlan.exists?(environment: environment)).to be(true) }
+      StorageFreezeControl.find(1).update_columns(mode: StorageFreezeControl.modes.fetch('read_only'))
+      result
+    end
+    expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(VpsAdmin::API::Exceptions::StorageReadOnly)
+    expect(TransactionChain.count).to eq(before)
+    expect(EnvironmentDatasetPlan.exists?(environment: environment)).to be(true)
+  end
+
+  it 'validates Guest admission in autocommit and refuses frozen entry without writes' do
+    PROFILE.instance_variable_set(:@instance, profile)
+    request = { 'operation' => 'info', 'key' => '0123456789abcdef' }
+    expect(StorageProfileAcceptance::Guest.validate!(request)).to eq(profile)
+    ordinary_reader { expect(StorageFreezeControl.find(1)).to be_read_write }
+    StorageFreezeControl.find(1).update_columns(mode: StorageFreezeControl.modes.fetch('read_only'))
+    before = catalog_counts
+    frozen = StorageFreezeControl.find(1).attributes
+    expect { StorageProfileAcceptance::Guest.validate!(request) }.to raise_error(VpsAdmin::API::Exceptions::StorageReadOnly)
+    expect(catalog_counts).to eq(before)
+    expect(StorageFreezeControl.find(1).attributes).to eq(frozen)
+    ordinary_reader { expect(StorageFreezeControl.find(1)).to be_read_only }
+  end
+end
+
+RSpec.describe StorageProfileAcceptance::Host do
+  let(:info) do
+    { 'source_id' => 11, 'destination_id' => 12, 'source_node' => 'node1',
+      'destination_node' => 'storage1', 'source_fs' => 'tank/source/fixture', 'settled' => true,
+      'tree_id' => nil, 'branch_id' => nil, 'snapshots' => {} }
+  end
+
+  around do |example|
+    Dir.mktmpdir('profile-payload-') do |directory|
+      File.chmod(0o700, directory)
+      @directory = directory
+      example.run
+    end
+  end
+
+  let(:host) do
+    allow_any_instance_of(described_class).to receive(:command!)
+      .with('dev-session', 'current').and_return('profile-spec')
+    instance = described_class.new(slug: 'profile-spec', artifact_dir: @directory, os_template_id: 1)
+    instance.instance_variable_get(:@request).merge!(
+      'kind' => 'vps', 'user_id' => 10, 'vps_id' => 20, 'source_id' => 11
+    )
+    instance.instance_variable_set(:@info, info)
+    instance
+  end
+
+  it 'checks fresh Guest info before payload SSH and uses intended updated snapshot evidence' do
+    fresh = info.merge('tree_id' => 30, 'branch_id' => 31, 'snapshots' => { '11' => [{ 'id' => 40 }] })
+    expect(host).to receive(:api!).with('info').ordered.and_return(fresh)
+    expect(host).to receive(:remote!).with('node1', /osctl ct exec 20/).ordered
+    host.send(:write_payload!, 'B')
+    expect(host.instance_variable_get(:@info)).to eq(fresh)
+  end
+
+  it 'refuses payload SSH when the fresh Guest observation refuses' do
+    expect(host).to receive(:api!).with('info')
+                                  .and_raise(StorageProfileAcceptance::Invalid, 'fixture observation refused')
+    expect(host).not_to receive(:remote!)
+    expect { host.send(:write_payload!, 'A') }.to raise_error(StorageProfileAcceptance::Invalid, /observation refused/)
+  end
+
+  { 'source_id' => 21, 'destination_id' => 22, 'source_node' => 'node2',
+    'destination_node' => 'node2', 'source_fs' => 'tank/other/fixture', 'settled' => false }.each do |field, changed|
+    it "refuses payload SSH when fresh #{field} differs" do
+      expect(host).to receive(:api!).with('info').and_return(info.merge(field => changed))
+      expect(host).not_to receive(:remote!)
+      expect { host.send(:write_payload!, 'A') }.to raise_error(StorageProfileAcceptance::Invalid, /identity changed/)
+    end
+  end
+
+  it 'refuses payload SSH if the current request no longer matches the bound source' do
+    host.instance_variable_get(:@request)['source_id'] = 21
+    expect(host).to receive(:api!).with('info').and_return(info)
+    expect(host).not_to receive(:remote!)
+    expect { host.send(:write_payload!, 'A') }.to raise_error(StorageProfileAcceptance::Invalid, /identity changed/)
   end
 end

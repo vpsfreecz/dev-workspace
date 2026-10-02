@@ -265,8 +265,14 @@ vpsadmin-devcluster storage-profile <slug> provision
 
 Provision creates missing configured roots through normal Pool chains, waits
 for readiness, commits shared empty snapshot templates, then enrolls existing
-members and confirmed sources. Newly profile-created sources use minimum 2,
-maximum 3 snapshots and maximum age 1800 seconds; new backup copies use minimum
+members and confirmed sources. Its initial admission observation completes in
+a short database transaction. Each chain and template writer checks admission
+again in its own staging transaction; physical waits hold no database
+transaction or freeze lock. A later freeze refuses subsequent work and retains
+previously committed chains and their evidence.
+
+Newly profile-created sources use minimum 2, maximum 3 snapshots and maximum
+age 1800 seconds; new backup copies use minimum
 2, maximum 5 and maximum age 3600 seconds. These are rotation targets after
 successful Backup, not hard growth or physical-space bounds. Failed or locked
 work and snapshot dependencies can retain more history. Existing source
@@ -374,6 +380,10 @@ the guest wrapper invokes only its packaged fixture through the ordinary
 database task. It accepts no arbitrary script path and exports no credentials.
 
 The fixture creates its own member, VPS and NAS child through normal chains.
+Immediately before each payload write, a fresh guest `info` request checks
+read-write mode, settled evidence and the bound source/destination routing.
+The trial requires no concurrent operator freeze change during these direct
+file writes: the observation is not an atomic interlock across DB and SSH.
 It writes only those new objects, verifies full and incremental sends, and
 checks both historical payload versions through normal `UseClone` read-only
 views. Each view must have `readonly=on`, matching checksums and the expected
