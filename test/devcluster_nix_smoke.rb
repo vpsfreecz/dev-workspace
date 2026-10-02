@@ -7,7 +7,10 @@ $stdout.sync = true
 
 # Run outside the build sandbox: Nix evaluates the installed provider flakes
 # through the daemon, using locked test inputs and disposable configuration.
-abort 'Usage: devcluster_nix_smoke.rb PACKAGE VPSADMIN VPSADMINOS VPSF_STATUS VPSADMIN_WEBUI' unless ARGV.length == 5
+storage_profile = ARGV.delete('--storage-profile')
+unless ARGV.length == 5
+  abort 'Usage: devcluster_nix_smoke.rb PACKAGE VPSADMIN VPSADMINOS VPSF_STATUS VPSADMIN_WEBUI [--storage-profile]'
+end
 package, vpsadmin, vpsadminos, status, webui = ARGV
 
 def run!(environment, *command)
@@ -66,10 +69,14 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
       %w[defaults override].each do |variant|
         if variant == 'override'
           config = File.join(workspace, "#{kind}-override.json")
-          File.write(config, JSON.generate(
+          cluster_overrides = {
             'network' => { 'bridge' => 'smoke-br0' },
             'nodes' => { 'node1' => { 'sshPort' => 32123 } }
-          ))
+          }
+          # Exercise explicit disabled selection against the actual default
+          # API input, which has no profile scheduler refresh option.
+          cluster_overrides['storageProfile'] = { 'enable' => false } if kind == 'vpsadmin'
+          File.write(config, JSON.generate(cluster_overrides))
           environment["#{prefix}CONFIG_FILE"] = config
         else
           environment["#{prefix}CONFIG_FILE"] = nil
@@ -80,6 +87,9 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
         abort "Expected a configuration derivation, got #{result.inspect}" unless result.fetch('drvPath').end_with?('.drv')
         rendered = JSON.parse(result.fetch('text'))
         if kind == 'vpsadmin'
+          if rendered.fetch('labels').key?('vpsadminPreservingSeed')
+            abort 'Disabled storage profile emitted a preserving-seed marker'
+          end
           abort 'Disabled WebUI unexpectedly added source labels' unless
             (rendered.fetch('labels').keys & %w[webuiSourceRevision webuiSourceDirty webuiSourceKind]).empty?
           abort 'Disabled WebUI unexpectedly added a credential mount' if rendered.fetch('machines').fetch('services').fetch('sharedFileSystems').key?('webuiCredentials')
@@ -137,7 +147,11 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
                                                   '--apply', 'config: config.drvPath',
                                                   "path:#{source}#cluster-config")
         abort "Invalid #{name} was accepted" if result.success?
-        abort "Invalid #{name} did not report #{error}" unless stderr.include?(error)
+        unless stderr.include?(error)
+          # This request uses only the fixed disposable smoke configuration.
+          warn stderr
+          abort "Invalid #{name} did not report #{error}"
+        end
         environment[name] = original
       end
 
@@ -148,6 +162,51 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
       abort 'Enabled local WebUI was accepted' if result.success?
       abort 'Enabled local WebUI did not report its routing limit' unless stderr.include?('requires bridge networking')
       puts 'vpsadmin: enabled local WebUI refused'
+
+      if storage_profile
+        profile_config = File.join(workspace, 'vpsadmin-storage-profile.json')
+        File.write(profile_config, JSON.generate('storageProfile' => { 'enable' => true }))
+        environment["#{prefix}CONFIG_FILE"] = profile_config
+        environment["#{prefix}TOPOLOGY"] = 'storage'
+        environment["#{prefix}NETWORK"] = 'local'
+        result = JSON.parse(run!(environment, 'nix', 'eval', *common, '--json',
+                                 '--apply', 'config: { drvPath = config.drvPath; text = config.text; }',
+                                 "path:#{source}#cluster-config"))
+        rendered = JSON.parse(result.fetch('text'))
+        marker = JSON.parse(rendered.fetch('labels').fetch('vpsadminPreservingSeed'))
+        abort 'Enabled storage profile marker differs from preserving seed policy' unless
+          marker == { 'version' => 1, 'existingAssignments' => 'preserve' }
+        abort 'Storage profile did not retain the actual storage topology' unless
+          %w[node1 node2 storage1 services].all? { |machine| rendered.fetch('machines').key?(machine) }
+        puts 'vpsadmin: enabled storage profile and actual services closure evaluated'
+
+        File.write(profile_config, JSON.generate('storageProfile' => { 'enable' => true, 'enrollment' => false }))
+        retired_result = JSON.parse(run!(environment, 'nix', 'eval', *common, '--json',
+                                         '--apply', 'config: { drvPath = config.drvPath; text = config.text; }',
+                                         "path:#{source}#cluster-config"))
+        retired = JSON.parse(retired_result.fetch('text'))
+        abort 'Retired storage profile lost its preserving seed marker' unless
+          retired.fetch('labels').fetch('vpsadminPreservingSeed') == rendered.fetch('labels').fetch('vpsadminPreservingSeed')
+        puts 'vpsadmin: retired storage profile retains preserving services closure'
+        [nil, 'false'].each do |invalid|
+          File.write(profile_config, JSON.generate('storageProfile' => { 'enable' => true, 'enrollment' => invalid }))
+          _stdout, stderr, result = Open3.capture3(environment, 'nix', 'eval', *common, '--json',
+                                                   '--apply', 'config: config.drvPath', "path:#{source}#cluster-config")
+          abort 'Storage profile accepted nonboolean enrollment' if result.success?
+          abort 'Invalid enrollment did not report the boolean boundary' unless stderr.include?('must be booleans')
+        end
+        File.write(profile_config, JSON.generate('storageProfile' => { 'enable' => true }))
+
+        environment["#{prefix}TOPOLOGY"] = 'single'
+        _stdout, stderr, result = Open3.capture3(environment, 'nix', 'eval', *common, '--json',
+                                                 '--apply', 'config: config.drvPath', "path:#{source}#cluster-config")
+        abort 'Enabled storage profile accepted an incomplete topology' if result.success?
+        unless stderr.include?('requires storage topology')
+          abort 'Invalid storage topology did not report the profile boundary'
+        end
+        puts 'vpsadmin: storage profile without a storage node refused'
+        environment["#{prefix}TOPOLOGY"] = 'storage'
+      end
     end
 
     output = run!(environment, 'nix', 'build', *common, '--no-link', '--print-out-paths', "path:#{source}#runner")

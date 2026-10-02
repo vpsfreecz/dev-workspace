@@ -328,6 +328,7 @@
               ruby test/devcluster_webui_seed_test.rb
               ruby test/devcluster_runner_test.rb
               ruby test/devcluster_maintenance_test.rb
+              ruby test/devcluster_storage_profile_test.rb
               ruby test/kb_cleanup_test.rb
               ruby test/kb_contract_tools_test.rb
               ruby test/kb_page_test.rb

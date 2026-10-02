@@ -67,9 +67,19 @@ let
       { }
     else if builtins.match "[0-9a-f]{40}" vpsadminWebuiRevision == null then
       throw "Enabled React WebUI requires a 40-character lowercase source revision"
-    else if !(builtins.elem vpsadminWebuiRevisionDirty [ "0" "1" ]) then
+    else if
+      !(builtins.elem vpsadminWebuiRevisionDirty [
+        "0"
+        "1"
+      ])
+    then
       throw "React WebUI source dirty value must be 0 or 1"
-    else if !(builtins.elem vpsadminWebuiSourceKind [ "pinned" "worktree" ]) then
+    else if
+      !(builtins.elem vpsadminWebuiSourceKind [
+        "pinned"
+        "worktree"
+      ])
+    then
       throw "React WebUI source kind must be pinned or worktree"
     else
       {
@@ -77,15 +87,18 @@ let
         webuiSourceDirty = if vpsadminWebuiRevisionDirty == "1" then "true" else "false";
         webuiSourceKind = vpsadminWebuiSourceKind;
       };
-  validNewWebuiDomain = domain:
+  validNewWebuiDomain =
+    domain:
     builtins.isString domain
     && builtins.stringLength domain <= 253
     && (
-      let labels = lib.splitString "." domain; in
+      let
+        labels = lib.splitString "." domain;
+      in
       lib.length labels >= 2
-      && lib.all (label:
-        builtins.stringLength label <= 63
-        && builtins.match "[a-z0-9]([a-z0-9-]*[a-z0-9])?" label != null
+      && lib.all (
+        label:
+        builtins.stringLength label <= 63 && builtins.match "[a-z0-9]([a-z0-9-]*[a-z0-9])?" label != null
       ) labels
     );
   newWebuiDomain =
@@ -95,13 +108,20 @@ let
       throw "Enabled React WebUI requires domains.newadmin"
     else if !(validNewWebuiDomain domains.newadmin) then
       throw "domains.newadmin must be a valid DNS name"
-    else if builtins.elem domains.newadmin ((builtins.attrValues (builtins.removeAttrs domains [ "newadmin" ])) ++ builtins.attrValues tmpDomains) then
+    else if
+      builtins.elem domains.newadmin (
+        (builtins.attrValues (builtins.removeAttrs domains [ "newadmin" ]))
+        ++ builtins.attrValues tmpDomains
+      )
+    then
       throw "domains.newadmin must differ from the other cluster domains"
     else if networkMode != "bridge" then
       throw "React WebUI requires bridge networking; disable newWebui.enable for local mode"
     else if webuiCredentialsDir == "" then
       throw "Enabled React WebUI requires the runtime credential directory path"
-    else if !lib.hasPrefix "/" webuiCredentialsDir || lib.hasPrefix "/nix/store/" webuiCredentialsDir then
+    else if
+      !lib.hasPrefix "/" webuiCredentialsDir || lib.hasPrefix "/nix/store/" webuiCredentialsDir
+    then
       throw "React WebUI credentials must stay outside the Nix store"
     else
       domains.newadmin;
@@ -329,6 +349,28 @@ let
     ++ lib.optional (node ? serverName) node.serverName;
 
   nodeRecords = map (node: node.seedRecord) allNodeList;
+
+  storageProfile = import ./storage-profile.nix {
+    inherit
+      lib
+      devConfig
+      topology
+      seed
+      ;
+    nodeRecords = map (node: { inherit (node) id role; }) allNodeList;
+  };
+  storageProfileJson = pkgs.writeText "vpsadmin-storage-profile.json" (
+    builtins.toJSON storageProfile.config
+  );
+  storageProfileConfigDir = pkgs.runCommand "vpsadmin-storage-profile-config" { } ''
+    mkdir -p "$out"
+    cp ${vpsadmin.outPath}/tests/configs/vpsadmin/api/* "$out/"
+    cp --remove-destination ${./storage-profile/hooks.rb} "$out/hooks.rb"
+    cp --remove-destination ${./storage-profile/dataset_plans.rb} "$out/dataset_plans.rb"
+    cp ${./storage-profile/config.rb} "$out/storage_profile_config.rb"
+    cp ${../lib/storage_profile.rb} "$out/storage_profile_impl.rb"
+    cp ${storageProfileJson} "$out/storage-profile.json"
+  '';
   nodeInventoryRecords = map (node: {
     inherit (node)
       id
@@ -421,6 +463,13 @@ let
   };
 
   devSeed = pkgs.writeText "vpsadmin-devcluster-seed.rb" ''
+    ${lib.optionalString storageProfile.enable ''
+      require '${../lib/storage_profile.rb}'
+      storage_profile = DevClusters::VpsAdminStorageProfile.configure(
+        JSON.parse(File.binread('${storageProfileJson}'))
+      )
+      storage_profile.bootstrap_defaults!
+    ''}
     require 'ipaddress'
     require 'json'
 
@@ -746,6 +795,9 @@ let
     end
 
     def upsert_user_namespace(user, attrs)
+      ${lib.optionalString storageProfile.enable ''
+        return DevClusters::VpsAdminStorageProfile.instance.preserve_namespace!(user)
+      ''}
       namespace_attrs = attrs.fetch('namespace')
       block_start = namespace_attrs.fetch('blockStart')
       block_count = namespace_attrs.fetch('blockCount')
@@ -793,6 +845,9 @@ let
     end
 
     def upsert_user_resources(admin, environment, user, values)
+      ${lib.optionalString storageProfile.enable ''
+        return DevClusters::VpsAdminStorageProfile.instance.preserve_seed_resources!(admin, environment, user, values)
+      ''}
       package = ClusterResourcePackage.find_or_initialize_by(
         environment: environment,
         user: user
@@ -867,14 +922,16 @@ let
         environment: environment,
         user: user
       )
-      config.assign_attributes(
-        can_create_vps: attrs.fetch('canCreateVps', true),
-        can_destroy_vps: attrs.fetch('canDestroyVps', true),
-        vps_lifetime: attrs.fetch('vpsLifetime', environment.vps_lifetime),
-        max_vps_count: attrs.fetch('maxVpsCount', 5),
-        default: true
-      )
-      config.save!
+      if config.new_record? || ${if storageProfile.enable then "false" else "true"}
+        config.assign_attributes(
+          can_create_vps: attrs.fetch('canCreateVps', true),
+          can_destroy_vps: attrs.fetch('canDestroyVps', true),
+          vps_lifetime: attrs.fetch('vpsLifetime', environment.vps_lifetime),
+          max_vps_count: attrs.fetch('maxVpsCount', 5),
+          default: true
+        )
+        config.save!
+      end
 
       upsert_user_namespace(user, attrs)
       upsert_user_resources(admin, environment, user, resources)
@@ -944,9 +1001,11 @@ let
   // optionalAttrs (webSourcePath != "") {
     web = webSourcePath;
   };
-  servicesSharedFileSystems = sharedFileSystems // optionalAttrs newWebuiEnabled {
-    webuiCredentials = webuiCredentialsDir;
-  };
+  servicesSharedFileSystems =
+    sharedFileSystems
+    // optionalAttrs newWebuiEnabled {
+      webuiCredentials = webuiCredentialsDir;
+    };
 
   sharedMounts = {
     "/mnt/vpsadmin" = {
@@ -1070,6 +1129,94 @@ let
       ...
     }:
     let
+      profileProvisionCommand = pkgs.writeShellApplication {
+        name = "vpsadmin-storage-profile";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.util-linux
+        ];
+        text = ''
+          operation="''${1:-}"
+          if [ "$#" -ne 1 ] || ! [[ "$operation" =~ ^(inspect|provision|retire)$ ]]; then
+            echo 'storage profile requires inspect, provision or retire' >&2
+            exit 2
+          fi
+          if [ "$(id -u)" -ne 0 ]; then
+            echo 'storage profile provisioner requires the owned services administrator' >&2
+            exit 1
+          fi
+          private_dir=$(mktemp -d /run/vpsadmin-storage-profile.XXXXXXXX)
+          chmod 0700 "$private_dir"
+          chown ${config.vpsadmin.databaseSetup.user}:${config.vpsadmin.databaseSetup.group} "$private_dir"
+          completed=0
+          cleanup() {
+            status=$?
+            if [ "$status" -eq 0 ] && [ "$completed" -eq 1 ]; then
+              rm -f -- "$private_dir/report.json" "$private_dir/rake.log"
+              rmdir -- "$private_dir"
+            else
+              echo "storage profile failed; private diagnostics: $private_dir" >&2
+            fi
+          }
+          trap cleanup EXIT
+          cd ${config.vpsadmin.databaseSetup.package}/database
+          if ! runuser -u ${config.vpsadmin.databaseSetup.user} -g ${config.vpsadmin.databaseSetup.group} -- \
+            env RACK_ENV=production SCHEMA=${config.vpsadmin.databaseSetup.stateDirectory}/cache/schema.rb \
+              STORAGE_PROFILE_OPERATION="$operation" STORAGE_PROFILE_REPORT="$private_dir/report.json" \
+              ${config.vpsadmin.databaseSetup.package}/ruby-env/bin/bundle exec rake db:seed:file \
+              SEED_FILE=${./storage-profile-provision.rb} >"$private_dir/rake.log" 2>&1; then
+            exit 1
+          fi
+          test -f "$private_dir/report.json"
+          test "$(wc -c <"$private_dir/report.json")" -le 8192
+          cat "$private_dir/report.json"
+          completed=1
+        '';
+      };
+      profileAcceptanceCommand = pkgs.writeShellApplication {
+        name = "vpsadmin-storage-profile-acceptance";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.util-linux
+        ];
+        text = ''
+          if [ "$#" -ne 1 ] || [ "''${#1}" -gt 10924 ] || [ "$(id -u)" -ne 0 ]; then
+            echo 'invalid owned storage fixture request' >&2
+            exit 2
+          fi
+          private_dir=$(mktemp -d /run/vpsadmin-storage-fixture.XXXXXXXX)
+          chmod 0700 "$private_dir"
+          chown ${config.vpsadmin.databaseSetup.user}:${config.vpsadmin.databaseSetup.group} "$private_dir"
+          cd ${config.vpsadmin.databaseSetup.package}/database
+          if ! runuser -u ${config.vpsadmin.databaseSetup.user} -g ${config.vpsadmin.databaseSetup.group} -- \
+            env RACK_ENV=production SCHEMA=${config.vpsadmin.databaseSetup.stateDirectory}/cache/schema.rb \
+              STORAGE_PROFILE_ACCEPTANCE_MODE=guest STORAGE_PROFILE_ACCEPTANCE_REQUEST="$1" \
+              STORAGE_PROFILE_ACCEPTANCE_NODE_MAP=${
+                pkgs.writeText "storage-profile-fixture-nodes.json" (
+                  builtins.toJSON (
+                    builtins.listToAttrs (
+                      map (node: {
+                        name = toString node.id;
+                        value = node.machineName;
+                      }) nodeList
+                    )
+                  )
+                )
+              } \
+              STORAGE_PROFILE_ACCEPTANCE_REPORT="$private_dir/report.json" \
+              ${config.vpsadmin.databaseSetup.package}/ruby-env/bin/bundle exec rake db:seed:file \
+              SEED_FILE=${../tests/storage-profile-acceptance.rb} >"$private_dir/rake.log" 2>&1; then
+            echo "storage fixture failed; private diagnostics: $private_dir" >&2
+            exit 1
+          fi
+          test -f "$private_dir/report.json"
+          test "$(wc -c <"$private_dir/report.json")" -le 262144
+          cat "$private_dir/report.json"
+          rm -- "$private_dir/report.json" "$private_dir/rake.log"
+          rm -f -- "$private_dir/admitted.json"
+          rmdir -- "$private_dir"
+        '';
+      };
       newWebuiProxyHeaders = ''
         proxy_http_version 1.1;
         proxy_set_header Connection "";
@@ -1148,8 +1295,12 @@ let
           assertion =
             config.containers.newadmin.autoStart
             && builtins.elem "machines.target" config.systemd.services."container@newadmin".wantedBy
-            && builtins.elem "vpsadmin-devcluster-webui-seed.service" config.systemd.services."container@newadmin".requires
-            && builtins.elem "vpsadmin-devcluster-webui-seed.service" config.systemd.services."container@newadmin".after;
+            &&
+              builtins.elem "vpsadmin-devcluster-webui-seed.service"
+                config.systemd.services."container@newadmin".requires
+            &&
+              builtins.elem "vpsadmin-devcluster-webui-seed.service"
+                config.systemd.services."container@newadmin".after;
           message = "Enabled React WebUI container must auto-start after its OAuth seed";
         }
         ++ lib.optional (!newWebuiEnabled) {
@@ -1230,22 +1381,27 @@ let
         };
       };
 
-      fileSystems = sharedMounts // optionalAttrs newWebuiEnabled {
-        "/mnt/vpsadmin-webui-credentials" = {
-          device = "webuiCredentials";
-          fsType = "virtiofs";
-          options = [ "nofail" "ro" ];
+      fileSystems =
+        sharedMounts
+        // optionalAttrs newWebuiEnabled {
+          "/mnt/vpsadmin-webui-credentials" = {
+            device = "webuiCredentials";
+            fsType = "virtiofs";
+            options = [
+              "nofail"
+              "ro"
+            ];
+          };
         };
-      };
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
 
-      environment.systemPackages = lib.mkIf webEnabled (
-        with pkgs;
-        [
-          xz
-        ]
-      );
+      environment.systemPackages =
+        lib.optional webEnabled pkgs.xz
+        ++ lib.optionals storageProfile.enable [
+          profileProvisionCommand
+          profileAcceptanceCommand
+        ];
 
       users = lib.mkIf webEnabled {
         users.vpsfree = {
@@ -1358,6 +1514,16 @@ let
           "test.nix"
           "${devSeed}"
         ];
+        databaseSetup.configDirectory = lib.mkIf storageProfile.enable (
+          lib.mkForce storageProfileConfigDir
+        );
+        api.configDirectory = lib.mkIf storageProfile.enable (lib.mkForce storageProfileConfigDir);
+        supervisor.configDirectory = lib.mkIf storageProfile.enable (lib.mkForce storageProfileConfigDir);
+        # The default API does not declare this profile-only scheduler option.
+        # mkIf false retains its option path; omit the definition instead.
+        api.scheduler = lib.optionalAttrs storageProfile.enable {
+          taskRefreshInterval = 60;
+        };
 
         varnish.api = {
           test.domain = lib.mkForce domains.api;
@@ -1689,7 +1855,8 @@ let
           imports = [ vpsadminWebui.nixosModules.default ];
           networking.hosts = devHosts;
           security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
-          systemd.services.vpsadmin-webui-bff.environment.NODE_EXTRA_CA_CERTS = "${certStoreDir}/vpsadmin-ca.crt";
+          systemd.services.vpsadmin-webui-bff.environment.NODE_EXTRA_CA_CERTS =
+            "${certStoreDir}/vpsadmin-ca.crt";
           services."vpsadmin-webui" = {
             enable = true;
             frontendPackage = vpsadminWebui.packages.${pkgs.stdenv.hostPlatform.system}.frontend;
@@ -1891,7 +2058,7 @@ in
   description = ''
     Branch-selected vpsAdmin development cluster for ${slug}.
   '';
-  labels = webuiSourceLabels;
+  labels = webuiSourceLabels // storageProfile.preservingSeedMarker;
 
   machines = {
     services = {
