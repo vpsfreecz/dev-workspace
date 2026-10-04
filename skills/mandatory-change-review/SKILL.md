@@ -1,16 +1,28 @@
 ---
 name: mandatory-change-review
-description: Run the required adaptive review of committed vpsFree.cz development changes after quick verification and before integration tests. Use for feature, bugfix, refactor, or cross-project work that changes code, schemas, APIs, protocols, configuration, documentation, tests, deployment behavior, or security posture; skip only dependency-only or generated update sessions without relevant code changes.
+description: Run independent final review of completed substantive vpsFree.cz deliverables after all intended changes are committed and quick checks pass, before long integration tests. Includes code, schemas, APIs, protocols, configuration, documentation, instructions, tests, deployment and security changes. Routine planning, investigation, findings, session tracking and evidence alone never trigger automatic review. Earlier review requires an explicit user request, is advisory, and does not replace final review; mechanical dependency/generated updates remain exempt when they contain no substantive changes.
 ---
 
 # Mandatory Change Review
 
 ## Purpose
 
-Use this skill after all intended changes are committed and quick local
-verification has passed, but before long integration tests are started. The
-review is advisory, but Blocking and Important findings must be addressed as
-described below before continuing.
+Use this skill for final review after the intended substantive deliverable is
+complete, all intended changes are committed and quick local verification has
+passed, but before long integration tests are started. Completed substantive
+documentation, instructions and configuration deliverables remain in scope,
+alongside code, schema, API, protocol, test, deployment and security changes.
+The review is advisory, but Blocking and Important findings must be addressed
+as described below before continuing.
+
+Routine planning, investigation, findings, design reconciliation, session
+tracking (plans/state) and evidence alone never trigger automatic review.
+These records provide context for final review. Merely having a reviewer in a
+preset creates no assignment. Earlier review requires an explicit user request:
+inspect the requested scope and report advisory findings as an early review.
+It does not require a completed or committed implementation, does not claim
+final readiness, and does not replace final committed-deliverable review.
+Apply the final workflow below when the substantive deliverable is ready.
 
 The coordinating agent assigns one independent reviewer the adaptive set of
 applicable review lanes. Prefer an eligible retained member whose saved purpose
@@ -97,9 +109,13 @@ into a superficial general review.
 
 ## Main Agent Workflow
 
-1. Confirm the review is required. Skip only when the session contains no
-   relevant code or design change, such as dependency-only updates, generated
-   lockfile refreshes, or other mechanical metadata updates.
+1. Confirm that the intended substantive deliverable is complete. Routine
+   planning, investigation, findings, session tracking and evidence alone do
+   not trigger review. Completed substantive documentation and configuration
+   deliverables do require final review. Earlier review requires an explicit
+   user request, is advisory, and does not replace this final workflow. Skip
+   genuinely mechanical dependency-only updates, generated lockfile refreshes
+   or metadata updates when they contain no substantive changes.
 2. Make sure all intended changes are committed in every affected repository.
    Do not review a half-staged or partly uncommitted implementation.
    Before claiming an unmerged feature branch ready, arrange a final review of
@@ -179,7 +195,9 @@ into a superficial general review.
 
 ## Shared Reviewer Instructions
 
-Review committed changes across all affected projects. Inspect diffs, commit
+For final review, review committed changes across all affected projects. For
+explicitly requested early review, inspect the requested scope and report
+advisory findings without claiming final readiness. Inspect diffs, commit
 history, local `AGENTS.md` files, relevant tests, documentation, and project
 context before forming conclusions. Review the commit series, not only the
 final tree, and compare it with the user request and initiative plan/state.

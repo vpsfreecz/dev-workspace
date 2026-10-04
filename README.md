@@ -14,6 +14,14 @@ explains document ownership and rationale capture. This extension connects that
 workflow to its review packets and handoffs; each consuming workspace names its
 project and site-specific documentation destinations.
 
+The [mandatory review skill](skills/mandatory-change-review/SKILL.md) owns final
+review routing. Invoke it for completed substantive deliverables, including
+standalone documentation and configuration changes, after commits and quick
+checks and before long integration tests. Routine planning, investigation,
+findings, session tracking and evidence alone cause no automatic review.
+Explicitly requested early review is advisory and does not replace final review.
+Solo sessions use a temporary independent reviewer without changing their roster.
+
 Concrete endpoints, credential paths, and development-cluster defaults are not
 stored here. A consuming workspace passes them to `lib.mkPackage`:
 

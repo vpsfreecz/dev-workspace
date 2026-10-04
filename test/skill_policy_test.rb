@@ -17,6 +17,23 @@ class SkillPolicyTest < Minitest::Test
     assert_match(/does not add a member or change the roster/, skill)
   end
 
+  def test_review_starts_at_completed_deliverables_and_early_review_is_explicit
+    skill = File.read(File.join(ROOT, 'skills/mandatory-change-review/SKILL.md'))
+    metadata = File.read(File.join(ROOT, 'skills/mandatory-change-review/agents/openai.yaml'))
+
+    assert_match(/deliverable is\s+complete, all intended changes are committed and quick local verification has\s+passed/, skill)
+    assert_match(/before long integration tests are started/, skill)
+    assert_match(/Completed substantive\s+documentation, instructions and configuration deliverables remain in scope/, skill)
+    assert_match(/Routine planning, investigation, findings, design reconciliation, session\s+tracking \(plans\/state\) and evidence alone never trigger automatic review/, skill)
+    assert_match(/Earlier review requires an explicit user request/, skill)
+    assert_match(/report advisory findings as an early review/, skill)
+    assert_match(/does not replace final committed-deliverable review/, skill)
+    assert_match(/no substantive changes/, skill)
+    assert_includes(metadata, 'completed substantive deliverable')
+    assert_includes(metadata, 'quick checks pass')
+    assert_includes(metadata, 'Earlier review requires an explicit user request')
+  end
+
   def test_final_review_requires_complete_history_and_explicit_conclusions
     skill = File.read(File.join(ROOT, 'skills/mandatory-change-review/SKILL.md'))
     general = File.read(File.join(ROOT, 'skills/mandatory-change-review/references/general-review.md'))

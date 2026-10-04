@@ -1,4 +1,4 @@
 interface:
   display_name: "Mandatory Change Review"
-  short_description: "Review committed changes before long tests."
-  default_prompt: "Use $mandatory-change-review to review the committed changes before integration tests."
+  short_description: "Final review after commits and quick checks."
+  default_prompt: "Use $mandatory-change-review for final review of the completed substantive deliverable after all intended changes are committed and quick checks pass, before long integration tests. Do not automatically review routine planning, investigation or session tracking. Earlier review requires an explicit user request, is advisory, and does not replace final review."
