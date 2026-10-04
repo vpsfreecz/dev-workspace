@@ -5,6 +5,7 @@ require 'minitest/autorun'
 require 'open3'
 require 'rbconfig'
 require 'tmpdir'
+require_relative '../dev-clusters/vpsadmin/lib/maintenance'
 
 class DevclusterCommandsTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
@@ -493,7 +494,400 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_failed_guest_requisite_query_keeps_target_pending_without_root_or_promotion
+    with_workspace('vpsadmin') do |env, directory|
+      proof_env = selection_proof_environment(env).merge('FAIL_PROOF_QUERY' => '1')
+      result = run_helper('vpsadmin', proof_env, 'update', 'node1')
+      assert_equal(23, result.exitstatus, @last_output)
+      applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      assert_equal(['node1'], applied.fetch('pending').fetch('targets'))
+      assert_empty(applied.fetch('provenance'))
+      assert_equal(['--query'], File.readlines(proof_env.fetch('TEST_PROOF_EVENTS'), chomp: true))
+      assert_locks_released(env)
+    end
+  end
+
+  def test_guest_closure_and_root_proof_promotes_only_the_updated_target
+    with_workspace('vpsadmin') do |env, directory|
+      proof_env = selection_proof_environment(env)
+      result = run_helper('vpsadmin', proof_env, 'update', 'node1')
+      assert(result.success?, @last_output)
+      applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      assert_nil(applied.fetch('pending'))
+      assert_equal(['node1'], applied.fetch('provenance').keys)
+      assert_equal(%w[--query --check-validity --add-root], File.readlines(proof_env.fetch('TEST_PROOF_EVENTS'), chomp: true))
+    end
+  end
+
+  def test_failed_applied_source_root_leaves_pending_before_copy
+    with_workspace('vpsadmin') do |env, directory|
+      result = run_helper('vpsadmin', env.merge('FAIL_GC_ROOT' => '1'), 'update', 'node1')
+      refute(result.success?, @last_output)
+      applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      assert_equal(['node1'], applied.fetch('pending').fetch('targets'))
+      assert_empty(applied.fetch('provenance'))
+      refute(events(env).any? { |event| %w[copy activate].include?(event['event']) })
+    end
+  end
+
+  def test_payload_registration_failure_prevents_fresh_runner_and_target_effects
+    %w[start update].each do |operation|
+      with_workspace('vpsadmin') do |env, directory|
+        attempt = events(env).length
+        result = run_helper('vpsadmin', env.merge('FAIL_PAYLOAD_ROOT' => '1'), operation, operation == 'update' ? 'node1' : nil)
+        refute(result.success?, @last_output)
+        target = operation == 'update' ? 'node1' : 'services'
+        assert_payload_root_refusal(env, attempt, File.join(env.fetch('TEST_STORE'), "fixture-#{target}-kernel"))
+        refute(events(env).any? { |event| %w[run copy activate selection-proof].include?(event['event']) })
+        if operation == 'update'
+          applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+          assert_equal(['node1'], applied.fetch('pending').fetch('targets'))
+          assert_empty(applied.fetch('provenance'))
+        else
+          refute(File.exist?(File.join(directory, 'applied-config.json')))
+        end
+      end
+    end
+  end
+
+  def test_update_roots_only_the_candidate_target_and_retains_previously_proved_payloads
+    with_workspace('vpsadmin') do |env, directory|
+      assert(run_helper('vpsadmin', env, 'start').success?, @last_output)
+      old_roots = Dir.glob(File.join(directory, 'maintenance-payload-*'))
+      machines = fixture_machines
+      machines.fetch('services')['toplevel'] += '-unproved'
+      machines.fetch('node1')['squashfs'] += '-updated'
+      env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
+      assert(run_helper('vpsadmin', env, 'update', 'node1').success?, @last_output)
+      targets = Dir.glob(File.join(directory, 'maintenance-payload-*')).map { |path| File.readlink(path) }
+      assert_includes(targets, env.fetch('TEST_STORE') + '/fixture-node1-squashfs-updated')
+      refute_includes(targets, env.fetch('TEST_STORE') + '/fixture-services-unproved')
+      assert(old_roots.all? { |path| File.symlink?(path) })
+      copy = events(env).index { |event| event['event'] == 'copy' }
+      assert(events(env)[0...copy].any? { |event| event['event'] == 'payload-root' && event['item'].end_with?('-updated') })
+      applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      assert_equal(machines.fetch('node1'), applied.fetch('configuration').fetch('machines').fetch('node1'))
+      refute_equal(machines.fetch('services'), applied.fetch('configuration').fetch('machines').fetch('services'))
+    end
+  end
+
+  def test_recovery_roots_selected_payloads_not_superseded_dns_and_retry_repairs_or_refuses
+    with_workspace('vpsadmin') do |env, directory|
+      with_recovery_selection(env, directory) do |evidence|
+        FileUtils.rm_rf(File.join(env.fetch('TEST_STORE'), 'old-dns-primary-not-copied'))
+        command = [File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'), 'maintenance-recover-config',
+                   env.fetch('TEST_SLUG'), '--residency-evidence', evidence]
+        _, error, result = Open3.capture3(env, *command)
+        assert(result.success?, error)
+        record = File.join(directory, 'maintenance-hold.json')
+        before = File.binread(record)
+        applied = File.binread(File.join(directory, 'applied-config.json'))
+        selected = File.join(env.fetch('TEST_STORE'), 'old-dns-primary')
+        root = File.join(directory, "maintenance-payload-#{Digest::SHA256.hexdigest(selected)}")
+        assert_equal(selected, File.readlink(root))
+        refute(Dir.glob(File.join(directory, 'maintenance-payload-*')).any? { |path| File.readlink(path).end_with?('-not-copied') })
+        File.unlink(root)
+        _, error, result = Open3.capture3(env, *command)
+        assert(result.success?, error)
+        assert_equal(selected, File.readlink(root))
+        assert_equal(before, File.binread(record))
+        assert_equal(applied, File.binread(File.join(directory, 'applied-config.json')))
+        # An on-disk item can lose its Nix registration. Keep it present so
+        # the real helper reaches the controlled store-validity refusal.
+        attempt = events(env).length
+        _, error, result = Open3.capture3(env.merge('FAIL_VALIDITY_ITEM' => selected), *command)
+        refute(result.success?)
+        assert_equal([{ 'event' => 'store-validity-refused', 'item' => selected }],
+          events(env).drop(attempt).select { |event| event['event'] == 'store-validity-refused' })
+        assert_equal(before, File.binread(record))
+        assert_equal(applied, File.binread(File.join(directory, 'applied-config.json')))
+        refute(events(env).any? { |event| %w[build run copy activate ssh selection-proof].include?(event['event']) })
+      end
+    end
+  end
+
+  def test_payload_registration_failure_keeps_recovery_predecessor_and_blocks_copied_boot
+    with_workspace('vpsadmin') do |env, directory|
+      with_recovery_selection(env, directory) do |evidence|
+        command = File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster')
+        record = File.join(directory, 'maintenance-hold.json')
+        before = File.binread(record)
+        attempt = events(env).length
+        _, error, result = Open3.capture3(env.merge('FAIL_PAYLOAD_ROOT' => '1'), command,
+          'maintenance-recover-config', env.fetch('TEST_SLUG'), '--residency-evidence', evidence)
+        refute(result.success?)
+        assert_payload_root_refusal(env, attempt, File.join(env.fetch('TEST_STORE'), 'kernel'))
+        assert_equal(before, File.binread(record))
+        refute(File.exist?(File.join(directory, 'applied-config.json')))
+        roots = Dir.glob(File.join(directory, 'maintenance-source-*'))
+        refute_empty(roots)
+        attempt = events(env).length
+        _, error, result = Open3.capture3(env.merge('FAIL_PAYLOAD_ROOT' => '1'), command,
+          'start', env.fetch('TEST_SLUG'), '--copied-config')
+        refute(result.success?)
+        assert_payload_root_refusal(env, attempt, File.join(env.fetch('TEST_STORE'), 'kernel'))
+        assert_equal('starting_copied', JSON.parse(File.read(record)).fetch('phase'))
+        assert(roots.all? { |path| File.symlink?(path) })
+        assert_equal('copied_boot', JSON.parse(File.read(File.join(directory, 'applied-config.json'))).fetch('pending').fetch('operation'))
+        refute(events(env).any? { |event| %w[run copy activate ssh selection-proof].include?(event['event']) })
+      end
+    end
+  end
+
+  def test_maintenance_payload_failure_precedes_system_inspection_and_masked_launch
+    with_workspace('vpsadmin') do |env, directory|
+      with_recovery_selection(env, directory) do |_evidence, resident, residency, top|
+        before = File.binread(File.join(directory, 'maintenance-hold.json'))
+        attempt = events(env).length
+        _, error, result = Open3.capture3(env.merge('FAIL_PAYLOAD_ROOT' => '1'),
+          File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'), 'maintenance-start', env.fetch('TEST_SLUG'),
+          '--resident-config', resident, '--expect-services-toplevel', top, '--residency-evidence', residency)
+        refute(result.success?)
+        assert_payload_root_refusal(env, attempt, File.join(env.fetch('TEST_STORE'), 'kernel'))
+        assert_equal(before, File.binread(File.join(directory, 'maintenance-hold.json')))
+        refute(events(env).any? { |event| %w[run copy activate ssh].include?(event['event']) })
+      end
+    end
+  end
+
+  def test_public_recovery_is_metadata_only_and_root_failure_preserves_original_hold
+    [true, false].each do |root_failure|
+      with_workspace('vpsadmin') do |env, directory|
+        with_recovery_selection(env, directory) do |evidence|
+          before = File.binread(File.join(directory, 'maintenance-hold.json'))
+          arguments = [File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'), 'maintenance-recover-config',
+                       env.fetch('TEST_SLUG'), '--residency-evidence', evidence]
+          stdout, stderr, result = Open3.capture3(env.merge('FAIL_GC_ROOT' => root_failure ? '1' : '0'), *arguments)
+          if root_failure
+            refute(result.success?, stdout + stderr)
+            assert_equal(before, File.binread(File.join(directory, 'maintenance-hold.json')))
+            refute(File.exist?(File.join(directory, 'applied-config.json')))
+          else
+            assert(result.success?, stdout + stderr)
+            hold = JSON.parse(File.read(File.join(directory, 'maintenance-hold.json')))
+            assert_equal(2, hold.fetch('version'))
+            assert_equal('copied', hold.fetch('phase'))
+            assert_equal(before, File.binread(hold.fetch('predecessor').fetch('path')))
+            applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+            assert_equal('copied_boot', applied.fetch('pending').fetch('operation'))
+            current = File.binread(File.join(directory, 'maintenance-hold.json'))
+            _, retry_stderr, retry_result = Open3.capture3(env, *arguments)
+            assert(retry_result.success?, retry_stderr)
+            assert_equal(current, File.binread(File.join(directory, 'maintenance-hold.json')))
+          end
+          refute(events(env).any? { |event| %w[build run copy activate ssh selection-proof].include?(event['event']) })
+          assert_locks_released(env)
+        end
+      end
+    end
+  end
+
+  def test_public_maintenance_start_never_launches_old_services_after_recovery
+    with_workspace('vpsadmin') do |env, directory|
+      with_recovery_selection(env, directory) do |evidence, resident, residency, top|
+        command = File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster')
+        _, errors, recovered = Open3.capture3(env, command, 'maintenance-recover-config', env.fetch('TEST_SLUG'),
+                                            '--residency-evidence', evidence)
+        assert(recovered.success?, errors)
+        before = File.binread(File.join(directory, 'maintenance-hold.json'))
+        stdout, stderr, result = Open3.capture3(env, command, 'maintenance-start', env.fetch('TEST_SLUG'),
+          '--resident-config', resident, '--expect-services-toplevel', top, '--residency-evidence', residency)
+        refute(result.success?, stdout + stderr)
+        assert_equal(before, File.binread(File.join(directory, 'maintenance-hold.json')))
+        refute(events(env).any? { |event| %w[run copy activate ssh].include?(event['event']) })
+        refute(File.exist?(File.join(directory, 'ready')))
+      end
+    end
+  end
+
+  def test_legacy_images_refuse_cold_start_without_inventing_residency
+    with_workspace('vpsadmin', retained: true) do |env, directory|
+      FileUtils.mkdir_p(File.join(directory, 'state'))
+      File.write(File.join(directory, 'state/services-root.img'), 'existing retained image')
+      result = run_helper('vpsadmin', env, 'start')
+      refute(result.success?)
+      refute(events(env).any? { |event| event['event'] == 'run' })
+      refute(File.exist?(File.join(directory, 'applied-config.json')))
+    end
+  end
+
+  def test_retained_start_refuses_changed_layout_and_ignores_unapplied_boot_payloads
+    with_workspace('vpsadmin') do |env, directory|
+      assert(run_helper('vpsadmin', env, 'start').success?, @last_output)
+      original = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      pending_before = File.binread(File.join(directory, 'applied-config.json'))
+      machines = fixture_machines
+      machines.fetch('node1')['networks'] = [{ 'type' => 'bridge', 'name' => 'changed-routing' }]
+      env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
+      runs = events(env).count { |event| event['event'] == 'run' }
+      refute(run_helper('vpsadmin', env, 'start').success?)
+      assert_equal(runs, events(env).count { |event| event['event'] == 'run' })
+      assert_equal(pending_before, File.binread(File.join(directory, 'applied-config.json')))
+      machines = fixture_machines
+      machines.fetch('services')['toplevel'] += '-new-unapplied'
+      machines.fetch('node1')['squashfs'] += '-new-unapplied'
+      env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
+      assert(run_helper('vpsadmin', env, 'start').success?, @last_output)
+      runner = events(env).select { |event| event['event'] == 'run' }.last
+      config_arg = runner.fetch('argv').index('--config') + 1
+      actual_boot = JSON.parse(File.read(runner.fetch('argv').fetch(config_arg)))
+      assert_equal(original.fetch('configuration'), actual_boot)
+      assert_equal(original.fetch('configuration'), JSON.parse(File.read(File.join(directory, 'applied-config.json'))).fetch('configuration'))
+    end
+  end
+
+  def test_recovery_accepts_only_fixed_evidence_argument_and_refuses_a_live_runner
+    with_workspace('vpsadmin') do |env, directory|
+      with_profile_runner(env, directory) do
+        before = events(env)
+        stdout, stderr, result = Open3.capture3(env, File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'),
+          'maintenance-recover-config', env.fetch('TEST_SLUG'), '--residency-evidence', '/fixture/evidence.json')
+        refute(result.success?, stdout + stderr)
+        assert_equal(before, events(env))
+        refute(File.exist?(File.join(directory, 'maintenance-hold.json')))
+      end
+    end
+    [[], ['--force'], ['--residency-evidence', '/fixture/evidence', '--config', '/fixture/config']].each do |arguments|
+      with_workspace('vpsadmin') do |env, _directory|
+        stdout, stderr, result = Open3.capture3(env, File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'),
+          'maintenance-recover-config', env.fetch('TEST_SLUG'), *arguments)
+        refute(result.success?, stdout + stderr)
+        assert_empty(events(env))
+      end
+    end
+  end
+
   private
+
+  def assert_payload_root_refusal(env, attempt, item)
+    directory = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), '.dev-clusters', 'vpsadmin', 'clusters', env.fetch('TEST_SLUG'))
+    root = File.join(directory, "maintenance-payload-#{Digest::SHA256.hexdigest(item)}")
+    assert_equal([{ 'event' => 'payload-root-refused', 'item' => item, 'root' => root }],
+      events(env).drop(attempt).select { |event| event['event'] == 'payload-root-refused' })
+  end
+
+  def write_host_payloads(store, machines)
+    machines.each_value do |machine|
+      %w[toplevel qemu virtiofsd].each do |field|
+        path = machine.fetch(field).sub('/nix/store/', store + '/')
+        FileUtils.mkdir_p(path)
+      end
+      %w[qemu virtiofsd].each do |field|
+        package = machine.fetch(field).sub('/nix/store/', store + '/')
+        executable = File.join(package, 'bin', field == 'qemu' ? 'qemu-kvm' : 'virtiofsd')
+        FileUtils.mkdir_p(File.dirname(executable))
+        File.write(executable, 'fixture executable')
+        File.chmod(0o755, executable)
+      end
+      %w[kernel initrd squashfs].each do |field|
+        next unless machine[field]
+
+        path = machine.fetch(field).sub('/nix/store/', store + '/')
+        FileUtils.mkdir_p(File.dirname(path))
+        File.write(path, 'fixture host boot payload')
+      end
+    end
+  end
+
+  def fixture_machines
+    %w[services node1 node2].to_h do |name|
+      machine = { 'spin' => name == 'services' ? 'nixos' : 'vpsadminos',
+                  'qemu' => '/nix/store/fixture-tools', 'virtiofsd' => '/nix/store/fixture-tools',
+                  'toplevel' => "/nix/store/fixture-#{name}",
+                  'kernel' => "/nix/store/fixture-#{name}-kernel", 'initrd' => "/nix/store/fixture-#{name}-initrd" }
+      disk = { 'device' => '{machine}-root.img', 'type' => 'file',
+               'create' => true, 'preserve' => true, 'size' => '1G' }
+      if name == 'services'
+        machine['rootDisk'] = disk
+      else
+        machine['disks'] = [disk]
+        machine['squashfs'] = "/nix/store/fixture-#{name}-squashfs"
+      end
+      [name, machine]
+    end
+  end
+
+  def with_recovery_selection(env, directory)
+    store = env.fetch('TEST_STORE')
+    state = File.join(directory, 'state')
+    FileUtils.mkdir_p(state)
+    File.write(File.join(directory, 'network'), "bridge\n")
+    qemu = File.join(store, 'qemu')
+    FileUtils.mkdir_p(File.join(qemu, 'bin'))
+    File.write(File.join(qemu, 'bin/qemu-kvm'), 'fixture')
+    File.chmod(0o755, File.join(qemu, 'bin/qemu-kvm'))
+    historic = { 'machines' => fixture_machines }
+    historic.fetch('machines')['dns-primary'] = historic.fetch('machines').fetch('services').dup
+    historic.fetch('machines').each do |name, machine|
+      machine['toplevel'] = File.join(store, "old-#{name}")
+      machine['kernel'] = File.join(store, 'kernel')
+      machine['initrd'] = File.join(store, 'initrd')
+      machine['qemu'] = qemu
+      machine['virtiofsd'] = qemu
+      File.write(File.join(state, "#{name}-root.img"), 'retained fixture image')
+    end
+    historic_path = File.join(store, 'historic.json')
+    File.write(historic_path, JSON.generate(historic))
+    selected = JSON.parse(JSON.generate(historic))
+    selected.fetch('machines').fetch('dns-primary')['toplevel'] += '-not-copied'
+    resident_path = File.join(store, 'legacy-selected.json')
+    File.write(resident_path, JSON.generate(selected))
+    candidate = JSON.parse(JSON.generate(selected))
+    candidate.fetch('machines').fetch('services')['toplevel'] += '-copied'
+    candidate['labels'] = { 'vpsadminPreservingSeed' => '{"version":1,"existingAssignments":"preserve"}' }
+    candidate_path = File.join(store, 'candidate.json')
+    File.write(candidate_path, JSON.generate(candidate))
+    write_host_payloads(store, historic.fetch('machines'))
+    write_host_payloads(store, selected.fetch('machines'))
+    write_host_payloads(store, candidate.fetch('machines'))
+    evidence = File.join(directory, 'residency.json')
+    File.write(evidence, JSON.generate('version' => 1, 'workspace' => env.fetch('DEVCLUSTER_WORKSPACE'),
+      'slug' => env.fetch('TEST_SLUG'), 'resident_config' => resident_path,
+      'resident_config_sha256' => Digest::SHA256.file(resident_path).hexdigest,
+      'services_toplevel' => selected.fetch('machines').fetch('services').fetch('toplevel'),
+      'evidence_kind' => 'prior_activation', 'evidence_reference' => 'fixture real services residency; DNS unproved'))
+    File.chmod(0o600, evidence)
+    helper = DevClusters::VpsAdminMaintenance.new(workspace: env.fetch('DEVCLUSTER_WORKSPACE'),
+      slug: env.fetch('TEST_SLUG'), directory: directory, store_root: store)
+    helper.prepare!(config_path: resident_path,
+      services_toplevel: selected.fetch('machines').fetch('services').fetch('toplevel'), evidence_path: evidence)
+    identity = { pid: 123, start: '456', boot_id: '01111111-2222-3333-4444-555555555555' }
+    helper.bind_boot!(**identity)
+    helper.begin_copy!(candidate_path: candidate_path, **identity)
+    next_path = File.join(store, 'next.json')
+    helper.build_next!(next_path: next_path)
+    helper.finish_copy!(next_path: next_path, **identity)
+    proof = JSON.parse(File.read(next_path)).fetch('machines').to_h do |name, machine|
+      source = name == 'dns-primary' ? historic_path : next_path
+      [name, { 'source_config' => source, 'source_config_sha256' => Digest::SHA256.file(source).hexdigest,
+               'proof_kind' => name == 'services' ? 'held_copy' : (name == 'dns-primary' ? 'prior_boot' : 'prior_update'),
+               'proof_reference' => 'fixture action ledger; retained disk never replaced',
+               'disks' => helper.send(:disk_identities, name:, machine:) }]
+    end
+    recovery = File.join(directory, 'recovery.json')
+    File.write(recovery, JSON.generate('version' => 1, 'kind' => 'retained_boot_recovery',
+      'workspace' => env.fetch('DEVCLUSTER_WORKSPACE'), 'slug' => env.fetch('TEST_SLUG'),
+      'expected_hold_sha256' => Digest::SHA256.file(File.join(directory, 'maintenance-hold.json')).hexdigest,
+      'machines' => proof))
+    File.chmod(0o600, recovery)
+    yield recovery, resident_path, evidence, selected.fetch('machines').fetch('services').fetch('toplevel')
+  end
+
+  def selection_proof_environment(env)
+    bin = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'proof-bin')
+    FileUtils.mkdir_p(bin)
+    path = File.join(bin, 'nix-store')
+    File.write(path, "#!#{RbConfig.ruby}\n" + <<~'RUBY')
+      File.open(ENV.fetch('TEST_PROOF_EVENTS'), 'a') { |file| file.puts(ARGV.first) }
+      if ARGV.first == '--query'
+        exit 23 if ENV['FAIL_PROOF_QUERY'] == '1'
+        puts ENV.fetch('TEST_PROOF_TOP')
+      end
+    RUBY
+    File.chmod(0o755, path)
+    env.merge('RUN_SELECTION_PROOF' => '1', 'TEST_PROOF_BIN' => bin,
+              'TEST_PROOF_EVENTS' => File.join(bin, 'events'))
+  end
 
   def enable_storage_profile(env, directory, enrollment: :omitted)
     config = JSON.parse(File.read(env.fetch('TEST_CONFIG')))
@@ -551,12 +945,16 @@ class DevclusterCommandsTest < Minitest::Test
       File.write(File.join(tracking, 'state.md'), "---\nlifecycle: active\n---\n")
       %w[vpsadmin vpsadminos].each { |project| FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug, project)) }
       config = File.join(ROOT, 'test', 'fixtures', "#{kind}-config.json")
-      machines = %w[services node1 node2].to_h { |name| [name, { 'toplevel' => "/fixture/#{name}" }] }
-      File.write(File.join(workspace, 'built.json'), JSON.generate('machines' => machines))
-      File.symlink(File.join(workspace, 'built.json'), File.join(directory, 'result-config')) if retained
+      store = File.join(workspace, 'store')
+      FileUtils.mkdir_p(store)
+      machines = fixture_machines
+      write_host_payloads(store, machines)
+      built = File.join(store, 'built.json')
+      File.write(built, JSON.generate('machines' => machines, 'labels' => {}))
+      File.symlink(built, File.join(directory, 'result-config')) if retained
       bin = File.join(workspace, 'bin')
       FileUtils.mkdir_p(bin)
-      %w[nix ssh ssh-keygen openssl git rm jq mktemp mv].each do |name|
+      %w[nix nix-store ruby ssh ssh-keygen openssl git rm jq mktemp mv ping].each do |name|
         path = File.join(bin, name)
         File.write(path, "#!#{RbConfig.ruby}\n" + command_stub)
         File.chmod(0o755, path)
@@ -565,6 +963,9 @@ class DevclusterCommandsTest < Minitest::Test
         'DEVCLUSTER_WORKSPACE' => workspace,
         'TEST_SLUG' => slug,
         'TEST_KIND' => kind,
+        'TEST_REAL_RUBY' => RbConfig.ruby,
+        'TEST_STORE' => store,
+        'TEST_BUILT_MACHINES' => JSON.generate(machines),
         'TEST_CONFIG' => config,
         'TEST_EVENTS' => File.join(workspace, 'events.jsonl'),
         'TEST_REAL_RM' => ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'rm') }.find { |path| File.executable?(path) },
@@ -584,6 +985,14 @@ class DevclusterCommandsTest < Minitest::Test
     argv = [File.join(ROOT, 'dev-clusters', kind, 'bin', 'devcluster'), command, env.fetch('TEST_SLUG')]
     argv << target if target
     argv += ['--network', env.fetch('TEST_START_NETWORK', 'local'), '--topology', 'dual'] if command == 'start'
+    if kind == 'vpsadmin' && command == 'update'
+      state = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), '.dev-clusters', kind, 'clusters', env.fetch('TEST_SLUG'), 'state')
+      FileUtils.mkdir_p(state)
+      fixture_machines.each_key do |name|
+        path = File.join(state, "#{name}-root.img")
+        File.write(path, 'retained sentinel') unless File.exist?(path)
+      end
+    end
     stdout, stderr, result = Open3.capture3(env, *argv)
     assert(result.exited?, stderr)
     @last_output = stdout + stderr
@@ -662,6 +1071,69 @@ class DevclusterCommandsTest < Minitest::Test
       require 'json'
       require 'fileutils'
       command = File.basename($PROGRAM_NAME)
+      exit 1 if command == 'ping'
+      if command == 'ruby'
+        helper = ARGV.first
+        if helper && helper.end_with?('/vpsadmin/lib/maintenance.rb')
+          require helper
+          DevClusters::VpsAdminMaintenance.prepend(Module.new do
+            def initialize(**identity)
+              super(**identity, store_root: ENV.fetch('TEST_STORE'))
+            end
+
+            # Shell proof fixtures use fixed /nix/store names, while the real
+            # helper registers only these test-owned filesystem equivalents.
+            def host_payloads(config, **options)
+              local = JSON.parse(JSON.generate(config).gsub('/nix/store/', ENV.fetch('TEST_STORE') + '/'))
+              super(local, **options)
+            end
+          end)
+          $0 = ARGV.shift
+          $VERBOSE = nil
+          load helper
+          exit 0
+        end
+        exec ENV.fetch('TEST_REAL_RUBY'), *ARGV
+      end
+      if command == 'nix-store'
+        ARGV.shift(3) if ARGV.first == '--option' && ARGV[1, 2] == %w[substitute false]
+        if ARGV.first == '--add'
+          require 'digest'
+          source = ARGV.fetch(1)
+          target = File.join(ENV.fetch('TEST_STORE'), Digest::SHA256.file(source).hexdigest + '-sealed.json')
+          FileUtils.cp(source, target) unless File.exist?(target)
+          puts target
+        elsif ARGV.first == '--add-root'
+          exit 23 if ENV['FAIL_GC_ROOT'] == '1'
+          link = ARGV.fetch(1)
+          target = ARGV.last
+          FileUtils.mkdir_p(File.dirname(link))
+          FileUtils.rm_f(link)
+          File.symlink(target, link)
+          if File.basename(link).start_with?('maintenance-payload-')
+            if ENV['FAIL_PAYLOAD_ROOT'] == '1'
+              File.open(ENV.fetch('TEST_EVENTS'), 'a') do |file|
+                file.puts(JSON.generate('event' => 'payload-root-refused', 'item' => target, 'root' => link))
+              end
+              exit 23
+            end
+            File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => 'payload-root', 'item' => target)) }
+          end
+        elsif ARGV.first == '--check-validity'
+          item = ARGV.fetch(1)
+          if ENV['FAIL_VALIDITY_ITEM'] == item || !File.exist?(item)
+            File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => 'store-validity-refused', 'item' => item)) }
+            exit 23
+          end
+        elsif ARGV[0, 2] == %w[--query --roots]
+          directory = File.join(ENV.fetch('DEVCLUSTER_WORKSPACE'), '.dev-clusters', 'vpsadmin', 'clusters', ENV.fetch('TEST_SLUG'))
+          roots = Dir.glob(File.join(directory, 'maintenance-{payload,source}-*')).select { |path| File.symlink?(path) && File.readlink(path) == ARGV.last }
+          puts roots.map { |path| "#{path} -> #{ARGV.last}" }
+        else
+          abort 'unexpected fixture nix-store action'
+        end
+        exit 0
+      end
       if command == 'jq'
         abort 'obsolete source metadata jq write' if ARGV.include?('-n') && ARGV.include?('revision')
         exec ENV.fetch('TEST_REAL_JQ'), *ARGV
@@ -687,6 +1159,8 @@ class DevclusterCommandsTest < Minitest::Test
               when 'ssh'
                 if ARGV.any? { |arg| arg.include?('switch-to-configuration') }
                   'activate'
+                elsif ARGV.last.include?('vpsadmin-devcluster-applied-')
+                  'selection-proof'
                 elsif ARGV.last == 'true'
                   'ssh-ready'
                 else
@@ -718,7 +1192,20 @@ class DevclusterCommandsTest < Minitest::Test
           link = value_after('--out-link')
           workspace = ENV.fetch('DEVCLUSTER_WORKSPACE')
           config = JSON.parse(File.read(ENV.fetch('TEST_CONFIG')))
-          machines = %w[services node1 node2].to_h { |name| [name, { 'toplevel' => "/fixture/#{name}" }] }
+          machines = JSON.parse(ENV.fetch('TEST_BUILT_MACHINES'))
+          store = ENV.fetch('TEST_STORE')
+          machines.each_value do |machine|
+            %w[toplevel qemu virtiofsd].each do |field|
+              path = machine.fetch(field).sub('/nix/store/', store + '/')
+              FileUtils.mkdir_p(path)
+            end
+            %w[kernel initrd squashfs].each do |field|
+              next unless machine[field]
+              path = machine.fetch(field).sub('/nix/store/', store + '/')
+              FileUtils.mkdir_p(File.dirname(path))
+              File.write(path, 'fixture host boot payload')
+            end
+          end
           labels = if config.dig('newWebui', 'enable') == true
                      { 'webuiSourceRevision' => environment.fetch('VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION'),
                        'webuiSourceDirty' => environment.fetch('VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_DIRTY') == '1' ? 'true' : 'false',
@@ -727,12 +1214,19 @@ class DevclusterCommandsTest < Minitest::Test
                      {}
                    end
           labels.delete('webuiSourceKind') if ENV['TEST_PARTIAL_LABELS'] == '1'
-          target = File.join(workspace, "built-#{File.readlines(ENV.fetch('TEST_EVENTS')).length}.json")
+          target = File.join(ENV.fetch('TEST_STORE'), "built-#{File.readlines(ENV.fetch('TEST_EVENTS')).length}.json")
           File.write(target, ENV['TEST_INVALID_RESULT'] == '1' ? '{invalid' : JSON.generate('machines' => machines, 'labels' => labels))
           FileUtils.rm_f(link)
           File.symlink(target, link)
           exit 23 if ENV['FAIL_AFTER_LINK'] == '1'
         when 'run'
+          config = JSON.parse(File.read(value_after('--config')))
+          state = value_after('--state-dir')
+          FileUtils.mkdir_p(state)
+          config.fetch('machines').each_key do |name|
+            path = File.join(state, "#{name}-root.img")
+            File.write(path, 'new fixture image') unless File.exist?(path)
+          end
           File.write(value_after('--ready-file'), 'ready')
         end
       when 'ssh-keygen'
@@ -748,6 +1242,25 @@ class DevclusterCommandsTest < Minitest::Test
           File.write(output, 'fixture')
         end
       when 'ssh'
+        if event == 'selection-proof'
+          if ENV['RUN_SELECTION_PROOF'] == '1'
+            require 'open3'
+            remote = ARGV.last
+            top = remote.match(/= '([^']+)'/).captures.first
+            prelude = <<~SH
+              readlink() { printf '%s\n' '#{top}'; }
+              test() {
+                if [ "$1" = -x ] && [ "$2" = '#{top}/init' ]; then return 0; fi
+                command test "$@"
+              }
+            SH
+            output, errors, result = Open3.capture3({ 'PATH' => "#{ENV.fetch('TEST_PROOF_BIN')}:#{ENV.fetch('PATH')}", 'TEST_PROOF_TOP' => top }, 'bash', '-c', prelude + remote)
+            print output
+            warn errors unless errors.empty?
+            exit result.exitstatus
+          end
+          exit 0
+        end
         if ENV['TEST_STORAGE_PROFILE'] == '1'
           remote = ARGV.last
           if remote.include?('vpsadmin-storage-profile inspect')

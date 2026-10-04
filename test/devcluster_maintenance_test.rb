@@ -9,6 +9,56 @@ class DevclusterMaintenanceTest < Minitest::Test
   Maintenance = DevClusters::VpsAdminMaintenance
   BOOT_ID = '01111111-2222-3333-4444-555555555555'.freeze
 
+  def test_host_projection_normalizes_lexical_items_and_ignores_external_or_unselected_inputs
+    with_fixture do |maintenance, paths|
+      config = payload_configuration(paths)
+      store = File.dirname(paths.fetch(:resident))
+      services = config.fetch('machines').fetch('services')
+      services['kernel'] = store + '/boot/bzImage'
+      services['initrd'] = store + '/boot/initrd'
+      services['sharedFileSystems'] = { 'store' => store + '/share/subdir', 'worktree' => '/external/worktree' }
+      services['networks'] = [{ 'type' => 'bridge', 'opts' => { 'helper' => store + '/qemu/bin/helper' } }]
+      config.fetch('machines').fetch('node1')['kernel'] = store + '/unselected.drv'
+      inputs = maintenance.host_payloads(config, machines: ['services'])
+      assert_equal([store + '/boot', services.fetch('toplevel'), store + '/qemu', store + '/share'], inputs.keys)
+      assert_equal([[store + '/boot/bzImage', :file], [store + '/boot/initrd', :file]], inputs.fetch(store + '/boot'))
+      refute(inputs.key?(store + '/old-image'))
+      refute(inputs.key?('/external/worktree'))
+      assert_raises(Maintenance::Invalid) { maintenance.host_payloads(config) }
+    end
+  end
+
+  def test_host_projection_includes_only_disk_images_that_osvm_will_consume
+    with_fixture do |maintenance, paths|
+      config = payload_configuration(paths)
+      services = config.fetch('machines').fetch('services')
+      image = services.fetch('rootDisk').fetch('image')
+      refute(maintenance.host_payloads(config).key?(image))
+      File.unlink(paths.fetch(:services_disk))
+      assert_includes(maintenance.host_payloads(config).keys, image)
+      File.write(paths.fetch(:services_disk), 'present again')
+      services.fetch('rootDisk')['preserve'] = false
+      assert_includes(maintenance.host_payloads(config).keys, image)
+      services.fetch('rootDisk')['create'] = false
+      refute(maintenance.host_payloads(config).key?(image))
+    end
+  end
+
+  def test_host_projection_enforces_item_machine_and_string_bounds_before_registration
+    with_fixture do |maintenance, paths|
+      config = payload_configuration(paths)
+      services = config.fetch('machines').fetch('services')
+      services['sharedFileSystems'] = 513.times.to_h { |i| [i.to_s, File.dirname(paths.fetch(:resident)) + "/share-#{i}"] }
+      assert_raises(Maintenance::Invalid) { maintenance.host_payloads(config) }
+      services['sharedFileSystems'] = {}
+      services['kernel'] = 'x' * 2049
+      assert_raises(Maintenance::Invalid) { maintenance.host_payloads(config) }
+      config = payload_configuration(paths)
+      config['machines'] = 17.times.to_h { |i| [i.zero? ? 'services' : "node#{i}", services] }
+      assert_raises(Maintenance::Invalid) { maintenance.host_payloads(config) }
+    end
+  end
+
   def test_residency_evidence_is_required_bound_and_private
     with_fixture do |maintenance, paths|
       assert_raises(Maintenance::Invalid) { prepare(maintenance, paths, evidence_path: paths.fetch(:missing)) }
@@ -67,7 +117,7 @@ class DevclusterMaintenanceTest < Minitest::Test
       File.open(paths.fetch(:missing), 'a') { |file| file.write("\n") }
       assert_raises(Maintenance::Invalid) { prepare(maintenance, paths, evidence_path: paths.fetch(:missing)) }
       assert_equal(before, File.binread(paths.fetch(:record)))
-      assert_equal({ 'version' => 1, 'mode' => 'maintenance', 'phase' => 'held',
+      assert_equal({ 'version' => 2, 'mode' => 'maintenance', 'phase' => 'held',
                      'pending' => true, 'copied' => false, 'active' => false }, maintenance.status)
       refute_includes(JSON.generate(maintenance.status), 'private reference')
     end
@@ -161,6 +211,8 @@ class DevclusterMaintenanceTest < Minitest::Test
       assert_equal('retained services payload', File.binread(paths.fetch(:services_disk)))
       assert_equal(paths.fetch(:next), maintenance.copied_config!)
       assert_equal('starting_copied', maintenance.status.fetch('phase'))
+      maintenance.begin_boot!(config_path: paths.fetch(:next), operation: 'copied_boot')
+      maintenance.finish_boot!(config_path: paths.fetch(:next), proof_reference: 'fixture full boot proof')
       maintenance.release!(**identity.merge(boot_id: '01111111-2222-3333-4444-666666666666'))
       refute(maintenance.pending?)
       assert(maintenance.status.fetch('active'))
@@ -284,7 +336,279 @@ class DevclusterMaintenanceTest < Minitest::Test
     end
   end
 
+  def test_target_promotion_keeps_all_other_descriptors_and_proofs
+    with_applied_fixture do |maintenance, paths|
+      before = read_applied(paths)
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'node1')
+      pending = read_applied(paths)
+      assert_equal(before.fetch('configuration'), pending.fetch('configuration'))
+      assert_equal(before.fetch('provenance'), pending.fetch('provenance'))
+      maintenance.promote_update!(target: 'node1', proof_reference: 'exact current-system and rooted closure')
+      after = read_applied(paths)
+      assert_equal(before.dig('configuration', 'machines', 'services'), after.dig('configuration', 'machines', 'services'))
+      assert_equal(before.dig('provenance', 'services'), after.dig('provenance', 'services'))
+      assert_equal(JSON.parse(File.read(paths.fetch(:candidate))).dig('machines', 'node1'), after.dig('configuration', 'machines', 'node1'))
+      assert_nil(after.fetch('pending'))
+    end
+  end
+
+  def test_node_boot_payload_changes_only_promote_the_selected_descriptor
+    with_applied_fixture do |maintenance, paths|
+      before = read_applied(paths)
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'node1')
+      maintenance.promote_update!(target: 'node1', proof_reference: 'real-shaped Node current-system and closure proof')
+      after = read_applied(paths)
+      refute_equal(before.dig('configuration', 'machines', 'node1', 'squashfs'), after.dig('configuration', 'machines', 'node1', 'squashfs'))
+      assert_equal(before.dig('configuration', 'machines', 'services'), after.dig('configuration', 'machines', 'services'))
+      %w[kernelParams extraQemuOptions iso qemu virtiofs networks sharedFileSystems].each do |field|
+        candidate = JSON.parse(File.read(paths.fetch(:candidate)))
+        candidate.fetch('machines').fetch('node1')[field] = 'changed retained layout'
+        path = paths.fetch(:candidate) + "-#{field}.json"
+        write_json(path, candidate)
+        unchanged = File.binread(paths.fetch(:applied))
+        assert_raises(Maintenance::Invalid, field) { maintenance.begin_update!(candidate_path: path, target: 'node1') }
+        assert_equal(unchanged, File.binread(paths.fetch(:applied)), field)
+      end
+    end
+  end
+
+  def test_unexpected_node_root_disk_has_no_image_source_exemption
+    with_applied_fixture do |maintenance, paths|
+      current = read_applied(paths)
+      node = current.fetch('configuration').fetch('machines').fetch('node1')
+      node['rootDisk'] = { 'type' => 'file', 'device' => 'node-extra.img', 'preserve' => true,
+                           'image' => paths.fetch(:resident) }
+      File.write(File.join(File.dirname(paths.fetch(:record)), 'state/node-extra.img'), 'retained extra disk')
+      source = paths.fetch(:resident) + '-unexpected-root.json'
+      write_json(source, current.fetch('configuration'))
+      current.fetch('provenance')['node1'] = { 'source_config' => source,
+        'source_config_sha256' => Digest::SHA256.file(source).hexdigest,
+        'proof_kind' => 'prior_boot', 'proof_reference' => 'fixture unexpected retained descriptor' }
+      write_json(paths.fetch(:applied), current)
+      candidate = JSON.parse(JSON.generate(current.fetch('configuration')))
+      candidate.fetch('machines').fetch('node1').fetch('rootDisk')['image'] = paths.fetch(:candidate)
+      changed = paths.fetch(:candidate) + '-unexpected-root.json'
+      write_json(changed, candidate)
+      assert_raises(Maintenance::Invalid) { maintenance.begin_update!(candidate_path: changed, target: 'node1') }
+    end
+  end
+
+  def test_pending_target_refuses_another_target_and_allows_explicit_retry
+    with_applied_fixture do |maintenance, paths|
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'node1')
+      before = File.binread(paths.fetch(:applied))
+      assert_raises(Maintenance::Invalid) { maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'services') }
+      assert_equal(before, File.binread(paths.fetch(:applied)))
+      assert_raises(Maintenance::Invalid) { maintenance.retained_config!(output_path: paths.fetch(:rendered)) }
+      retry_config = JSON.parse(File.read(paths.fetch(:candidate)))
+      retry_config.fetch('machines').fetch('node1')['toplevel'] += '-retry'
+      # Both candidates remain immutable; only the explicit pending target changes.
+      retry_path = paths.fetch(:candidate) + '-retry.json'
+      write_json(retry_path, retry_config)
+      maintenance.begin_update!(candidate_path: retry_path, target: 'node1')
+      assert_equal(retry_path, read_applied(paths).fetch('pending').fetch('candidate'))
+      maintenance.promote_update!(target: 'node1', proof_reference: 'actual retry proof')
+      assert_equal(retry_config.fetch('machines').fetch('node1'), read_applied(paths).dig('configuration', 'machines', 'node1'))
+    end
+  end
+
+  def test_legacy_target_update_does_not_prove_untouched_images
+    with_fixture do |maintenance, paths|
+      assert_raises(Maintenance::Invalid) { maintenance.begin_boot!(config_path: paths.fetch(:resident), operation: 'boot') }
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'node1')
+      maintenance.promote_update!(target: 'node1', proof_reference: 'actual target update')
+      applied = JSON.parse(File.read(File.join(File.dirname(paths.fetch(:record)), 'applied-config.json')))
+      assert_equal(['node1'], applied.fetch('provenance').keys)
+      assert_raises(Maintenance::Invalid) { maintenance.retained_config!(output_path: paths.fetch(:next)) }
+    end
+  end
+
+  def test_missing_or_changed_disk_layout_refuses_before_pending_publication
+    with_applied_fixture do |maintenance, paths|
+      before = File.binread(paths.fetch(:applied))
+      candidate = JSON.parse(File.read(paths.fetch(:candidate)))
+      candidate.fetch('machines').fetch('node1').fetch('disks').first['device'] = '../outside'
+      write_json(paths.fetch(:candidate), candidate)
+      assert_raises(Maintenance::Invalid) { maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'node1') }
+      assert_equal(before, File.binread(paths.fetch(:applied)))
+    end
+  end
+
+  def test_interrupted_target_promotion_retains_pending_and_prior_selection
+    with_applied_fixture do |maintenance, paths|
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'node1')
+      before = File.binread(paths.fetch(:applied))
+      maintenance.stub(:write_private_json, ->(*) { raise Errno::EIO }) do
+        assert_raises(Errno::EIO) { maintenance.promote_update!(target: 'node1', proof_reference: 'actual proof') }
+      end
+      assert_equal(before, File.binread(paths.fetch(:applied)))
+    end
+  end
+
+  def test_recovery_preserves_six_machine_copy_and_immutable_predecessor
+    with_recovery_fixture do |maintenance, paths|
+      old_hold = File.binread(paths.fetch(:record))
+      original = JSON.parse(File.read(paths.fetch(:next)))
+      prepared = maintenance.prepare_recovery!(evidence_path: paths.fetch(:recovery), output_path: paths.fetch(:corrected))
+      assert_equal(false, prepared.fetch('already_recorded'))
+      assert_equal(old_hold, File.binread(paths.fetch(:record)))
+      maintenance.commit_recovery!(evidence_path: paths.fetch(:recovery), next_path: paths.fetch(:corrected))
+      corrected = JSON.parse(File.read(paths.fetch(:corrected)))
+      %w[services node1 node2 storage1].each do |name|
+        assert_equal(original.fetch('machines').fetch(name), corrected.fetch('machines').fetch(name))
+      end
+      history = JSON.parse(File.read(paths.fetch(:historic)))
+      %w[dns-primary dns-secondary].each do |name|
+        assert_equal(history.fetch('machines').fetch(name), corrected.fetch('machines').fetch(name))
+      end
+      record = maintenance.load_record
+      assert_equal(2, record.fetch('version'))
+      assert_equal(1, record.fetch('mask_policy'))
+      assert_equal(old_hold, File.binread(record.fetch('predecessor').fetch('path')))
+      assert_equal('copied', maintenance.status.fetch('phase'))
+      assert(maintenance.pending?)
+      assert_raises(Maintenance::Invalid) { maintenance.retained_config!(output_path: paths.fetch(:rendered)) }
+      retry_result = maintenance.prepare_recovery!(evidence_path: paths.fetch(:recovery), output_path: paths.fetch(:rendered))
+      assert(retry_result.fetch('already_recorded'))
+      assert_equal(paths.fetch(:corrected), retry_result.fetch('next_config'))
+    end
+  end
+
+  def test_recovery_validation_failure_never_publishes
+    %w[hold node services dns_source disk layout extra marker float duplicate].each do |failure|
+      with_recovery_fixture do |maintenance, paths|
+        evidence = JSON.parse(File.read(paths.fetch(:recovery)))
+        case failure
+        when 'hold' then evidence['expected_hold_sha256'] = '0' * 64
+        when 'node'
+          foreign = JSON.parse(File.read(paths.fetch(:next)))
+          foreign.fetch('machines').fetch('node1')['squashfs'] += '-different'
+          source = paths.fetch(:historic) + '-foreign.json'
+          write_json(source, foreign)
+          evidence.fetch('machines').fetch('node1').merge!(
+            'source_config' => source, 'source_config_sha256' => Digest::SHA256.file(source).hexdigest)
+        when 'services'
+          evidence.fetch('machines').fetch('services').merge!(
+            'source_config' => paths.fetch(:historic), 'source_config_sha256' => Digest::SHA256.file(paths.fetch(:historic)).hexdigest)
+        when 'dns_source' then evidence.fetch('machines').fetch('dns-primary')['proof_kind'] = 'prior_update'
+        when 'disk' then evidence.fetch('machines').fetch('dns-primary').fetch('disks').first['ino'] += 1
+        when 'layout' then File.unlink(paths.fetch(:dns_disk))
+        when 'float' then evidence['version'] = 1.0
+        when 'extra' then evidence.fetch('machines')['foreign'] = evidence.fetch('machines').fetch('node1')
+        when 'marker'
+          candidate = JSON.parse(File.read(paths.fetch(:candidate)))
+          candidate['labels'] = {}
+          write_json(paths.fetch(:candidate), candidate)
+        end
+        write_json(paths.fetch(:recovery), evidence)
+        if failure == 'duplicate'
+          File.write(paths.fetch(:recovery), File.read(paths.fetch(:recovery)).sub('{', '{"version":1,'))
+        end
+        before = File.binread(paths.fetch(:record))
+        assert_raises(Maintenance::Invalid, failure) do
+          maintenance.prepare_recovery!(evidence_path: paths.fetch(:recovery), output_path: paths.fetch(:corrected))
+        end
+        assert_equal(before, File.binread(paths.fetch(:record)), failure)
+        refute(File.exist?(paths.fetch(:corrected)), failure)
+      end
+    end
+  end
+
+  def test_recovery_final_publication_failure_leaves_original_hold_authoritative
+    with_recovery_fixture do |maintenance, paths|
+      maintenance.prepare_recovery!(evidence_path: paths.fetch(:recovery), output_path: paths.fetch(:corrected))
+      before = File.binread(paths.fetch(:record))
+      original_writer = maintenance.method(:write_private_json)
+      maintenance.stub(:write_private_json, lambda { |path, value, **options|
+        raise Errno::EIO if path == paths.fetch(:record)
+        original_writer.call(path, value, **options)
+      }) do
+        assert_raises(Errno::EIO) { maintenance.commit_recovery!(evidence_path: paths.fetch(:recovery), next_path: paths.fetch(:corrected)) }
+      end
+      assert_equal(before, File.binread(paths.fetch(:record)))
+      assert(maintenance.pending?)
+    end
+  end
+
+  def test_recovered_boot_rechecks_current_disk_snapshot_and_requires_full_proof
+    with_recovery_fixture do |maintenance, paths|
+      maintenance.prepare_recovery!(evidence_path: paths.fetch(:recovery), output_path: paths.fetch(:corrected))
+      maintenance.commit_recovery!(evidence_path: paths.fetch(:recovery), next_path: paths.fetch(:corrected))
+      assert_equal(paths.fetch(:corrected), maintenance.copied_config!)
+      maintenance.validate_copied_runner!(config_path: paths.fetch(:corrected))
+      assert_raises(Maintenance::Invalid) { maintenance.release!(**identity) }
+      config = JSON.parse(File.read(paths.fetch(:corrected)))
+      File.rename(paths.fetch(:dns_disk), paths.fetch(:dns_disk) + '.old')
+      File.write(paths.fetch(:dns_disk), 'replacement same size'.ljust(File.size(paths.fetch(:dns_disk) + '.old')))
+      assert_raises(Maintenance::Invalid) do
+        maintenance.validate_machine_disks!(name: 'dns-primary', machine: config.fetch('machines').fetch('dns-primary'))
+      end
+    end
+  end
+
+  def test_recovered_pending_selection_refuses_old_maintenance_before_effects
+    with_recovery_fixture do |maintenance, paths|
+      maintenance.prepare_recovery!(evidence_path: paths.fetch(:recovery), output_path: paths.fetch(:corrected))
+      maintenance.commit_recovery!(evidence_path: paths.fetch(:recovery), next_path: paths.fetch(:corrected))
+      before = File.binread(paths.fetch(:record))
+      error = assert_raises(Maintenance::Invalid) { prepare(maintenance, paths) }
+      assert_equal('recovered selection requires copied boot', error.message)
+      error = assert_raises(Maintenance::Invalid) { maintenance.validate_runner!(config_path: paths.fetch(:resident)) }
+      assert_equal('recovered selection requires copied boot', error.message)
+      assert_equal(before, File.binread(paths.fetch(:record)))
+    end
+  end
+
+  def test_applied_envelope_rejects_float_version
+    with_applied_fixture do |maintenance, paths|
+      applied = read_applied(paths).merge('version' => 1.0)
+      write_json(paths.fetch(:applied), applied)
+      assert_raises(Maintenance::Invalid) { maintenance.retained_selection? }
+    end
+  end
+
+  def test_completed_recovered_full_boot_publishes_before_release
+    with_recovery_fixture do |maintenance, paths|
+      maintenance.prepare_recovery!(evidence_path: paths.fetch(:recovery), output_path: paths.fetch(:corrected))
+      maintenance.commit_recovery!(evidence_path: paths.fetch(:recovery), next_path: paths.fetch(:corrected))
+      maintenance.copied_config!
+      maintenance.begin_boot!(config_path: paths.fetch(:corrected), operation: 'copied_boot')
+      assert_raises(Maintenance::Invalid) { maintenance.release!(**identity) }
+      maintenance.finish_boot!(config_path: paths.fetch(:corrected), proof_reference: 'full copied boot, seed and Node refresh completed')
+      maintenance.release!(**identity)
+      refute(maintenance.pending?)
+      maintenance.retained_config!(output_path: paths.fetch(:rendered))
+      assert_equal(JSON.parse(File.read(paths.fetch(:corrected))), JSON.parse(File.read(paths.fetch(:rendered))))
+      assert_equal(2, maintenance.load_record.fetch('version'))
+    end
+  end
+
+  def test_legacy_v1_reader_remains_exact_and_new_transitions_write_v2
+    with_fixture do |maintenance, paths|
+      prepare(maintenance, paths)
+      legacy = maintenance.load_record.reject { |key, _| %w[predecessor recovery].include?(key) }.merge('version' => 1)
+      write_json(paths.fetch(:record), legacy)
+      assert_equal(1, maintenance.load_record.fetch('version'))
+      bind_boot(maintenance)
+      new_record = maintenance.load_record
+      assert_equal(2, new_record.fetch('version'))
+      # The published v1 reader's exact version/key guard cannot accept v2,
+      # including a released record; no unknown-type compatibility fallback.
+      %w[held released].each do |phase|
+        candidate = new_record.merge('phase' => phase)
+        refute(candidate.fetch('version') == 1 && candidate.keys.sort == Maintenance::RECORD_KEYS.sort)
+      end
+    end
+  end
+
   private
+
+  def payload_configuration(paths)
+    config = JSON.parse(File.read(paths.fetch(:resident)))
+    qemu = config.dig('machines', 'services', 'qemu')
+    config.fetch('machines').each_value { |machine| machine.merge!('qemu' => qemu, 'virtiofsd' => qemu) }
+    config
+  end
 
   def identity
     { pid: 123, start: '456', boot_id: BOOT_ID }
@@ -296,6 +620,74 @@ class DevclusterMaintenanceTest < Minitest::Test
 
   def begin_copy(maintenance, paths, **overrides)
     maintenance.begin_copy!(candidate_path: paths.fetch(:candidate), **identity.merge(overrides))
+  end
+
+  def read_applied(paths)
+    JSON.parse(File.read(paths.fetch(:applied)))
+  end
+
+  def with_applied_fixture
+    with_fixture do |maintenance, paths|
+      prepare(maintenance, paths)
+      bind_boot(maintenance)
+      begin_copy(maintenance, paths)
+      maintenance.build_next!(next_path: paths.fetch(:next))
+      maintenance.finish_copy!(next_path: paths.fetch(:next), **identity)
+      maintenance.copied_config!
+      maintenance.begin_boot!(config_path: paths.fetch(:next), operation: 'copied_boot')
+      maintenance.finish_boot!(config_path: paths.fetch(:next), proof_reference: 'fixture prior successful full boot')
+      paths[:applied] = File.join(File.dirname(paths.fetch(:record)), 'applied-config.json')
+      paths[:rendered] = paths.fetch(:next) + '-rendered.json'
+      yield maintenance, paths
+    end
+  end
+
+  def with_recovery_fixture
+    with_fixture do |maintenance, paths|
+      historic = JSON.parse(File.read(paths.fetch(:resident)))
+      old_services = historic.fetch('machines').fetch('services')
+      %w[node2 storage1].each do |name|
+        historic.fetch('machines')[name] = historic.fetch('machines').fetch('node1').merge('toplevel' => File.join(File.dirname(paths.fetch(:resident)), "old-#{name}"))
+        File.write(File.join(File.dirname(paths.fetch(:record)), 'state', "#{name}-tank.img"), 'retained node payload')
+      end
+      %w[dns-primary dns-secondary].each do |name|
+        historic.fetch('machines')[name] = old_services.merge('toplevel' => File.join(File.dirname(paths.fetch(:resident)), "old-#{name}"))
+        File.write(File.join(File.dirname(paths.fetch(:record)), 'state', "#{name}-root.img"), 'retained dns payload')
+      end
+      paths[:dns_disk] = File.join(File.dirname(paths.fetch(:record)), 'state', 'dns-primary-root.img')
+      paths[:historic] = paths.fetch(:resident) + '-historic.json'
+      write_json(paths.fetch(:historic), historic)
+      selected = JSON.parse(JSON.generate(historic))
+      %w[dns-primary dns-secondary].each { |name| selected.fetch('machines').fetch(name)['toplevel'] += '-never-copied' }
+      write_json(paths.fetch(:resident), selected)
+      update_evidence_digest(paths)
+      candidate = selected.merge('machines' => selected.fetch('machines').merge(
+        'services' => JSON.parse(File.read(paths.fetch(:candidate))).fetch('machines').fetch('services')),
+        'labels' => { 'vpsadminPreservingSeed' => '{"version":1,"existingAssignments":"preserve"}' })
+      write_json(paths.fetch(:candidate), candidate)
+      prepare(maintenance, paths)
+      bind_boot(maintenance)
+      begin_copy(maintenance, paths)
+      maintenance.build_next!(next_path: paths.fetch(:next))
+      maintenance.finish_copy!(next_path: paths.fetch(:next), **identity)
+      paths[:recovery] = paths.fetch(:evidence) + '-recovery.json'
+      paths[:corrected] = paths.fetch(:next) + '-corrected.json'
+      paths[:rendered] = paths.fetch(:next) + '-rendered.json'
+      current = JSON.parse(File.read(paths.fetch(:next)))
+      proofs = current.fetch('machines').to_h do |name, machine|
+        dns = name.start_with?('dns-')
+        source = dns ? paths.fetch(:historic) : paths.fetch(:next)
+        kind = dns ? 'prior_boot' : (name == 'services' ? 'held_copy' : 'prior_update')
+        [name, { 'source_config' => source, 'source_config_sha256' => Digest::SHA256.file(source).hexdigest,
+                 'proof_kind' => kind, 'proof_reference' => 'actual owning fixture boot/update/copy reference',
+                 'disks' => maintenance.send(:disk_identities, name:, machine:) }]
+      end
+      write_json(paths.fetch(:recovery), { 'version' => 1, 'kind' => 'retained_boot_recovery',
+        'workspace' => File.realpath(File.join(File.dirname(paths.fetch(:resident)), '..')),
+        'slug' => '2026-10-02-maintenance-fixture',
+        'expected_hold_sha256' => Digest::SHA256.file(paths.fetch(:record)).hexdigest, 'machines' => proofs })
+      yield maintenance, paths
+    end
   end
 
   def prepare(maintenance, paths, evidence_path: paths.fetch(:evidence))
@@ -330,6 +722,8 @@ class DevclusterMaintenanceTest < Minitest::Test
                    'rootDisk' => { 'device' => '{machine}-root.img', 'type' => 'file', 'create' => true,
                                    'preserve' => true, 'size' => '1G', 'image' => File.join(store, 'old-image') } }
       node = { 'spin' => 'vpsadminos', 'toplevel' => File.join(store, 'old-node'),
+               'kernel' => File.join(store, 'old-node-kernel'), 'initrd' => File.join(store, 'old-node-initrd'),
+               'squashfs' => File.join(store, 'old-node-squashfs'),
                'disks' => [{ 'device' => '{machine}-tank.img', 'type' => 'file', 'preserve' => true }] }
       FileUtils.mkdir_p(File.join(services.fetch('qemu'), 'bin'))
       File.binwrite(File.join(services.fetch('qemu'), 'bin/qemu-system-x86_64'), 'fixture')
@@ -347,7 +741,8 @@ class DevclusterMaintenanceTest < Minitest::Test
         'machines' => { 'services' => services.merge('toplevel' => File.join(store, 'new-services'),
                                                     'kernel' => File.join(store, 'new-kernel'), 'initrd' => File.join(store, 'new-initrd'),
                                                     'rootDisk' => services.fetch('rootDisk').merge('image' => File.join(store, 'new-image'))),
-                        'node1' => node.merge('toplevel' => File.join(store, 'not-copied-node')) },
+                        'node1' => node.merge('toplevel' => File.join(store, 'not-copied-node'),
+                                              'squashfs' => File.join(store, 'not-copied-node-squashfs')) },
         'labels' => { 'vpsadminPreservingSeed' => JSON.generate('version' => 1, 'existingAssignments' => 'preserve') }
       })
       maintenance = Maintenance.new(workspace:, slug:, directory:, store_root: store)

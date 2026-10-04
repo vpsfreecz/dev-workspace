@@ -36,6 +36,18 @@ let
           enrollment = true;
         };
         newWebui.enable = false;
+        dns = {
+          enable = true;
+          servers.dns-primary = {
+            id = 301;
+            name = "retained-dns";
+            serverName = "retained-dns.example.test";
+            ip = "192.0.2.3";
+            cpus = 1;
+            memoryMiB = 1024;
+            sshPort = 19123;
+          };
+        };
       }
     );
   fixtureModule =
@@ -106,7 +118,24 @@ let
     in
     actual
     // {
-      # The real seed still sees the ordinary topology; only services boots.
+      # Real provider services and one retained DNS root share this scenario.
+      machines.dns-primary = actual.machines.dns-primary // {
+        networks = [
+          {
+            type = "user";
+            opts = {
+              network = "10.0.2.0/24";
+              host = "10.0.2.2";
+              dns = "10.0.2.3";
+              hostForward = "tcp:127.0.0.1:19123-:22";
+            };
+          }
+        ];
+        config = {
+          imports = [ actual.machines.dns-primary.config ];
+          environment.etc.retained-dns-generation.text = if enabled then "new" else "old";
+        };
+      };
       machines.services = actual.machines.services // {
         networks = [
           {

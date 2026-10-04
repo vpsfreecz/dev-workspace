@@ -14,9 +14,40 @@ sources before starting the cluster. Existing complete VM disk images need no
 conversion.
 
 Services and DNS root disks are retained across stop/start. Apply configuration
-changes with `update` while the VMs are running so their root disks contain the
-new system closures before the next boot. Starting retained disks with older
-runner versions can replace them with fresh images and erase their data.
+changes with `update` while the VMs are running so their disks contain the new
+closures. Starting retained disks with older runner versions can replace them
+with fresh images and erase their data.
+
+### Build candidates and retained boot selections
+
+`result-config` describes the full build candidate. The provider records the
+retained boot selection in one private `applied-config.json` envelope. Its
+version-1 format contains the workspace/slug, full configuration, machine
+provenance and one nullable pending operation. Guest proof determines which
+built descriptors become part of the retained selection.
+
+An update records its pending target before copy or activation. It promotes
+that target's complete descriptor after verifying exact `/run/current-system`,
+closure validity, executable init where applicable and a guest GC root.
+A services update also finishes its restart and Node refresh before promotion.
+The provider retains every other descriptor and proof. On failure, the target
+stays pending and completed earlier targets remain recorded. A retry may select
+a new candidate for the same target; another target cannot clear that pending
+operation.
+
+Ordinary cold start uses only a complete, non-pending applied selection. A newly
+built candidate validates the requested routing/layout but does not replace
+retained boot payloads. NixOS updates may change toplevel/kernel/initrd and the
+source `rootDisk.image`; direct vpsAdminOS updates may change
+toplevel/kernel/initrd/squashfs. Spin, boot options, resources, preserved disk
+fields, networks and shared mounts must remain exact.
+
+Fresh creation records a pending boot before starting guests and establishes
+residency after full boot proof. Existing legacy images without the envelope
+remain readable and target-updatable. Each update proves its own target; cold
+start requires proof for every guest. A build, image age or stale readiness file
+cannot supply that proof. Use the stopped recovery below when historical
+evidence supports it.
 
 ## Maintenance boot for retained disks
 
@@ -91,14 +122,90 @@ before each start. A missing disk refuses boot before OSVM can create an image.
 
 The copied-config boot uses the recorded configuration without rebuilding it.
 It releases the hold only after the new seed has run successfully, API and
-supervisor are active, and the normal node refresh completes. Pending or
-unknown maintenance state blocks plain start, update, refresh, restart and
+supervisor are active, the normal Node refresh completes, and every guest
+proves its exact recorded system and rooted closure. The complete applied
+selection is published before release; publication failure leaves the hold
+pending. Pending or unknown maintenance state blocks plain start, update,
+refresh, restart and
 reset. Status and stop remain available. Private hold/copy records and their
 configuration GC roots survive stop and interruption. Failed copy has no
 release receipt; stop and retry the same proved maintenance selection or
 diagnose while stopped. If a new boot may have changed schema or state, verify
 compatibility before selecting an old resident generation for masked recovery.
 Never reset retained state or run an old package to evade a refusal.
+
+### Correcting an unproved DNS selection while stopped
+
+If a completed services copy recorded rebuilt DNS descriptors that were never
+copied, stop the owned runner and collect trustworthy historical evidence.
+Then use the metadata-only command:
+
+```sh
+vpsadmin-devcluster maintenance-recover-config <slug> \
+  --residency-evidence /private/retained-boot-evidence.json
+```
+
+Recovery requires a completed pending copy in `copied` or `starting_copied`,
+the existing stopped-owner/socket/address checks and all retained disks. This
+metadata operation records a boot selection without building guest closures,
+starting guests, copying or activating systems, or releasing the hold. It
+restores the complete configured DNS primary/secondary descriptors from one
+prior successful full boot.
+Both prior and recorded DNS descriptors must be NixOS with compatible retained
+layout. Services remains the exact copied candidate; every Node descriptor,
+including squashfs, must equal its actual last update and the recorded next.
+An arbitrary merged config or whole-old-config rollback is not accepted.
+
+The operator-owned, non-symlink 0600 evidence is at most 16 KiB. Its version-1
+JSON has exactly `version`, `kind` (`retained_boot_recovery`), `workspace`,
+`slug`, `expected_hold_sha256` and `machines`. Use SHA-256 of the exact original
+hold bytes. `machines` must contain every recorded machine, without extras.
+Each entry has these fields:
+
+```json
+{
+  "source_config": "/nix/store/immutable-source-config",
+  "source_config_sha256": "64-lowercase-hex-digits",
+  "proof_kind": "prior_boot",
+  "proof_reference": "private historical continuity and action evidence reference",
+  "disks": [{ "device": "dns-primary-root.img", "dev": 1, "ino": 1, "size": 1 }]
+}
+```
+
+The stat numbers above are placeholders; supply actual current measurements.
+DNS uses `prior_boot`, Nodes use `prior_update`, and services uses `held_copy`.
+Source configs remain bounded to 2 MiB, references to 2048 bytes and machine
+names to 128 bytes. The provider validates exact bindings and layout; the
+trusted local operator supplies the underlying historical continuity account.
+Original paths, sizes and mtimes, cold copies, and successful boot/update/copy
+source records support that account when there is no known replacement, reset,
+restore, truncation or contradictory evidence. Historical device/inode may be
+unmeasured and must not be backfilled. Expected mtime changes from guest writes
+and unexplained runner loss alone do not establish a disk replacement.
+
+Current device/inode/size bind this stopped recovery attempt. The helper checks
+them under the lifecycle lock and before each boot, refusing changed bindings.
+Historical residency and payload equality need their own evidence; a fresh stat
+cannot establish them or replace missing historical proof.
+
+Recovery durably archives the exact predecessor hold and evidence as private
+0600 files in a 0700 history directory, roots immutable source configs and the
+derived next, then publishes the version-2 hold last. The old ledger and roots
+remain intact. An identical evidence retry returns the same selection; changed
+evidence refuses. The hold stays pending with its phase and copy identity
+preserved. Run the existing
+`start <slug> --copied-config` separately to establish full seed/refresh and
+residency proof before release. A recovered selection cannot be overwritten by
+a masked copy retry.
+
+Maintenance records are version 2; legacy version 1 remains readable with its
+original validation. Explicit supported transitions write version 2. Mask
+policy, preserving seed, residency/recovery evidence and applied envelope stay
+version 1; canonical runtime schema 1/policy 3 is unchanged. Old version-1
+helpers reject version-2 holds even after release. Old providers can still
+ignore applied metadata on other clusters without a version-2 hold. Rollback
+requires a reviewed provider that preserves this selection contract. Never use
+an old candidate helper to evade it.
 
 Runtime policy 3 permits the supported forward transition from policy 2 with
 schema 1. It conservatively rejects normal transitions to policy 2 while any
@@ -115,11 +222,11 @@ an inherited user gem directory cannot replace its Minitest version:
 export DEVCLUSTER_RUNTIME_CONTRACT="$(nix eval --raw --impure --expr \
   '(builtins.getFlake (toString ./.)).inputs.dev-workspace.lib.runtimeContract')"
 nix shell --inputs-from . nixpkgs#ruby nixpkgs#bash nixpkgs#coreutils \
-  nixpkgs#git nixpkgs#jq nixpkgs#openssl nixpkgs#util-linux -c bash -ec '
+  nixpkgs#git nixpkgs#jq nixpkgs#nix nixpkgs#openssl nixpkgs#util-linux -c bash -ec '
     unset RUBYOPT
     export GEM_HOME="$(ruby -rrubygems -e "puts Gem.default_dir")"
     export GEM_PATH="$GEM_HOME"
-    for name in maintenance runner commands status; do
+    for name in maintenance runner commands status store_roots; do
       ruby "test/devcluster_${name}_test.rb"
     done
   '
@@ -128,6 +235,9 @@ nix shell --inputs-from . nixpkgs#ruby nixpkgs#bash nixpkgs#coreutils \
 The normal flake test check also runs these fixtures. They do not boot a guest;
 generator masks, seed preservation and copy/restart interruption require the
 separate disposable VM acceptance check after review.
+The store-roots fixture uses real Nix adds, indirect roots and queries in a
+temporary private local store. It performs no builds or GC; root-query results
+prove registration, not observed survival through collection.
 
 ## Basic Usage
 
@@ -182,9 +292,39 @@ to an empty value to omit the QEMU `helper=` option.
 `start` and `update` keep the built cluster config rooted at
 `.dev-clusters/vpsadmin/clusters/<slug>/result-config` while the cluster is in
 use. `stop` removes that root after the runner exits, and `reset` removes it
-with the rest of the cluster state. Use `vpsadmin-devcluster gcroots` to list retained
-cluster config roots and `vpsadmin-devcluster gcroots --cleanup` to remove roots for
+with the rest of the cluster state. Applied-selection and maintenance source
+roots survive ordinary stop so retained provenance stays readable. Use
+`vpsadmin-devcluster gcroots` to list retained cluster config roots and
+`vpsadmin-devcluster gcroots --cleanup` to remove roots for
 stopped clusters left by older tooling.
+
+Importing config JSON with `nix-store --add` does not register the store paths
+named in its contents as dependencies. The provider registers indirect host GC
+roots for selected boot payloads before boot, copy, activation or publishing the
+selection. It covers kernel/initrd/toplevel, QEMU/virtiofs packages, squashfs/ISO,
+and store-backed shares and bridge helpers. File subpaths use the containing
+store item, with duplicates removed and at most 512 items per config. An existing
+preserved disk does not consume its source image, so a missing old NixOS image
+is allowed. Fresh disk creation requires its image. External worktree,
+credential and wrapper paths keep their existing handling; these roots do not
+protect them.
+
+Permanent JSON roots use
+`maintenance-source-<sha256-of-containing-store-item-path>`. Hashing the store
+item path keeps distinct JSON files rooted even when their bytes are identical.
+Record content digests stay unchanged, and existing roots remain in place.
+
+Each `maintenance-payload-<sha256-of-store-item-path>` root must bind the exact
+existing, registered non-derivation item. A missing item or failed registration
+refuses the operation without building, substituting or repairing it. Recovery
+keeps historical JSON for provenance and roots payloads from the corrected
+selection. An identical retry checks or restores those roots before reporting
+success. Host roots retain host store items; guest residency and disk continuity
+require separate proofs.
+
+Config/provenance and payload roots accumulate across changes and survive stop
+or interruption. The provider does not prune them automatically or promise to
+reclaim disk space.
 
 Resolver behavior is configured in `config.json` under `resolver`. The default
 mode, `cluster`, runs dnsmasq on the services VM, serves all devcluster host
@@ -349,6 +489,13 @@ that build. Ordinary flake checks keep the disabled default API selection.
 An invocation without a compatible API override refuses the enabled candidate
 configuration before starting a guest. The native runner receives only the
 built store JSON files.
+
+The same ordered example also boots one real old DNS guest and proves that its
+rebuilt candidate closure is absent. It seals a fixture-only legacy selection
+with that unproved DNS descriptor, recovers after stop/reap, and boots new
+services with the old DNS descriptor and unchanged payload/disk identity. The
+combined legacy selection is never claimed booted; six-machine unit fixtures
+cover exact Node preservation. No new DNS candidate is copied or booted.
 
 ```sh
 nix run --no-write-lock-file \
@@ -606,4 +753,6 @@ the normal build to establish rooting and validation before updating a VM.
 Keep the compatible API and database schema, WebUI credentials, and BFF
 session state. Do not reset the cluster or rotate secrets to recover from this
 failure. An update stops at the first failed copy, activation, or refresh.
-Machines updated before that failure keep their new configuration.
+Only targets with completed copy, activation and residency proof are promoted
+in the applied envelope. A failed target remains pending; its running generation
+may already have changed and needs an explicit same-target retry.

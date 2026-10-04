@@ -123,6 +123,47 @@ class DevclusterRunnerTest < Minitest::Test
     end
   end
 
+  def test_recovered_runner_constructs_old_dns_and_rechecks_snapshot_before_each_start
+    with_recorded_runner(:copied_config, recovered: true) do |runner, options, _disk, dns_disk|
+      machines = runner.send(:build_machines, options)
+      selected = JSON.parse(File.read(options.fetch(:config)))
+      assert(selected.fetch('machines').fetch('dns-primary').fetch('toplevel').end_with?('/old-dns'))
+      assert_equal(%w[services dns-primary], machines.map(&:name))
+      started = []
+      machines.each do |entry|
+        entry.machine.define_singleton_method(:start) { |**| started << entry.name }
+        entry.machine.define_singleton_method(:wait_for_boot) { |**| }
+      end
+      File.rename(dns_disk, dns_disk + '.previous')
+      File.write(dns_disk, File.read(dns_disk + '.previous'))
+      assert_raises(DevClusters::VpsAdminMaintenance::Invalid) { runner.send(:start_machines, machines, 30) }
+      assert_equal(['services'], started)
+    end
+  end
+
+  def test_recovered_disk_snapshot_change_refuses_before_machine_construction
+    with_recorded_runner(:copied_config, recovered: true) do |runner, options, disk, _dns_disk|
+      File.rename(disk, disk + '.previous')
+      File.write(disk, File.read(disk + '.previous'))
+      assert_raises(DevClusters::VpsAdminMaintenance::Invalid) { runner.send(:build_machines, options) }
+    end
+  end
+
+  def test_recovered_pending_hold_refuses_old_services_before_construction
+    with_recorded_runner(:copied_config, recovered: true) do |runner, options, _disk|
+      path = File.join(File.dirname(options.fetch(:state_dir)), 'maintenance-hold.json')
+      before = File.binread(path)
+      resident = JSON.parse(before).fetch('resident_config')
+      OsVm::NixosMachine.stub(:new, ->(*) { raise 'constructed old services' }) do
+        error = assert_raises(DevClusters::VpsAdminMaintenance::Invalid) do
+          runner.send(:build_machines, options.merge(maintenance: true, copied_config: false, config: resident))
+        end
+        assert_equal('recovered selection requires copied boot', error.message)
+      end
+      assert_equal(before, File.binread(path))
+    end
+  end
+
   def test_failed_maintenance_policy_never_constructs_a_machine
     with_runner do |_runner, options|
       policy = Class.new do
@@ -186,7 +227,7 @@ class DevclusterRunnerTest < Minitest::Test
     end
   end
 
-  def with_recorded_runner(mode)
+  def with_recorded_runner(mode, recovered: false)
     Dir.mktmpdir('recorded-runner-test') do |workspace|
       slug = '2026-10-02-recorded-runner'
       directory = File.join(workspace, '.dev-clusters/vpsadmin/clusters', slug)
@@ -212,7 +253,16 @@ class DevclusterRunnerTest < Minitest::Test
       machine = { 'spin' => 'nixos', 'toplevel' => top, 'qemu' => qemu,
                   'kernel' => File.join(store, 'kernel'), 'initrd' => File.join(store, 'initrd'),
                   'rootDisk' => { 'device' => '{machine}-root.img', 'type' => 'file', 'preserve' => true, 'size' => '1G' } }
-      File.write(config, JSON.generate('machines' => { 'services' => machine }))
+      selected = { 'machines' => { 'services' => machine } }
+      dns_disk = File.join(state, 'dns-primary-root.img')
+      historical = File.join(store, 'historical.json')
+      if recovered
+        File.write(dns_disk, 'retained DNS sentinel')
+        old_dns = machine.merge('toplevel' => File.join(store, 'old-dns'))
+        File.write(historical, JSON.generate(selected.merge('machines' => selected.fetch('machines').merge('dns-primary' => old_dns))))
+        selected.fetch('machines')['dns-primary'] = old_dns.merge('toplevel' => File.join(store, 'uncopied-dns'))
+      end
+      File.write(config, JSON.generate(selected))
       evidence = File.join(directory, 'evidence.json')
       File.write(evidence, JSON.generate('version' => 1, 'workspace' => workspace, 'slug' => slug,
                                        'resident_config' => config, 'resident_config_sha256' => Digest::SHA256.file(config).hexdigest,
@@ -227,17 +277,36 @@ class DevclusterRunnerTest < Minitest::Test
         identity = { pid: 123, start: '456', boot_id: '01111111-2222-3333-4444-555555555555' }
         policy.bind_boot!(**identity)
         candidate = File.join(store, 'candidate.json')
-        File.write(candidate, JSON.generate('machines' => { 'services' => machine },
+        File.write(candidate, JSON.generate('machines' => selected.fetch('machines'),
                                             'labels' => { 'vpsadminPreservingSeed' => '{"version":1,"existingAssignments":"preserve"}' }))
         policy.begin_copy!(candidate_path: candidate, **identity)
         config = File.join(store, 'next.json')
         policy.build_next!(next_path: config)
         policy.finish_copy!(next_path: config, **identity)
+        if recovered
+          hold = File.join(directory, 'maintenance-hold.json')
+          proofs = JSON.parse(File.read(config)).fetch('machines').to_h do |name, descriptor|
+            source = name == 'services' ? candidate : historical
+            [name, { 'source_config' => source, 'source_config_sha256' => Digest::SHA256.file(source).hexdigest,
+                     'proof_kind' => name == 'services' ? 'held_copy' : 'prior_boot',
+                     'proof_reference' => 'fixture historical source with no disk replacement',
+                     'disks' => policy.send(:disk_identities, name:, machine: descriptor) }]
+          end
+          recovery = File.join(directory, 'recovery.json')
+          File.write(recovery, JSON.generate('version' => 1, 'kind' => 'retained_boot_recovery',
+            'workspace' => workspace, 'slug' => slug, 'expected_hold_sha256' => Digest::SHA256.file(hold).hexdigest,
+            'machines' => proofs))
+          File.chmod(0o600, recovery)
+          corrected = File.join(store, 'recovered.json')
+          policy.prepare_recovery!(evidence_path: recovery, output_path: corrected)
+          policy.commit_recovery!(evidence_path: recovery, next_path: corrected)
+          config = corrected
+        end
         policy.copied_config!
       end
       options = { config:, state_dir: state, sock_dir: state, timeout: 30, mode => true }
       runner = DevClusters::OsVmRunner.new([], hash_base: 'test', priority_machines: ['services'], maintenance_policy: policy_class)
-      yield runner, options, disk
+      yield runner, options, disk, dns_disk
     end
   end
 end

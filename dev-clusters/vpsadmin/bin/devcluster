@@ -40,6 +40,7 @@ usage() {
 Usage:
   devcluster start <slug> [--topology single|dual|storage] [--network bridge|local] [--force]
   devcluster start <slug> --copied-config
+  devcluster maintenance-recover-config <slug> --residency-evidence PATH
   devcluster maintenance-start <slug> --resident-config PATH --expect-services-toplevel PATH --residency-evidence PATH
   devcluster stop <slug>
   devcluster status <slug>
@@ -1103,12 +1104,10 @@ start_cluster() {
     die "$service_ip responds; stop the existing dev frontend or use --force"
   fi
 
+  maintenance_state "$slug" root-applied-payloads || return
   kill_socket_processes "$slug" || return
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
     build_config_with_credentials "$slug" "$topology" "$network" || return
-  printf '%s\n' "$topology" > "$(topology_file "$slug")" || return
-  printf '%s\n' "$network" > "$(network_file "$slug")" || return
-
   local vpsadmin_path vpsadminos_input_value vpsf_status_path vpsadmin_webui_path
   vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
   vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
@@ -1120,6 +1119,18 @@ start_cluster() {
     runner_overrides+=("$item")
   done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$vpsadmin_webui_path")
 
+  local boot_config
+  if [ "$(maintenance_state "$slug" applied-present)" = true ]; then
+    maintenance_state "$slug" applied-config "$(cluster_dir "$slug")/applied-boot.json" "$(config_path "$slug")" || return
+    boot_config="$(nix-store --add "$(cluster_dir "$slug")/applied-boot.json")" || return
+    maintenance_root_config "$slug" applied-boot "$boot_config" || return
+  else
+    boot_config="$(config_path "$slug")" || return
+  fi
+  root_applied_source "$slug" "$boot_config" || return
+  printf '%s\n' "$topology" > "$(topology_file "$slug")" || return
+  printf '%s\n' "$network" > "$(network_file "$slug")" || return
+  maintenance_state "$slug" applied-begin-boot "$boot_config" boot || return
   local dir log ready sock_dir
   dir="$(cluster_dir "$slug")"
   log="$dir/runner.log"
@@ -1137,7 +1148,7 @@ start_cluster() {
     "path:$CLUSTER_DIR#runner"
     --
     start
-    --config "$(config_path "$slug")"
+    --config "$boot_config"
     --state-dir "$dir/state"
     --sock-dir "$sock_dir"
     --pid-file "$pid_path"
@@ -1157,6 +1168,7 @@ start_cluster() {
   for _ in $(seq 1 900); do
     if [ -f "$ready" ]; then
       refresh_nodes_after_seed "$slug" || return
+      prove_full_applied_boot "$slug" "$boot_config" || return
       urls_cluster "$slug"
       return
     fi
@@ -1418,6 +1430,7 @@ update_cluster() {
   local network
   network="$(cluster_network "$slug")"
 
+  maintenance_state "$slug" root-applied-payloads || return
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
     build_config_with_credentials "$slug" "$topology" "$network" || return
 
@@ -1433,7 +1446,6 @@ update_cluster() {
   local cfg
   cfg="$(config_path "$slug")" || return
 
-  local services_updated=0
   for machine in "${machines[@]}"; do
     local host toplevel opts
     host="$(machine_host "$slug" "$machine")"
@@ -1441,25 +1453,28 @@ update_cluster() {
     [ -n "$toplevel" ] || die "no toplevel found for $machine in $cfg"
     opts="$(ssh_opts "$slug" "$machine")"
 
+    maintenance_state "$slug" applied-begin-update "$cfg" "$machine" || return
+    maintenance_state "$slug" root-applied-payloads || return
+    root_applied_source "$slug" "$cfg" "$machine" || return
     printf 'Updating %s (%s) to %s\n' "$machine" "$host" "$toplevel"
     NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$toplevel" || return
     # shellcheck disable=SC2086
     ssh $opts "root@$host" "$toplevel/bin/switch-to-configuration" switch || return
 
     if [ "$machine" = "services" ]; then
-      services_updated=1
       # shellcheck disable=SC2086
       ssh $opts "root@$host" '
         if systemctl cat vpsadmin-devcluster-seed.service >/dev/null 2>&1; then
           systemctl restart vpsadmin-api.service
         fi
       ' || return
+      refresh_nodes_after_seed "$slug" || return
     fi
+    prove_machine_selection "$slug" "$machine" "$toplevel" "$(jq -r --arg machine "$machine" '.machines[$machine].spin' "$cfg")" || return
+    maintenance_state "$slug" applied-promote-update "$machine" "public update proved exact current system and rooted closure" || return
   done
 
-  if [ "$services_updated" = "1" ]; then
-    refresh_nodes_after_seed "$slug"
-  fi
+  : # Each services target finishes its refresh before promotion.
 }
 
 restart_service() {
@@ -1576,7 +1591,7 @@ maintenance_require_stopped() {
 
 maintenance_root_config() {
   local slug="$1" name="$2" config="$3"
-  nix-store --add-root "$(cluster_dir "$slug")/maintenance-$name" --indirect --realise "$config" >/dev/null
+  nix-store --option substitute false --add-root "$(cluster_dir "$slug")/maintenance-$name" --indirect --realise "$config" >/dev/null
 }
 
 maintenance_remote() {
@@ -1669,6 +1684,62 @@ launch_recorded_config() {
   die "recorded runner readiness timed out; maintenance hold retained"
 }
 
+# A candidate is not residency evidence until the target proves its exact system.
+root_applied_source() {
+  local slug="$1" config="$2"
+  maintenance_state "$slug" root-source "$config" || return
+  maintenance_state "$slug" root-payloads "$config" "${@:3}"
+}
+
+prove_machine_selection() {
+  local slug="$1" machine="$2" top="$3" spin="$4" opts host init_check=""
+  host="$(machine_host "$slug" "$machine")" || return
+  opts="$(ssh_opts "$slug" "$machine")" || return
+  # Fixed provider store paths, never arbitrary code or caller kernel options.
+  [[ "$top" =~ ^/nix/store/[A-Za-z0-9+._-]+$ ]] || die "invalid candidate system path"
+  [ "$spin" != nixos ] || init_check="test -x '$top/init';"
+  # shellcheck disable=SC2086
+  timeout --kill-after=5s 120s ssh $opts "root@$host" "set -eu; test \"\$(readlink -e /run/current-system)\" = '$top'; $init_check requisites=\"\$(nix-store --query --requisites '$top')\" || exit \$?; test -n \"\$requisites\"; printf '%s\\n' \"\$requisites\" | xargs -r nix-store --check-validity; nix-store --add-root '/nix/var/nix/gcroots/vpsadmin-devcluster-applied-$slug-$machine' --indirect --realise '$top' >/dev/null"
+}
+
+prove_full_applied_boot() {
+  local slug="$1" config="$2" machine top names
+  root_applied_source "$slug" "$config" || return
+  names="$(jq -r '.machines | keys[]' "$config")" || return
+  [ -n "$names" ] || die "full boot proof requires every configured machine"
+  while IFS= read -r machine; do
+    top="$(jq -r --arg machine "$machine" '.machines[$machine].toplevel' "$config")" || return
+    prove_machine_selection "$slug" "$machine" "$top" "$(jq -r --arg machine "$machine" '.machines[$machine].spin' "$config")" || return
+  done <<<"$names"
+  maintenance_state "$slug" applied-finish-boot "$config" "public full boot proved all current systems and rooted closures after refresh"
+}
+
+maintenance_recover_config() {
+  local slug="$1" evidence prepared next source sources
+  shift
+  [ "$#" -eq 2 ] && [ "$1" = --residency-evidence ] && [ -n "$2" ] || die "recovery requires exactly residency evidence"
+  evidence="$2"
+  devcluster_validate_cluster_directory "$slug" false || die "recovery requires existing owned state"
+  maintenance_require_stopped "$slug" || return
+  prepared="$(maintenance_state "$slug" recover-prepare "$evidence")" || return
+  sources="$(jq -r '.sources[]' <<<"$prepared")" || return
+  [ -n "$sources" ] || die "recovery requires rooted machine source evidence"
+  while IFS= read -r source; do
+    # Historical JSON remains evidence, but its superseded DNS is not selected.
+    maintenance_state "$slug" root-source "$source" || return
+  done <<<"$sources"
+  source="$(jq -r '.next_config' <<<"$prepared")" || return
+  if [ "$(jq -r '.already_recorded' <<<"$prepared")" = true ]; then
+    root_applied_source "$slug" "$source" || return
+    printf 'identical recovery already recorded; selected host payload roots checked; maintenance remains pending\n'
+    return
+  fi
+  next="$(nix-store --add "$source")" || return
+  root_applied_source "$slug" "$next" || return
+  maintenance_state "$slug" recover-commit "$evidence" "$next" || return
+  printf 'retained DNS selection recovered; copied boot and release remain pending\n'
+}
+
 maintenance_start() {
   local slug="$1" resident="" expected="" evidence=""
   shift
@@ -1683,9 +1754,12 @@ maintenance_start() {
   [ -n "$resident" ] && [ -n "$expected" ] && [ -n "$evidence" ] || die "maintenance-start requires resident config, expected toplevel and residency evidence"
   devcluster_validate_cluster_directory "$slug" false || die "maintenance requires existing owned cluster state"
   maintenance_require_stopped "$slug" || return
+  maintenance_state "$slug" root-maintenance-sources || return
+  maintenance_state "$slug" root-source "$resident" || return
   maintenance_state "$slug" prepare "$resident" "$expected" "$evidence" || return
-  maintenance_state "$slug" inspect || return
   maintenance_root_config "$slug" resident "$resident" || return
+  maintenance_state "$slug" root-payloads "$resident" services || return
+  maintenance_state "$slug" inspect || return
   launch_recorded_config "$slug" "$resident" maintenance || return
   wait_for_machine_ssh "$slug" services || return
   maintenance_check_hold "$slug" || return
@@ -1704,10 +1778,12 @@ maintenance_copy_only() {
   local -a identity=() after=()
   read -r -a identity <<<"$(maintenance_identity "$slug")" || return
   [ "${#identity[@]}" -eq 3 ] || die "maintenance boot identity is incomplete"
+  maintenance_state "$slug" root-maintenance-sources || return
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
     build_config_with_credentials "$slug" "$(cluster_topology "$slug")" "$(cluster_network "$slug")" || return
   config="$(config_path "$slug")" || return
   maintenance_state "$slug" begin-copy "$config" "${identity[@]}" || return
+  root_applied_source "$slug" "$config" services || return
   top="$(maintenance_state "$slug" candidate-toplevel)" || return
   host="$(machine_host "$slug" services)" || return
   opts="$(ssh_opts "$slug" services)" || return
@@ -1718,7 +1794,7 @@ maintenance_copy_only() {
   [ "${identity[*]}" = "${after[*]}" ] || die "maintenance runner or boot changed during copy"
   maintenance_state "$slug" build-next "$(cluster_dir "$slug")/maintenance-next.json" || return
   next="$(nix-store --add "$(cluster_dir "$slug")/maintenance-next.json")" || return
-  maintenance_root_config "$slug" next "$next" || return
+  root_applied_source "$slug" "$next" || return
   maintenance_root_config "$slug" candidate "$config" || return
   maintenance_state "$slug" finish-copy "$next" "${after[@]}" || return
   printf 'services closure copied; running generation remains held\n'
@@ -1728,6 +1804,8 @@ start_copied_config() {
   local slug="$1" config
   maintenance_require_stopped "$slug" || return
   config="$(maintenance_state "$slug" copied)" || return
+  maintenance_state "$slug" applied-begin-boot "$config" copied_boot || return
+  root_applied_source "$slug" "$config" || return
   launch_recorded_config "$slug" "$config" copied || return
   wait_for_machine_ssh "$slug" services || return
   maintenance_remote "$slug" 'set -eu
@@ -1746,6 +1824,7 @@ start_copied_config() {
   local -a identity=()
   read -r -a identity <<<"$(maintenance_identity "$slug")" || return
   [ "${#identity[@]}" -eq 3 ] || die "copied boot identity is incomplete"
+  prove_full_applied_boot "$slug" "$config" || return
   maintenance_state "$slug" release "${identity[@]}" || return
   printf 'copied services configuration ready; maintenance hold released\n'
 }
@@ -1857,6 +1936,7 @@ main() {
 
   case "$cmd" in
     start) devcluster_with_lifecycle_lock "$1" true true start start_dispatch "${@:2}" ;;
+    maintenance-recover-config) devcluster_with_lifecycle_lock "$1" true true maintenance-recover-config maintenance_recover_config "${@:2}" ;;
     maintenance-start) devcluster_with_lifecycle_lock "$1" true true maintenance-start maintenance_start "${@:2}" ;;
     stop) devcluster_with_lifecycle_lock "$1" false true stop stop_cluster "${@:2}" ;;
     status) devcluster_with_lifecycle_lock "$1" false false status status_cluster "${@:2}" ;;

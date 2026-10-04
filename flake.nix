@@ -325,6 +325,7 @@
                 pkgs.coreutils
                 pkgs.git
                 pkgs.jq
+                pkgs.nix
                 pkgs.openssl
                 pkgs.ruby
                 pkgs.tmux
@@ -343,6 +344,7 @@
               ruby test/devcluster_webui_seed_test.rb
               ruby test/devcluster_runner_test.rb
               ruby test/devcluster_maintenance_test.rb
+              ruby test/devcluster_store_roots_test.rb
               ruby test/devcluster_storage_profile_test.rb
               ruby test/kb_cleanup_test.rb
               ruby test/kb_contract_tools_test.rb
