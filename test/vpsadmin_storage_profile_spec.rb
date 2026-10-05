@@ -249,6 +249,56 @@ RSpec.describe DevClusters::VpsAdminStorageProfile do
     Object.new.tap { |receiver| receiver.instance_eval(methods, 'static-profile-seed', 1) }
   end
 
+  it 'requests fixture VPS memory within the selected API seed bounds' do
+    # The ordinary spec seed has a lower minimum than the selected guest seed.
+    # Evaluate only its unique numeric memory definition, never the full seed.
+    expression = <<~NIX
+      let
+        source = import (builtins.toPath #{JSON.generate(File.join(api_root, 'api/db/seeds/test.nix'))});
+        definitions = builtins.filter (row: row.model == "ClusterResource") source.seed;
+        resources = if builtins.length definitions == 1 then
+          (builtins.head definitions).records
+        else throw "ambiguous cluster resource definition";
+        rows = builtins.filter (row: row.name == "memory") resources;
+        memory = if builtins.length rows == 1 then builtins.head rows
+          else throw "ambiguous memory definition";
+      in
+        if builtins.all builtins.isInt [ memory.min memory.max memory.stepsize ] then
+          { inherit (memory) min max stepsize; }
+        else throw "invalid numeric memory definition"
+    NIX
+    output, _errors, status = Open3.capture3('timeout', '--kill-after=5s', '30s',
+                                             'nix', 'eval', '--impure', '--json', '--expr', expression)
+    raise 'Selected API memory projection failed' unless status.success? && output.bytesize <= 1024
+
+    bounds = JSON.parse(output)
+    expect(bounds.keys.sort).to eq(%w[max min stepsize])
+    expect(bounds.values).to all(be_a(Numeric))
+    expect(bounds.fetch('stepsize')).to be_positive
+    expect(512).to be < bounds.fetch('min')
+
+    member = user
+    template = create_os_template!
+    request = { 'key' => SecureRandom.hex(8), 'os_template_id' => template.id }
+    user_chain = instance_double(TransactionChain)
+    guest = StorageProfileAcceptance::Guest
+    expect(TransactionChains::User::Create).to receive(:fire)
+      .with(instance_of(User), false, nil, nil, true).and_return([user_chain, member])
+    expect(guest).to receive(:record_admitted!).with(user_chain, 'user_id' => member.id)
+    expect(guest).to receive(:wait!).with(user_chain)
+    captured_memory = nil
+    request_captured = Class.new(StandardError)
+    expect(VpsAdmin::API::Operations::Vps::Create).to receive(:run) do |attributes, resources, _options|
+      expect(attributes.values_at(:user, :node, :os_template)).to eq([member, source_pool.node, template])
+      captured_memory = resources.fetch(:memory)
+      raise request_captured
+    end
+
+    expect { guest.prepare!(request, profile) }.to raise_error(request_captured)
+    expect(captured_memory).to be_between(bounds.fetch('min'), bounds.fetch('max')).inclusive
+    expect(captured_memory % bounds.fetch('stepsize')).to eq(0)
+  end
+
   it 'runs the enabled static seed repeatedly without rewriting changed namespace or resource assignments' do
     ensure_user_namespace_blocks!(count: 6)
     chain, namespace = TransactionChains::UserNamespace::Allocate.fire(user, 2)

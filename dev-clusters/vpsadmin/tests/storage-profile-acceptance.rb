@@ -191,7 +191,7 @@ module StorageProfileAcceptance
 
       chain, vps = VpsAdmin::API::Operations::Vps::Create.run(
         { user: user, node: source_pool.node, os_template: template, hostname: label },
-        { cpu: 1, memory: 512, swap: 0, diskspace: 4096 },
+        { cpu: 1, memory: 1024, swap: 0, diskspace: 4096 },
         { ipv4: 0, ipv4_private: 0, ipv6: 0, start: true }
       )
       record_admitted!(chain, 'user_id' => user.id, 'vps_id' => vps.id)
