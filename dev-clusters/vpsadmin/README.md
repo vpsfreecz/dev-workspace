@@ -397,6 +397,31 @@ keep their entitlement; catch-up reports insufficient resources rather than
 changing a personal package. Administrative/service accounts receive no
 automatic member NAS allocation.
 
+New member NAS roots use `nas-<user-id>`; VPS roots keep their numeric VPS-ID
+names. Catch-up reuses one valid numeric or prefixed NAS root after checking
+member ownership, the configured NAS Pool/DIP, label, quota and confirmation.
+Ambiguous, pending or incompatible roots cause refusal. Catch-up preserves
+existing names, DIPs and policy and never creates a second NAS root beside one.
+
+Before staging a backup creation or enrolling a reused copy, the profile checks
+exclusive catalog ownership of the destination node, Pool filesystem and
+Dataset full name. A locking read under storage admission checks current
+claims, including confirmed and pending DIPs in duplicate Pool entries.
+Only the validated reused DIP is excluded. A conflicting claim rolls back the
+current User, VPS or catch-up staging before its commands can run. Physical
+waits hold no admission lock. This check covers catalog claims made through
+upgraded profile writers; uncatalogued physical targets and old or unrelated
+writers remain outside its guarantee.
+
+Load the upgraded helper in every profile-writing API, Supervisor and task
+process before enrollment. After creating prefixed roots, rolling back to an
+active old helper could create a second root because it recognizes only numeric
+NAS names. Before rolling back, use the compatible retired selection
+(`enable: true`, `enrollment: false`) and normal retirement, retaining the
+preserving overlay. Naming and refusal changes do not repair existing aliases.
+Retirement leaves their Dataset/DIP catalog and payloads intact; re-enrollment
+refuses an alias until a separately authorized recovery has resolved it.
+
 After the compatible services generation and Node workers are running, use:
 
 ```sh

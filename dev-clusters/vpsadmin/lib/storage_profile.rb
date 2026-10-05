@@ -215,7 +215,7 @@ module DevClusters
         PLAN_NAME, label: 'Development short backup', keep_empty_group_snapshots: true
       ) do |dip|
         profile.require_enrollment! if %i[add verify].include?(direction)
-        profile.validate_registration!(dip)
+        profile.validate_registration!(dip, check_backup_path: %i[add verify].include?(direction))
         group_snapshot dip, *SNAPSHOT_SCHEDULE
         backup dip, *BACKUP_SCHEDULE
       end
@@ -261,7 +261,7 @@ module DevClusters
       end
     end
 
-    def validate_registration!(source)
+    def validate_registration!(source, check_backup_path: true)
       selection = source_pool_configs.find do |pool|
         pool.fetch('nodeId') == source.pool.node_id && pool.fetch('filesystem') == source.pool.filesystem
       end
@@ -287,6 +287,7 @@ module DevClusters
         raise ::ResourceLocked.new(copy, 'Configured backup destination is locked by another chain')
       end
 
+      validate_backup_path!(source.dataset, backup, copy: copy) if check_backup_path
       copy
     end
 
@@ -304,6 +305,7 @@ module DevClusters
       destination = pool!(config.fetch('backupPool'))
       copies = source_dip.dataset.dataset_in_pools.joins(:pool).where(pools: { role: :backup }).lock.limit(2).to_a
       if copies.empty?
+        validate_backup_path!(source_dip.dataset, destination)
         if destination.dataset_in_pools.count >= destination.max_datasets
           raise Invalid, 'Configured backup pool has no dataset capacity'
         end
@@ -321,6 +323,7 @@ module DevClusters
 
         backup = copies.first
         chain.lock(backup)
+        validate_backup_path!(source_dip.dataset, destination, copy: backup)
       end
       if owned_create?(chain, source_dip.dataset)
         source_dip.update!(min_snapshots: 2, max_snapshots: 3, snapshot_max_age: 1800)
@@ -369,13 +372,21 @@ module DevClusters
       chain.lock(user)
       map = ensure_namespace!(chain: chain, user: user)
       nas = pool!(config.fetch('nasPool'))
-      roots = ::Dataset.roots.where(user: user, name: user.id.to_s).limit(2).to_a
+      names = [user.id.to_s, "nas-#{user.id}"]
+      nas_datasets = ::DatasetInPool.where(pool: nas).select(:dataset_id)
+      candidates = ::Dataset.roots.where(name: names)
+      # Include owned NAS roots with unexpected names and foreign owners of
+      # either accepted NAS path; neither permits creating a second root.
+      roots = ::Dataset.roots.where(user: user, vps_id: nil, id: nas_datasets)
+                       .or(candidates.where(user: user, vps_id: nil))
+                       .or(candidates.where(id: nas_datasets)).lock.limit(2).to_a
       raise Invalid, 'Member NAS root is ambiguous' if roots.size > 1
 
       if roots.one?
         root = roots.first
-        copies = root.dataset_in_pools.where(pool: nas).limit(2).to_a
-        unless root.confirmed? && root.user_editable && root.user_create && !root.user_destroy &&
+        copies = root.dataset_in_pools.where(pool: nas).lock.limit(2).to_a
+        unless root.user_id == user.id && root.vps_id.nil? && names.include?(root.name) &&
+               root.full_name == root.name && root.confirmed? && root.user_editable && root.user_create && !root.user_destroy &&
                copies.one? && copies.first.confirmed? && copies.first.label == 'nas' && copies.first.effective_quota == 1024
           raise Invalid, 'Existing NAS root is incompatible or pending'
         end
@@ -385,7 +396,7 @@ module DevClusters
       end
       raise Invalid, 'Configured NAS pool has no dataset capacity' if nas.dataset_in_pools.count >= nas.max_datasets
 
-      root = ::Dataset.new(name: user.id.to_s, user: user, user_editable: true,
+      root = ::Dataset.new(name: "nas-#{user.id}", user: user, user_editable: true,
                            user_create: true, user_destroy: false, confirmed: ::Dataset.confirmed(:confirm_create))
       chain.use_chain(::TransactionChains::Dataset::Create,
                       args: [nas, nil, [root], { user: user, label: 'nas', automount: false,
@@ -520,6 +531,20 @@ module DevClusters
     end
 
     private
+
+    def validate_backup_path!(dataset, destination, copy: nil)
+      ::StorageMutationAdmission.check!
+      owners = ::DatasetInPool.joins(:pool, :dataset).where(
+        pools: { node_id: destination.node_id, filesystem: destination.filesystem },
+        datasets: { full_name: dataset.full_name }
+      )
+      owners = owners.where.not(id: copy.id) if copy
+      # Admission serializes upgraded profile writers. FOR UPDATE sees a claim
+      # committed while this transaction waited, including pending/Pool aliases.
+      return if owners.lock.limit(1).to_a.empty?
+
+      raise Invalid, 'Configured backup path has another catalog owner'
+    end
 
     # Static seed and retirement share this bounded ownership check. Packages
     # and assignments survive; only the future default link is removed.
