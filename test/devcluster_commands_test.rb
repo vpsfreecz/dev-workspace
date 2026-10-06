@@ -494,6 +494,105 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def profile_inspection_v2
+    {
+      'version' => 2, 'profile_version' => 2, 'enrollment' => true,
+      'backup_placement' => { 'legacy' => { 'node_id' => 201, 'filesystem' => 'tank/backup' },
+                              'vps' => { 'node_id' => 201, 'filesystem' => 'tank/vps-backup' } },
+      'pools' => [
+        { 'node_id' => 101, 'filesystem' => 'tank/ct', 'present' => true },
+        { 'node_id' => 102, 'filesystem' => 'tank/ct', 'present' => true },
+        { 'node_id' => 201, 'filesystem' => 'tank/backup', 'present' => false },
+        { 'node_id' => 201, 'filesystem' => 'tank/nas', 'present' => false },
+        { 'node_id' => 201, 'filesystem' => 'tank/vps-backup', 'present' => false }
+      ]
+    }
+  end
+
+  def test_storage_profile_v2_preflights_both_destinations_before_provision_or_retire
+    %w[provision retire].each do |operation|
+      with_workspace('vpsadmin', retained: true) do |env, directory|
+        env = enable_storage_profile(env, directory, enrollment: operation == 'provision', vps_root: 'tank/vps-backup')
+        with_profile_runner(env, directory) do
+          result = run_helper('vpsadmin', env, 'storage-profile', operation)
+          assert(result.success?, @last_output)
+          commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+          probes = commands.each_index.select { |index| commands[index].include?('zfs list -H -r') }
+          stop = commands.index('systemctl stop vpsadmin-scheduler.service')
+          assert_equal(5, probes.size)
+          assert(probes.all? { |index| index < stop })
+          refute(events(env).any? { |event| %w[build run copy activate].include?(event['event']) })
+          assert_locks_released(env)
+        end
+      end
+    end
+  end
+
+  def test_storage_profile_rejects_stale_typed_or_incomplete_placement_reports_before_effects
+    changes = [
+      ->(r) { r['version'] = 1 }, ->(r) { r['version'] = 2.0 },
+      ->(r) { r['profile_version'] = 1 }, ->(r) { r['profile_version'] = '2' },
+      ->(r) { r['profile_version'] = 2.0 }, ->(r) { r['enrollment'] = 'true' },
+      ->(r) { r['extra'] = true }, ->(r) { r.delete('profile_version') },
+      ->(r) { r.delete('backup_placement') },
+      ->(r) { r['backup_placement']['vps']['filesystem'] = 'tank/foreign' },
+      ->(r) { r['backup_placement']['legacy']['node_id'] = 101 },
+      ->(r) { r['backup_placement']['vps']['node_id'] = 201.0 },
+      ->(r) { r['pools'].pop }, ->(r) { r['pools'] << r['pools'].last.dup },
+      ->(r) { r['pools'].last['present'] = nil },
+      ->(r) { r['pools'] += 7.times.map { |i| { 'node_id' => 201, 'filesystem' => "tank/extra#{i}", 'present' => false } } }
+    ]
+    changes.each do |change|
+      with_workspace('vpsadmin', retained: true) do |env, directory|
+        env = enable_storage_profile(env, directory, vps_root: 'tank/vps-backup')
+        report = profile_inspection_v2
+        change.call(report)
+        env['TEST_PROFILE_REPORT'] = JSON.generate(report)
+        with_profile_runner(env, directory) do
+          result = run_helper('vpsadmin', env, 'storage-profile', 'provision')
+          refute(result.success?, @last_output)
+          commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+          refute(commands.any? { |command| command.include?('zfs list') || command.include?('systemctl stop') || command.include?("'provision'") })
+          assert_locks_released(env)
+        end
+      end
+    end
+    with_workspace('vpsadmin', retained: true) do |env, directory|
+      env = enable_storage_profile(env, directory)
+      env['TEST_PROFILE_REPORT'] = JSON.generate(profile_inspection_v2)
+      with_profile_runner(env, directory) do
+        refute(run_helper('vpsadmin', env, 'storage-profile', 'provision').success?)
+        refute(events(env).any? { |event| event['argv'].last.to_s.include?('systemctl stop') })
+      end
+    end
+  end
+
+  def test_storage_profile_v2_accepts_eleven_selected_pools_and_refuses_preferred_root_adoption
+    with_workspace('vpsadmin', retained: true) do |env, directory|
+      env = enable_storage_profile(env, directory, vps_root: 'tank/vps-backup')
+      config = JSON.parse(File.read(env.fetch('TEST_CONFIG')))
+      report = profile_inspection_v2
+      (3..8).each do |index|
+        config['nodes']["node#{index}"] = config['nodes']['node1'].merge('id' => 100 + index, 'sshPort' => 10122)
+        config['topologies']['storage'] << "node#{index}"
+        report['pools'] << { 'node_id' => 100 + index, 'filesystem' => 'tank/ct', 'present' => true }
+      end
+      File.write(env.fetch('TEST_CONFIG'), JSON.generate(config))
+      env['TEST_PROFILE_REPORT'] = JSON.generate(report)
+      with_profile_runner(env, directory) do
+        assert(run_helper('vpsadmin', env, 'storage-profile', 'provision').success?, @last_output)
+      end
+    end
+    with_workspace('vpsadmin', retained: true) do |env, directory|
+      env = enable_storage_profile(env, directory, vps_root: 'tank/vps-backup').merge('TEST_PROFILE_VPS_ORPHAN' => '1')
+      with_profile_runner(env, directory) do
+        refute(run_helper('vpsadmin', env, 'storage-profile', 'provision').success?)
+        commands = events(env).select { |event| event['event'] == 'ssh' }.map { |event| event['argv'].last }
+        refute_includes(commands, 'systemctl stop vpsadmin-scheduler.service')
+      end
+    end
+  end
+
   def test_failed_guest_requisite_query_keeps_target_pending_without_root_or_promotion
     with_workspace('vpsadmin') do |env, directory|
       proof_env = selection_proof_environment(env).merge('FAIL_PROOF_QUERY' => '1')
@@ -889,10 +988,11 @@ class DevclusterCommandsTest < Minitest::Test
               'TEST_PROOF_EVENTS' => File.join(bin, 'events'))
   end
 
-  def enable_storage_profile(env, directory, enrollment: :omitted)
+  def enable_storage_profile(env, directory, enrollment: :omitted, vps_root: :omitted)
     config = JSON.parse(File.read(env.fetch('TEST_CONFIG')))
     config['storageProfile'] = { 'enable' => true }
     config['storageProfile']['enrollment'] = enrollment unless enrollment == :omitted
+    config['storageProfile']['vpsBackupFilesystem'] = vps_root unless vps_root == :omitted
     path = File.join(directory, 'config.json')
     File.write(path, JSON.generate(config))
     File.write(File.join(directory, 'topology'), "storage\n")
@@ -1267,15 +1367,28 @@ class DevclusterCommandsTest < Minitest::Test
             selection = JSON.parse(File.read(ENV.fetch('TEST_CONFIG'))).fetch('storageProfile')
             enrollment = selection.fetch('enrollment', true)
             enrollment = JSON.parse(ENV.fetch('TEST_PROFILE_EFFECTIVE_ENROLLMENT')) if ENV.key?('TEST_PROFILE_EFFECTIVE_ENROLLMENT')
-            puts JSON.generate('version' => 1, 'enrollment' => enrollment, 'pools' => [
+            rows = [
               { 'node_id' => 101, 'filesystem' => 'tank/ct', 'present' => true },
-              { 'node_id' => 201, 'filesystem' => 'tank/backup', 'present' => false },
-              { 'node_id' => 201, 'filesystem' => 'tank/nas', 'present' => false }
-            ])
+              { 'node_id' => 201, 'filesystem' => selection.fetch('backupFilesystem', 'tank/backup'), 'present' => false },
+              { 'node_id' => 201, 'filesystem' => selection.fetch('nasFilesystem', 'tank/nas'), 'present' => false }
+            ]
+            report = { 'version' => 1, 'enrollment' => enrollment, 'pools' => rows }
+            if selection.key?('vpsBackupFilesystem')
+              rows << { 'node_id' => 102, 'filesystem' => 'tank/ct', 'present' => true }
+              rows << { 'node_id' => 201, 'filesystem' => selection.fetch('vpsBackupFilesystem'), 'present' => false }
+              report.merge!('version' => 2, 'profile_version' => 2,
+                            'backup_placement' => {
+                              'legacy' => { 'node_id' => 201, 'filesystem' => selection.fetch('backupFilesystem', 'tank/backup') },
+                              'vps' => { 'node_id' => 201, 'filesystem' => selection.fetch('vpsBackupFilesystem') }
+                            })
+            end
+            report = JSON.parse(ENV.fetch('TEST_PROFILE_REPORT')) if ENV.key?('TEST_PROFILE_REPORT')
+            puts JSON.generate(report)
           elsif remote.include?('zfs list -H -r')
             roots = ['tank']
-            roots << 'tank/ct' if value_after('-p') == '10122' && ENV['TEST_PROFILE_MISSING_ROOT'] != '1'
+            roots << 'tank/ct' if %w[10122 10222].include?(value_after('-p')) && ENV['TEST_PROFILE_MISSING_ROOT'] != '1'
             roots << 'tank/backup' if value_after('-p') == '10322' && ENV['TEST_PROFILE_ORPHAN'] == '1'
+            roots << 'tank/vps-backup' if ENV['TEST_PROFILE_VPS_ORPHAN'] == '1'
             puts roots
           elsif remote.match?(/vpsadmin-storage-profile '(provision|retire)'/) && ENV['FAIL_PROFILE_OPERATION'] == '1'
             exit 23

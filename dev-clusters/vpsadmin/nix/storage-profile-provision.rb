@@ -48,7 +48,7 @@ module DevStorageProfileProvision
   end
 
   def pool_rows(profile)
-    selections = profile.config.fetch('sourcePools') + [profile.config.fetch('backupPool'), profile.config.fetch('nasPool')]
+    selections = profile.pool_configs
     selections.map do |selection|
       pools = Pool.where(node_id: selection.fetch('nodeId'), filesystem: selection.fetch('filesystem')).limit(2).to_a
       raise 'Configured storage pool is ambiguous' if pools.size > 1
@@ -73,7 +73,11 @@ module DevStorageProfileProvision
   end
 
   def inspect(profile)
-    { 'version' => 1, 'enrollment' => profile.enrollment?, 'pools' => pool_rows(profile) }
+    report = { 'version' => profile.config.fetch('version'), 'enrollment' => profile.enrollment?, 'pools' => pool_rows(profile) }
+    if profile.config.fetch('version') == 2
+      report.merge!('profile_version' => 2, 'backup_placement' => profile.backup_placement)
+    end
+    report
   end
 
   def provision!(profile)
@@ -83,7 +87,7 @@ module DevStorageProfileProvision
       StorageMutationAdmission.check!
     end
     pool_rows(profile)
-    [profile.config.fetch('backupPool'), profile.config.fetch('nasPool')].each do |selection|
+    profile.pool_configs.reject { |selection| selection.fetch('role') == 'hypervisor' }.each do |selection|
       check_deadline!
       next if Pool.exists?(node_id: selection.fetch('nodeId'), filesystem: selection.fetch('filesystem'))
 
@@ -98,7 +102,7 @@ module DevStorageProfileProvision
     loop do
       check_deadline!
       begin
-        (profile.config.fetch('sourcePools') + [profile.config.fetch('backupPool'), profile.config.fetch('nasPool')]).each do |selection|
+        profile.pool_configs.each do |selection|
           profile.pool!(selection)
         end
         break

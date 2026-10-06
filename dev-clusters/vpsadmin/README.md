@@ -477,6 +477,79 @@ profile. Never disable the overlay on retained disks to retire or recover.
 Re-enrollment requires a compatible services generation with enrollment true,
 then provision. These operations do not establish quiet or repair authority.
 
+### Optional VPS backup placement
+
+Omitting `storageProfile.vpsBackupFilesystem` keeps profile configuration
+version 1 and its single backup destination. Setting it selects configuration
+version 2 with an additional backup root on the same storage node:
+
+```json
+{
+  "storageProfile": {
+    "enable": true,
+    "vpsBackupFilesystem": "tank/vps-backup"
+  }
+}
+```
+
+The new root must have the form `zpool/component` and differ from every
+configured root on that node. Null, empty, single-component and nested paths
+are invalid. The existing `backupFilesystem` default (`tank/backup`) remains
+the NAS backup destination and an allowed destination for existing VPS copies.
+
+The configured source Pool determines placement, including for NAS children.
+With configuration version 2, a source in a hypervisor Pool that has no backup
+copy uses `vpsBackupPool`; a NAS source uses `backupPool`. The selector reuses
+a sole valid VPS copy on either configured destination, preserving its DIP,
+name, history, retention and Plan action/task identities. The unused preferred
+Pool need not be ready. A source without a backup requires its default Pool
+to be ready and have capacity; the selector does not fall back to the other
+destination.
+
+Configuration version 2 examines all backup-role copies, including closed and
+pending ones. Multiple copies, a foreign destination, an invalid Pool,
+unrelated pending work or a catalog path alias cause refusal before the staging
+transaction can commit. Only the enclosing staging chain may reuse its own
+copy awaiting a create confirmation. The payload reader requires a confirmed,
+unlocked source and destination. It uses the same selector and completes its
+admission/path transaction before SSH, payload writes or physical waits.
+Configuration version 1 retains direct Plan selection among open copies;
+its catch-up and payload reader examine all copies. Catalog checks do not
+prove absence of uncatalogued physical paths.
+
+Provision inspects every configured source, NAS and backup root before creating
+any Pool, then uses normal Pool chains and fresh readiness evidence. Shared
+snapshot templates remain on source and NAS Pools. Inspection report version 2
+contains `profile_version: 2` and the exact legacy and VPS destination
+identities. The host requires those identities and the complete bounded Pool
+list to match its resolved desired configuration before stopping dispatch or
+changing Pools. Without the opt-in, inspection retains report version 1.
+These versions are separate from preserving-seed marker version 1 and the
+unchanged maintenance and runtime formats.
+
+Deliver the compatible helper and configuration to every API, Supervisor,
+scheduler and database-task writer before affected enrollment or dispatch.
+Exclude or settle old staging writers before the transition. An old process
+with its version-1 configuration can still stage into the legacy Pool; editing
+the host config or stopping the scheduler does not prove that all writers have
+loaded the new selection.
+
+Existing copies retain their locations and names; the policy never adds a
+second copy beside one. Removing or changing a destination with existing copies is
+unsupported. Once copies exist only on the version-2 VPS destination, rollback
+to an active version-1 profile is unsupported. Keep the enabled preserving
+overlay and a compatible retired selection during transitions. Compatible
+retirement removes only owned scheduling/default metadata, preserving copies
+and histories in both destination Pools. Re-enrollment retains each valid
+destination.
+
+This policy leaves existing aliases unresolved and does not authorize retrying
+a populated trial. Delivery requires reviewed provider publication, a generated
+consumer pin, composed package/source proof, external idle activation and
+supported services delivery. Before use, verify the exact installed scripts
+and configuration and prove that the writers loaded them. Editing a worktree
+helper does not replace the installed public package.
+
 ### Storage profile verification
 
 The optional no-VM smoke selection evaluates active and retired profile

@@ -36,7 +36,9 @@ module DevClusters
 
     def validate_config!
       fields = %w[version enrollment environmentId sourcePools backupPool nasPool resources packageVersion namespaceBlocks]
-      unless config.is_a?(Hash) && config.keys.sort == fields.sort && config['version'] == 1
+      fields += %w[vpsBackupPool] if config.is_a?(Hash) && config['version'] == 2
+      unless config.is_a?(Hash) && config['version'].is_a?(Integer) && [1, 2].include?(config['version']) &&
+             config.keys.sort == fields.sort
         raise Invalid, 'Invalid storage profile configuration'
       end
 
@@ -60,6 +62,13 @@ module DevClusters
       end
 
       all = sources + [backup, nas]
+      if config.fetch('version') == 2
+        vps = config.fetch('vpsBackupPool')
+        validate_pool_config!(vps, role: 'backup')
+        raise Invalid, 'VPS backup must use the configured storage node' unless vps.fetch('nodeId') == backup.fetch('nodeId')
+
+        all << vps
+      end
       unless all.map { |pool| [pool.fetch('nodeId'), pool.fetch('filesystem')] }.uniq.size == all.size
         raise Invalid, 'Storage profile pool selections overlap'
       end
@@ -261,51 +270,19 @@ module DevClusters
       end
     end
 
-    def validate_registration!(source, check_backup_path: true)
-      selection = source_pool_configs.find do |pool|
-        pool.fetch('nodeId') == source.pool.node_id && pool.fetch('filesystem') == source.pool.filesystem
-      end
-      raise Invalid, 'Source is outside configured storage profile pools' unless selection
-
-      pool!(selection)
-      backup = pool!(config.fetch('backupPool'))
-      copies = source.dataset.dataset_in_pools.joins(:pool).where(pools: { role: :backup, is_open: true }).limit(2).to_a
-      unless copies.one? && copies.first.pool_id == backup.id
-        raise Invalid, 'Source requires exactly the configured backup destination'
-      end
-
-      copy = copies.first
-      source_lock = source.get_current_lock
-      chain_id = source_lock.locked_by_id if source_lock&.locked_by_type == 'TransactionChain'
-      pending_copy = chain_id && owned_create_by_id?(chain_id, copy)
-      unless copy.confirmed? || pending_copy
-        raise Invalid, 'Configured backup destination is not confirmed by this chain'
-      end
-
-      copy_lock = copy.get_current_lock
-      if copy_lock && !(chain_id && copy_lock.locked_by_type == 'TransactionChain' && copy_lock.locked_by_id == chain_id)
-        raise ::ResourceLocked.new(copy, 'Configured backup destination is locked by another chain')
-      end
-
-      validate_backup_path!(source.dataset, backup, copy: copy) if check_backup_path
+    def validate_registration!(source, check_backup_path: true, confirmed_only: false)
+      _, copy = select_backup!(source, existing_only: true, registration: true,
+                               check_backup_path: check_backup_path, confirmed_only: confirmed_only)
       copy
     end
 
     def ensure_backup_and_plan!(chain:, source_dip:)
       require_enrollment!
       ::StorageMutationAdmission.check!
-      selection = source_pool_configs.find do |pool|
-        pool.fetch('nodeId') == source_dip.pool.node_id && pool.fetch('filesystem') == source_dip.pool.filesystem
-      end
-      raise Invalid, 'Source is outside configured storage profile pools' unless selection
-
-      pool!(selection)
       chain.lock(source_dip.dataset)
       chain.lock(source_dip)
-      destination = pool!(config.fetch('backupPool'))
-      copies = source_dip.dataset.dataset_in_pools.joins(:pool).where(pools: { role: :backup }).lock.limit(2).to_a
-      if copies.empty?
-        validate_backup_path!(source_dip.dataset, destination)
+      destination, backup = select_backup!(source_dip, chain: chain)
+      unless backup
         if destination.dataset_in_pools.count >= destination.max_datasets
           raise Invalid, 'Configured backup pool has no dataset capacity'
         end
@@ -316,14 +293,7 @@ module DevClusters
         chain.lock(backup)
         chain.append_t(::Transactions::Storage::CreateDataset, args: backup) { |confirmation| confirmation.create(backup) }
       else
-        unless copies.one? && copies.first.pool_id == destination.id &&
-               (copies.first.confirmed? || owned_create?(chain, copies.first))
-          raise Invalid, 'Existing backup copy is pending or has a conflicting destination'
-        end
-
-        backup = copies.first
         chain.lock(backup)
-        validate_backup_path!(source_dip.dataset, destination, copy: backup)
       end
       if owned_create?(chain, source_dip.dataset)
         source_dip.update!(min_snapshots: 2, max_snapshots: 3, snapshot_max_age: 1800)
@@ -478,6 +448,19 @@ module DevClusters
       config.fetch('sourcePools') + [config.fetch('nasPool')]
     end
 
+    # One enumeration owns inspect, physical preflight, creation and readiness.
+    def pool_configs
+      config.fetch('sourcePools') + [config.fetch('backupPool'), config.fetch('nasPool')] +
+        (config.fetch('version') == 2 ? [config.fetch('vpsBackupPool')] : [])
+    end
+
+    def backup_placement
+      %w[backupPool vpsBackupPool].zip(%w[legacy vps]).to_h do |field, name|
+        selection = config.fetch(field)
+        [name, { 'node_id' => selection.fetch('nodeId'), 'filesystem' => selection.fetch('filesystem') }]
+      end
+    end
+
     def enrollment?
       config.fetch('enrollment')
     end
@@ -531,6 +514,78 @@ module DevClusters
     end
 
     private
+
+    # Pool identity, never a Dataset/VPS ID, determines placement. Existing
+    # copies are resolved first so reuse does not depend on an unused default.
+    def placement_for(source)
+      selection = source_pool_configs.find do |pool|
+        pool.fetch('nodeId') == source.pool.node_id && pool.fetch('filesystem') == source.pool.filesystem
+      end
+      raise Invalid, 'Source is outside configured storage profile pools' unless selection
+
+      pool!(selection)
+      legacy = config.fetch('backupPool')
+      pool!(legacy) if config.fetch('version') == 1
+      if config.fetch('version') == 2 && selection.fetch('role') == 'hypervisor'
+        preferred = config.fetch('vpsBackupPool')
+        [[legacy, preferred], preferred]
+      else
+        [[legacy], legacy]
+      end
+    end
+
+    def select_backup!(source, chain: nil, existing_only: false, registration: false,
+                       check_backup_path: true, confirmed_only: false)
+      ::StorageMutationAdmission.check! if check_backup_path
+      allowed, default = placement_for(source)
+      scope = source.dataset.dataset_in_pools.joins(:pool)
+      copies = scope.where(pools: { role: :backup })
+      if config.fetch('version') == 2
+        # A configured destination with a changed role is invalid, not empty.
+        allowed.each do |pool|
+          copies = copies.or(scope.where(pools: { node_id: pool.fetch('nodeId'), filesystem: pool.fetch('filesystem') }))
+        end
+      end
+      # v1 direct Plan calls retain their open-copy selection. Catch-up and the
+      # strict guest reader, plus every v2 caller, inspect all backup copies.
+      copies = copies.where(pools: { is_open: true }) if registration && !confirmed_only && config.fetch('version') == 1
+      copies = copies.lock if check_backup_path
+      copies = copies.limit(2).to_a
+      if copies.empty? && !existing_only
+        destination = pool!(default)
+        validate_backup_path!(source.dataset, destination)
+        return [destination, nil]
+      end
+      unless copies.one?
+        raise Invalid, 'Source requires exactly the configured backup destination'
+      end
+
+      copy = copies.first
+      selected = allowed.find do |pool|
+        pool.fetch('nodeId') == copy.pool.node_id && pool.fetch('filesystem') == copy.pool.filesystem
+      end
+      raise Invalid, 'Existing backup copy is pending or has a conflicting destination' unless selected
+
+      destination = pool!(selected)
+      raise Invalid, 'Existing backup copy has an ambiguous destination' unless copy.pool_id == destination.id
+
+      source_lock = source.get_current_lock
+      chain_id = chain ? chain.dst_chain.id : (source_lock.locked_by_id if source_lock&.locked_by_type == 'TransactionChain')
+      if confirmed_only
+        unless source.confirmed? && source.dataset.confirmed? && copy.confirmed? && !source_lock && !source.dataset.get_current_lock
+          raise Invalid, 'Fixture source or backup destination is pending or locked'
+        end
+      elsif !(copy.confirmed? || (copy.confirmed == :confirm_create && chain_id && owned_create_by_id?(chain_id, copy)))
+        raise Invalid, 'Configured backup destination is not confirmed by this chain'
+      end
+      copy_lock = copy.get_current_lock
+      if copy_lock && (confirmed_only || !(chain_id && copy_lock.locked_by_type == 'TransactionChain' && copy_lock.locked_by_id == chain_id))
+        raise ::ResourceLocked.new(copy, 'Configured backup destination is locked by another chain')
+      end
+
+      validate_backup_path!(source.dataset, destination, copy: copy) if check_backup_path
+      [destination, copy]
+    end
 
     def validate_backup_path!(dataset, destination, copy: nil)
       ::StorageMutationAdmission.check!

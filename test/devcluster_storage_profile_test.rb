@@ -54,6 +54,58 @@ class DevclusterStorageProfileTest < Minitest::Test
     assert_raises(Profile::Invalid) { Profile.new(overlap) }
   end
 
+  def placement_configuration
+    configuration.merge('version' => 2, 'vpsBackupPool' => {
+      'nodeId' => 201, 'filesystem' => 'tank/vps-backup', 'role' => 'backup', 'maxDatasets' => 32
+    })
+  end
+
+  def test_profile_formats_are_exact_integer_declarations_with_no_optional_fields
+    [configuration, placement_configuration].each do |valid|
+      assert_equal(valid, Profile.new(valid).config)
+      [nil, '1', '2', 1.0, 2.0, 0, 3].each do |version|
+        assert_raises(Profile::Invalid) { Profile.new(valid.merge('version' => version)) }
+      end
+      assert_raises(Profile::Invalid) { Profile.new(valid.merge('extra' => true)) }
+    end
+    assert_raises(Profile::Invalid) { Profile.new(placement_configuration.merge('version' => 1)) }
+    assert_raises(Profile::Invalid) { Profile.new(configuration.merge('version' => 2)) }
+  end
+
+  def test_vps_placement_is_bounded_distinct_and_on_the_existing_storage_node
+    [nil, '', 'tank', 'tank/backup/child', 'tank/..', 'tank/backup', 'tank/nas'].each do |root|
+      invalid = placement_configuration
+      invalid.fetch('vpsBackupPool')['filesystem'] = root
+      assert_raises(Profile::Invalid) { Profile.new(invalid) }
+    end
+    invalid = placement_configuration
+    invalid.fetch('vpsBackupPool')['nodeId'] = 202
+    assert_raises(Profile::Invalid) { Profile.new(invalid) }
+    invalid = placement_configuration
+    invalid.fetch('sourcePools').first['nodeId'] = 201
+    invalid.fetch('vpsBackupPool')['filesystem'] = 'tank/ct'
+    assert_raises(Profile::Invalid) { Profile.new(invalid) }
+    %w[role maxDatasets].each do |field|
+      invalid = placement_configuration
+      invalid.fetch('vpsBackupPool').delete(field)
+      assert_raises(Profile::Invalid) { Profile.new(invalid) }
+    end
+  end
+
+  def test_pool_enumeration_and_inspection_placement_leave_templates_on_source_pools
+    selected = Profile.new(placement_configuration)
+    assert_equal(4, selected.pool_configs.size)
+    assert_equal(2, selected.source_pool_configs.size)
+    assert_equal({ 'legacy' => { 'node_id' => 201, 'filesystem' => 'tank/backup' },
+                   'vps' => { 'node_id' => 201, 'filesystem' => 'tank/vps-backup' } }, selected.backup_placement)
+    assert_equal(3, Profile.new(configuration).pool_configs.size)
+    bounded = placement_configuration
+    bounded['sourcePools'] = 8.times.map { |i| { 'nodeId' => 101 + i, 'filesystem' => 'tank/ct', 'role' => 'hypervisor' } }
+    assert_equal(11, Profile.new(bounded).pool_configs.size)
+    bounded['sourcePools'] << { 'nodeId' => 109, 'filesystem' => 'tank/ct', 'role' => 'hypervisor' }
+    assert_raises(Profile::Invalid) { Profile.new(bounded) }
+  end
+
   def test_existing_preservation_marker_has_the_exact_consumer_shape
     assert_equal({ 'version' => 1, 'existingAssignments' => 'preserve' }, Profile::PRESERVING_SEED)
     source = File.read(File.expand_path('../dev-clusters/vpsadmin/nix/test.nix', __dir__))

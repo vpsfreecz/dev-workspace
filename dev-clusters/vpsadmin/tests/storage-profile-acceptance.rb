@@ -120,13 +120,10 @@ module StorageProfileAcceptance
     end
 
     def destination!(source, profile)
-      backup_pool = profile.pool!(profile.config.fetch('backupPool'))
-      copies = source.dataset.dataset_in_pools.joins(:pool).where(pools: { role: :backup }).limit(2).to_a
-      unless copies.one? && copies.first.pool_id == backup_pool.id && copies.first.confirmed?
-        raise Invalid, 'fixture backup destination differs'
+      # Shared strict selection/path admission ends before SSH or physical waits.
+      StorageFreezeControl.transaction(requires_new: true) do
+        profile.validate_registration!(source, confirmed_only: true)
       end
-
-      copies.first
     end
 
     def machine!(node)

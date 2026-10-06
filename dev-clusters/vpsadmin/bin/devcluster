@@ -1862,7 +1862,7 @@ storage_profile_cluster() {
   [ "$#" -eq 2 ] && [[ "$operation" = provision || "$operation" = retire ]] || die "storage-profile requires provision or retire"
   [ "$(config_get "$slug" '.storageProfile.enable // false')" = true ] || die "storage profile is not enabled"
   local desired_enrollment
-  desired_enrollment="$(config_get "$slug" '.storageProfile | if has("enrollment") then .enrollment else true end')" || return
+  desired_enrollment="$(config_get "$slug" '.storageProfile | if has("enrollment") then if (.enrollment | type) == "boolean" then .enrollment else "invalid" end else true end')" || return
   [[ "$desired_enrollment" = true || "$desired_enrollment" = false ]] || die "storage profile enrollment must be a boolean"
   if [ "$operation" = provision ]; then
     [ "$desired_enrollment" = true ] || die "storage profile provisioning requires enrollment enabled"
@@ -1885,10 +1885,57 @@ storage_profile_cluster() {
     die "storage profile inspection failed; private evidence: $profile_dir"
   fi
   [ "$(wc -c <"$report")" -le 8192 ] || die "storage profile inspection exceeded its bound"
-  jq -e '.version == 1 and (.enrollment | type == "boolean") and (.pools | length >= 1 and length <= 10) and
-    all(.pools[]; (.node_id | type == "number" and . == floor and . > 0) and
-      (.filesystem | type == "string" and test("^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")) and
-      (.present | type == "boolean"))' "$report" >/dev/null || die "invalid storage profile inspection"
+  # Inspection and profile formats are independent. Validate JSON integer
+  # declarations, exact fields and loaded routing before any root/Pool effect.
+  ruby -rjson - "$report" "$cfg" <<'RUBY' || die "invalid storage profile inspection or desired/loaded routing"
+begin
+  report, cfg = ARGV.map { |path| JSON.parse(File.binread(path)) }
+  selection = cfg.fetch('storageProfile')
+  opt_in = selection.key?('vpsBackupFilesystem')
+  version = opt_in ? 2 : 1
+  valid_root = lambda do |root|
+    root.is_a?(String) && root.match?(%r{\A[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\z}) &&
+      root.split('/').none? { |part| %w[. ..].include?(part) }
+  end
+  fields = %w[version enrollment pools] + (opt_in ? %w[profile_version backup_placement] : [])
+  valid = report.is_a?(Hash) && report.keys.sort == fields.sort &&
+    report['version'].is_a?(Integer) && report['version'] == version &&
+    [true, false].include?(report['enrollment'])
+  rows = report.fetch('pools')
+  valid &&= rows.is_a?(Array) && rows.size.between?(1, opt_in ? 11 : 10) && rows.all? do |row|
+    row.is_a?(Hash) && row.keys.sort == %w[filesystem node_id present] &&
+      row['node_id'].is_a?(Integer) && row['node_id'].positive? && valid_root.call(row['filesystem']) &&
+      [true, false].include?(row['present'])
+  end
+  abort 'invalid storage profile inspection' unless valid
+  identities = rows.map { |row| row.values_at('node_id', 'filesystem') }
+  abort 'duplicate storage profile pool selection' unless identities.uniq == identities
+  if opt_in
+    nodes = cfg.fetch('topologies').fetch('storage').map { |name| cfg.fetch('nodes').fetch(name) }
+    storage = nodes.select { |node| node.fetch('role') == 'storage' }
+    abort 'invalid storage profile storage topology' unless storage.one?
+    storage_id = storage.first.fetch('id')
+    abort 'invalid desired storage node identity' unless storage_id.is_a?(Integer) && storage_id.positive?
+    legacy = selection.fetch('backupFilesystem', 'tank/backup')
+    vps = selection.fetch('vpsBackupFilesystem')
+    nas = selection.fetch('nasFilesystem', 'tank/nas')
+    roots = [legacy, vps, nas]
+    abort 'invalid desired storage profile roots' unless roots.all? { |root| valid_root.call(root) } && roots.uniq.size == roots.size
+    placement = { 'legacy' => { 'node_id' => storage_id, 'filesystem' => legacy },
+                  'vps' => { 'node_id' => storage_id, 'filesystem' => vps } }
+    abort 'storage profile placement differs from desired routing' unless
+      report['profile_version'].is_a?(Integer) && report['profile_version'] == 2 &&
+      report['backup_placement'] == placement &&
+      report['backup_placement'].values.all? { |entry| entry['node_id'].is_a?(Integer) }
+    expected = nodes.select { |node| node.fetch('role') == 'node' }.map do |node|
+      [node.fetch('id'), cfg.fetch('seed').fetch('pools').fetch('filesystem')]
+    end + roots.map { |root| [storage_id, root] }
+    abort 'incomplete storage profile pool inspection' unless identities.sort == expected.sort
+  end
+rescue JSON::ParserError, KeyError, TypeError, NoMethodError
+  abort 'invalid storage profile inspection'
+end
+RUBY
   [ "$(jq -r '.enrollment' "$report")" = "$desired_enrollment" ] || die "storage profile desired and deployed enrollment differ; complete the services replacement first"
   while IFS=$'\t' read -r node root present; do
     [[ "$root" != */. && "$root" != */.. && "$root" != ./* && "$root" != ../* ]] || die "invalid storage profile root"

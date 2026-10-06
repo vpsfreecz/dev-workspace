@@ -35,6 +35,14 @@ RSpec.describe DevClusters::VpsAdminStorageProfile do
     }
   end
   let(:profile) { described_class.new(configuration) }
+  let(:vps_backup_pool) { create_profile_pool!(:backup, 'profile_vps_backup') }
+  let(:placement_configuration) do
+    configuration.merge('version' => 2, 'vpsBackupPool' => {
+      'nodeId' => vps_backup_pool.node_id, 'filesystem' => vps_backup_pool.filesystem,
+      'role' => 'backup', 'maxDatasets' => 32
+    })
+  end
+  let(:placement_profile) { described_class.new(placement_configuration) }
 
   around do |example|
     definitions = VpsAdmin::API::DatasetPlans.plans.dup
@@ -105,6 +113,27 @@ RSpec.describe DevClusters::VpsAdminStorageProfile do
                                              user_destroy: false, properties: { quota: 1024 })
     attach_dataset_to_pool!(dataset: dataset, pool: backup_pool, label: 'backup')
     [dataset, dip]
+  end
+
+  def bootstrap_placement!
+    placement_profile.install_plan!
+    placement_profile.bootstrap_templates!
+  end
+
+  def retained_storage_rows
+    [Dataset, DatasetInPool, DatasetTree, Branch, Snapshot, SnapshotInPool, SnapshotInPoolInBranch,
+     DatasetProperty, UserNamespace, UserNamespaceMap, UserNamespaceMapEntry, ClusterResourcePackage,
+     ClusterResourcePackageItem, UserClusterResourcePackage, UserClusterResource].map do |model|
+      model.order(:id).map(&:attributes)
+    end
+  end
+
+  def retained_backup_history!(dataset, source, copy)
+    snapshot, = create_snapshot!(dataset: dataset, dip: source)
+    tree = create_tree!(dip: copy)
+    branch = create_branch!(tree: tree, name: 'profile-retained')
+    create_backup_branch_snapshot!(snapshot: snapshot, dip: copy, branch: branch)
+    [tree, branch]
   end
 
   def fresh_profile_reader(selected_configuration, chains)
@@ -660,6 +689,226 @@ RSpec.describe DevClusters::VpsAdminStorageProfile do
     destination.update!(confirmed: DatasetInPool.confirmed(:confirmed))
     profile.plan.register(source)
     expect(DatasetInPoolPlan.where(dataset_in_pool: source).count).to eq(1)
+  end
+
+  %i[legacy preferred nas].each do |destination|
+    it "preserves a valid #{destination} source copy, retained history and existing Plan/task identities under v2" do
+      bootstrap_placement!
+      dataset, source = create_dataset_with_pool!(user: user, pool: destination == :nas ? nas_pool : source_pool, name: "placement-history-#{destination}")
+      selected_pool = destination == :preferred ? vps_backup_pool : backup_pool
+      copy = attach_dataset_to_pool!(dataset: dataset, pool: selected_pool)
+      source.update!(min_snapshots: 7, max_snapshots: 99, snapshot_max_age: 777)
+      copy.update!(min_snapshots: 2, max_snapshots: 5, snapshot_max_age: 3600)
+      retained_backup_history!(dataset, source, copy)
+      placement_profile.plan.register(source)
+      # Only the selected destination must be ready for reuse.
+      (destination == :preferred ? backup_pool : vps_backup_pool).update!(is_open: 0)
+      storage = retained_storage_rows
+      metadata = [DatasetAction, RepeatableTask, DatasetInPoolPlan, GroupSnapshot].map { |m| m.order(:id).map(&:attributes) }
+      2.times do
+        chain, reused = placement_profile.catch_up_chain.fire(placement_profile, source_dip: source)
+        expect(reused.id).to eq(copy.id)
+        expect(chain.transactions.where(handle: Transactions::Storage::CreateDataset.t_type)).to be_empty
+        chain.release_locks
+        placement_profile.plan.register(source)
+        expect(StorageProfileAcceptance::Guest.destination!(source, placement_profile).id).to eq(copy.id)
+      end
+      expect(retained_storage_rows).to eq(storage)
+      expect([DatasetAction, RepeatableTask, DatasetInPoolPlan, GroupSnapshot].map { |m| m.order(:id).map(&:attributes) }).to eq(metadata)
+    end
+  end
+
+  it 'uses source Pool identity for a NAS child even when vps_id is nil and VPS placement is enabled' do
+    bootstrap_placement!
+    root, parent = create_dataset_with_pool!(user: user, pool: nas_pool, name: 'legacy-nas-root')
+    dataset, source = create_dataset_with_pool!(user: user, pool: nas_pool, parent: root, name: 'child')
+    expect(dataset.vps_id).to be_nil
+    chain, copy = placement_profile.catch_up_chain.fire(placement_profile, source_dip: source)
+    expect(copy.pool_id).to eq(backup_pool.id)
+    expect(dataset.reload.dataset_in_pools.pluck(:pool_id)).to contain_exactly(nas_pool.id, backup_pool.id)
+    expect(parent.reload.pool_id).to eq(nas_pool.id)
+    expect(chain.transactions.where(handle: Transactions::Storage::CreateDataset.t_type).count).to eq(1)
+  end
+
+  it 'places an empty numeric VPS source in the disjoint destination while preserving an equal-name legacy NAS history' do
+    bootstrap_placement!
+    nas, nas_source = create_dataset_with_pool!(user: user, pool: nas_pool, name: user.id.to_s,
+                                               label: 'nas', user_destroy: false, properties: { quota: 1024 })
+    nas_copy = attach_dataset_to_pool!(dataset: nas, pool: backup_pool)
+    retained_backup_history!(nas, nas_source, nas_copy)
+    placement_profile.plan.register(nas_source)
+    models = [DatasetTree, Branch, Snapshot, SnapshotInPool, SnapshotInPoolInBranch]
+    history = models.map { |m| m.order(:id).map(&:attributes) }
+    dataset, source = create_dataset_with_pool!(user: user, pool: source_pool, name: user.id.to_s)
+    source_identity = source.attributes
+    chain, copy = placement_profile.catch_up_chain.fire(placement_profile, source_dip: source)
+    expect(copy.pool_id).to eq(vps_backup_pool.id)
+    expect(copy.dataset_id).to eq(dataset.id)
+    expect(source.reload.attributes).to eq(source_identity)
+    creations = chain.transactions.where(handle: Transactions::Storage::CreateDataset.t_type)
+    expect(creations.count).to eq(1)
+    signed = JSON.parse(creations.first.input)
+    expect(signed.fetch('node')).to eq(vps_backup_pool.node_id)
+    expect(signed.fetch('input').slice('pool_fs', 'name', 'create_private'))
+      .to eq('pool_fs' => vps_backup_pool.filesystem, 'name' => dataset.full_name, 'create_private' => false)
+    expect(nas.reload.dataset_in_pools.pluck(:id)).to contain_exactly(nas_source.id, nas_copy.id)
+    expect(models.map { |m| m.order(:id).map(&:attributes) }).to eq(history)
+  end
+
+  %i[foreign multiple closed role pending alias].each do |invalid|
+    it "refuses a #{invalid} existing v2 copy without treating it as an empty source" do
+      bootstrap_placement!
+      dataset, source = create_dataset_with_pool!(user: user, pool: source_pool, name: "placement-refusal-#{invalid}")
+      pool = invalid == :foreign ? create_profile_pool!(:backup, 'placement_foreign') : backup_pool
+      copy = attach_dataset_to_pool!(dataset: dataset, pool: pool)
+      case invalid
+      when :multiple
+        attach_dataset_to_pool!(dataset: dataset, pool: vps_backup_pool)
+      when :closed
+        pool.update!(is_open: 0)
+      when :role
+        pool.update!(role: :primary)
+      when :pending
+        copy.update!(confirmed: DatasetInPool.confirmed(:confirm_create))
+      when :alias
+        owner = Dataset.create!(user: SpecSeed.user, name: dataset.full_name, user_create: true, user_destroy: true,
+                                user_editable: true, confirmed: Dataset.confirmed(:confirmed))
+        attach_dataset_to_pool!(dataset: owner, pool: backup_pool)
+      end
+      before = profile_staging_rows
+      expect { placement_profile.catch_up_chain.fire(placement_profile, source_dip: source) }.to raise_error(described_class::Invalid)
+      expect { placement_profile.plan.register(source) }.to raise_error(described_class::Invalid)
+      expect { StorageProfileAcceptance::Guest.destination!(source, placement_profile) }.to raise_error(described_class::Invalid)
+      expect(profile_staging_rows).to eq(before)
+      expect(dataset.dataset_in_pools.where(pool: vps_backup_pool).count).to eq(invalid == :multiple ? 1 : 0)
+    end
+  end
+
+  %i[missing stale closed full collision duplicate].each do |invalid|
+    it "refuses a #{invalid} preferred v2 destination for an empty source without falling back" do
+      bootstrap_placement!
+      dataset, source = create_dataset_with_pool!(user: user, pool: source_pool, name: "placement-default-#{invalid}")
+      selected = placement_profile
+      case invalid
+      when :missing
+        vps_backup_pool.delete
+      when :stale
+        vps_backup_pool.update_columns(checked_at: nil)
+      when :closed
+        vps_backup_pool.update!(is_open: 0)
+      when :full
+        vps_backup_pool.update!(max_datasets: 1)
+        selected = described_class.new(placement_configuration.merge('vpsBackupPool' => placement_configuration.fetch('vpsBackupPool').merge('maxDatasets' => 1)))
+        create_dataset_with_pool!(user: user, pool: vps_backup_pool, name: 'placement-full-owner')
+      when :collision
+        owner = Dataset.create!(user: SpecSeed.user, name: dataset.full_name, user_create: true, user_destroy: true,
+                                user_editable: true, confirmed: Dataset.confirmed(:confirmed))
+        attach_dataset_to_pool!(dataset: owner, pool: vps_backup_pool, confirmed: :confirm_create)
+      when :duplicate
+        create_profile_pool!(:backup, 'placement_duplicate').update!(filesystem: vps_backup_pool.filesystem)
+      end
+      before = profile_staging_rows
+      expect { selected.catch_up_chain.fire(selected, source_dip: source) }.to raise_error(described_class::Invalid)
+      expect(profile_staging_rows).to eq(before)
+      expect(dataset.dataset_in_pools.pluck(:id)).to eq([source.id])
+    end
+  end
+
+  it 'refuses a reconfigured or removed VPS destination without moving its existing copy or Plan metadata' do
+    bootstrap_placement!
+    dataset, source = create_dataset_with_pool!(user: user, pool: source_pool, name: 'placement-not-migration')
+    copy = attach_dataset_to_pool!(dataset: dataset, pool: vps_backup_pool)
+    retained_backup_history!(dataset, source, copy)
+    placement_profile.plan.register(source)
+    changed = placement_configuration.merge('vpsBackupPool' => placement_configuration.fetch('vpsBackupPool').merge('filesystem' => 'tank/changed-vps'))
+    [changed, configuration].each do |config|
+      selected = described_class.new(config)
+      selected.install_plan!
+      before = profile_staging_rows
+      expect { selected.catch_up_chain.fire(selected, source_dip: source) }.to raise_error(described_class::Invalid)
+      expect { selected.plan.register(source) }.to raise_error(described_class::Invalid)
+      expect(profile_staging_rows).to eq(before)
+      expect(dataset.dataset_in_pools.pluck(:id)).to contain_exactly(source.id, copy.id)
+    end
+  end
+
+  it 'allows only this enclosing chain pending v2 copy and keeps the fixture reader strictly confirmed' do
+    bootstrap_placement!
+    _, source = create_dataset_with_pool!(user: user, pool: source_pool, name: 'placement-owned-pending')
+    chain, copies = placement_profile.catch_up_chain.fire(placement_profile, source_dips: [source, source])
+    expect(copies.map(&:id).uniq.size).to eq(1)
+    expect(copies.first.pool_id).to eq(vps_backup_pool.id)
+    expect(chain.transactions.where(handle: Transactions::Storage::CreateDataset.t_type).count).to eq(1)
+    chain.release_locks
+    expect { StorageProfileAcceptance::Guest.destination!(source, placement_profile) }
+      .to raise_error(described_class::Invalid, /pending/)
+  end
+
+  it 'retains v1 open-copy Plan semantics but rejects an additional closed copy for every v2 consumer' do
+    bootstrap!
+    dataset, source = create_dataset_with_pool!(user: user, pool: source_pool, name: 'placement-legacy-open')
+    attach_dataset_to_pool!(dataset: dataset, pool: backup_pool)
+    extra_pool = create_profile_pool!(:backup, 'placement_closed_extra')
+    extra_pool.update!(is_open: 0)
+    attach_dataset_to_pool!(dataset: dataset, pool: extra_pool)
+    profile.plan.register(source)
+    expect { profile.catch_up_chain.fire(profile, source_dip: source) }.to raise_error(described_class::Invalid)
+    placement_profile.install_plan!
+    before = profile_staging_rows
+    expect { placement_profile.plan.register(source) }.to raise_error(described_class::Invalid)
+    expect { StorageProfileAcceptance::Guest.destination!(source, placement_profile) }.to raise_error(described_class::Invalid)
+    expect(profile_staging_rows).to eq(before)
+  end
+
+  it 'preserves both allowed histories through v2 retirement and re-enrollment metadata changes' do
+    bootstrap_placement!
+    DefaultUserClusterResourcePackage.where(environment: environment).delete_all
+    placement_profile.bootstrap_defaults!
+    sources = [backup_pool, vps_backup_pool].each_with_index.map do |pool, index|
+      dataset, source = create_dataset_with_pool!(user: user, pool: source_pool, name: "placement-retire-#{index}")
+      copy = attach_dataset_to_pool!(dataset: dataset, pool: pool)
+      retained_backup_history!(dataset, source, copy)
+      placement_profile.plan.register(source)
+      source
+    end
+    storage = retained_storage_rows
+    action_ids = placement_profile.plan.dataset_plan.dataset_actions.pluck(:id)
+    task_ids = RepeatableTask.where(class_name: 'DatasetAction', row_id: action_ids).pluck(:id)
+    retired = described_class.new(placement_configuration.merge('enrollment' => false))
+    retired.install_plan!
+    2.times { retired.retire! }
+    expect(retained_storage_rows).to eq(storage)
+    expect(DatasetInPoolPlan.where(dataset_in_pool: sources)).to be_empty
+    expect(retired.plan.dataset_plan.dataset_actions).to be_empty
+    expect(DatasetAction.where(id: action_ids)).to be_empty
+    expect(RepeatableTask.where(id: task_ids)).to be_empty
+    retired.bootstrap_defaults!
+    expect(DefaultUserClusterResourcePackage.where(environment: environment)).to be_empty
+    placement_profile.install_plan!
+    placement_profile.bootstrap_templates!
+    placement_profile.bootstrap_defaults!
+    sources.each do |source|
+      chain, copy = placement_profile.catch_up_chain.fire(placement_profile, source_dip: source)
+      expect(chain.transactions.where(handle: Transactions::Storage::CreateDataset.t_type)).to be_empty
+      chain.release_locks
+      expect(StorageProfileAcceptance::Guest.destination!(source, placement_profile).id).to eq(copy.id)
+    end
+    expect(retained_storage_rows).to eq(storage)
+  end
+
+  it 'reports v2 placement and every configured Pool independently from the profile format' do
+    bootstrap_placement!
+    SpecSeed.other_node.update!(role: :storage)
+    source = File.read(File.expand_path('../dev-clusters/vpsadmin/nix/storage-profile-provision.rb', __dir__))
+    first = source.index('module DevStorageProfileProvision')
+    last = source.index("\nactor = ", first)
+    Object.class_eval(source[first...last], 'storage-profile-provision', 1)
+    report = DevStorageProfileProvision.inspect(placement_profile)
+    expect(report.keys).to contain_exactly('version', 'profile_version', 'enrollment', 'backup_placement', 'pools')
+    expect(report.values_at('version', 'profile_version')).to eq([2, 2])
+    expect(report.fetch('backup_placement')).to eq(placement_profile.backup_placement)
+    expect(report.fetch('pools').map { |row| row.values_at('node_id', 'filesystem') })
+      .to eq(placement_profile.pool_configs.map { |pool| pool.values_at('nodeId', 'filesystem') })
   end
 
   it 'uses the actual Dataset hook once and respects preserve-existing-backups replacement' do
@@ -1484,6 +1733,79 @@ RSpec.describe 'Storage profile autocommit admission', :no_transaction do
     expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(VpsAdmin::API::Exceptions::StorageReadOnly)
     expect(TransactionChain.count).to eq(before)
     expect(EnvironmentDatasetPlan.exists?(environment: environment)).to be(true)
+  end
+
+  def autocommit_placement_profile!(create_destination: true)
+    existing_backup!
+    selection = { 'nodeId' => storage_node.id, 'filesystem' => "tank/admission_vps_#{SecureRandom.hex(4)}",
+                  'role' => 'backup', 'maxDatasets' => 32 }
+    own_pool(:backup, storage_node, filesystem: selection.fetch('filesystem')) if create_destination
+    PROFILE.new(profile.config.merge('version' => 2, 'vpsBackupPool' => selection))
+  end
+
+  it 'finishes strict Guest v2 path admission before ordinary readers and rejects a later freeze' do
+    selected = autocommit_placement_profile!
+    dip = source!
+    destination = selected.pool!(selected.config.fetch('vpsBackupPool'))
+    copy = own(DatasetInPool.new(dataset: dip.dataset, pool: destination, confirmed: DatasetInPool.confirmed(:confirmed)))
+    checked = false
+    allow(selected).to receive(:validate_backup_path!).and_wrap_original do |method, *args, **kwargs|
+      expect(ActiveRecord::Base.connection.transaction_open?).to be(true)
+      checked = true
+      method.call(*args, **kwargs)
+    end
+    expect(StorageProfileAcceptance::Guest.destination!(dip, selected).id).to eq(copy.id)
+    expect(checked).to be(true)
+    expect(ActiveRecord::Base.connection.transaction_open?).to be(false)
+    ordinary_reader { expect(DatasetInPool.find(copy.id).pool_id).to eq(destination.id) }
+    StorageFreezeControl.find(1).update_columns(mode: StorageFreezeControl.modes.fetch('read_only'))
+    before = catalog_counts
+    expect { StorageProfileAcceptance::Guest.destination!(dip, selected) }.to raise_error(VpsAdmin::API::Exceptions::StorageReadOnly)
+    expect(catalog_counts).to eq(before)
+  end
+
+  it 'commits missing v2 destination Pool staging and releases admission before its physical wait' do
+    selected = autocommit_placement_profile!(create_destination: false)
+    unlock_transaction_signer!
+    selection = selected.config.fetch('vpsBackupPool')
+    allow(DevStorageProfileProvision).to receive(:wait_for_chain!) do |chain|
+      ordinary_reader do
+        expect(TransactionChain.find(chain.id).state).to eq('queued')
+        expect(Transaction.where(transaction_chain_id: chain.id).pluck(:handle)).to eq([Transactions::Storage::CreatePool.t_type])
+        expect(Pool.exists?(node_id: selection.fetch('nodeId'), filesystem: selection.fetch('filesystem'))).to be(true)
+      end
+      raise WaitReached
+    end
+    expect { DevStorageProfileProvision.provision!(selected) }.to raise_error(WaitReached)
+  end
+
+  it 'uses a current locking read for a v2 default claim committed behind a repeatable-read snapshot' do
+    selected = autocommit_placement_profile!
+    dip = source!
+    destination = selected.pool!(selected.config.fetch('vpsBackupPool'))
+    selected.install_plan!
+    selected.bootstrap_templates!
+    unlock_transaction_signer!
+    claim = nil
+    ActiveRecord::Base.transaction(isolation: :repeatable_read) do
+      expect(DatasetInPool.where(pool: destination).count).to eq(0)
+      ordinary_reader(during_staging: true) do
+        owner = own(Dataset.new(user: SpecSeed.user, name: dip.dataset.full_name,
+                                user_create: true, user_destroy: true, user_editable: true,
+                                confirmed: Dataset.confirmed(:confirmed)))
+        claim = own(DatasetInPool.new(dataset: owner, pool: destination, confirmed: DatasetInPool.confirmed(:confirm_create)))
+      end
+      expect(DatasetInPool.exists?(id: claim.id)).to be(false)
+      before = catalog_counts
+      expect { selected.catch_up_chain.fire(selected, source_dip: dip) }.to raise_error(PROFILE::Invalid, /another catalog owner/)
+      expect(catalog_counts).to eq(before)
+    end
+    ordinary_reader do
+      expect(DatasetInPool.find(claim.id).confirmed).to eq(:confirm_create)
+      expect(DatasetInPool.where(dataset: dip.dataset, pool: destination)).to be_empty
+      expect(DatasetInPoolPlan.where(dataset_in_pool: dip)).to be_empty
+      expect(Transaction.where(node_id: @owned[Node])).to be_empty
+    end
   end
 
   it 'validates Guest admission in autocommit and refuses frozen entry without writes' do

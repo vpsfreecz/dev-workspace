@@ -22,6 +22,24 @@ def run!(environment, *command)
   stdout.strip
 end
 
+# Read the actual profile JSON producer in the evaluated services dependency
+# graph. No fixture config import or VM closure realization substitutes for it.
+def storage_profile_projection!(environment, config_drv)
+  graph = JSON.parse(run!(environment, 'nix', 'derivation', 'show', '--recursive', config_drv))
+  unless graph.is_a?(Hash) && graph.keys.sort == %w[derivations version] &&
+         graph['version'].is_a?(Integer) && graph['version'] == 4 && graph['derivations'].is_a?(Hash)
+    abort 'Unsupported Nix derivation metadata envelope'
+  end
+  derivations = graph.fetch('derivations')
+  unless derivations.values.all? { |entry| entry.is_a?(Hash) && entry['env'].is_a?(Hash) }
+    abort 'Invalid Nix derivation metadata entries'
+  end
+  profiles = derivations.values.select { |entry| entry.fetch('env').fetch('name', nil) == 'vpsadmin-storage-profile.json' }
+  abort 'Actual services graph did not contain one profile JSON producer' unless profiles.one?
+
+  JSON.parse(profiles.first.fetch('env').fetch('text'))
+end
+
 Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
   key = File.join(workspace, 'id_ed25519')
   run!({}, 'ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', key)
@@ -178,6 +196,9 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
           marker == { 'version' => 1, 'existingAssignments' => 'preserve' }
         abort 'Storage profile did not retain the actual storage topology' unless
           %w[node1 node2 storage1 services].all? { |machine| rendered.fetch('machines').key?(machine) }
+        legacy_projection = storage_profile_projection!(environment, result.fetch('drvPath'))
+        abort 'Omitted VPS backup selection changed the v1 projection' unless
+          legacy_projection.fetch('version') == 1 && !legacy_projection.key?('vpsBackupPool')
         puts 'vpsadmin: enabled storage profile and actual services closure evaluated'
 
         File.write(profile_config, JSON.generate('storageProfile' => { 'enable' => true, 'enrollment' => false }))
@@ -194,6 +215,31 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
                                                    '--apply', 'config: config.drvPath', "path:#{source}#cluster-config")
           abort 'Storage profile accepted nonboolean enrollment' if result.success?
           abort 'Invalid enrollment did not report the boolean boundary' unless stderr.include?('must be booleans')
+        end
+        placement = { 'enable' => true, 'vpsBackupFilesystem' => 'tank/vps-backup' }
+        [true, false].each do |enrollment|
+          File.write(profile_config, JSON.generate('storageProfile' => placement.merge('enrollment' => enrollment)))
+          placement_result = JSON.parse(run!(environment, 'nix', 'eval', *common, '--json',
+                                             '--apply', 'config: { drvPath = config.drvPath; text = config.text; }',
+                                             "path:#{source}#cluster-config"))
+          actual = storage_profile_projection!(environment, placement_result.fetch('drvPath'))
+          expected = legacy_projection.merge('version' => 2, 'enrollment' => enrollment,
+                                             'vpsBackupPool' => legacy_projection.fetch('backupPool').merge('filesystem' => 'tank/vps-backup'))
+          abort 'Actual v2 placement projection differs' unless actual == expected
+          labels = JSON.parse(placement_result.fetch('text')).fetch('labels')
+          abort 'V2 placement changed preserving-seed marker1' unless
+            labels.fetch('vpsadminPreservingSeed') == rendered.fetch('labels').fetch('vpsadminPreservingSeed')
+          puts "vpsadmin: actual v2 placement enrollment=#{enrollment} evaluated"
+        end
+        [nil, '', 32, 'tank', 'tank/backup', 'tank/nas', 'tank/backup/nas-3'].each do |invalid|
+          File.write(profile_config, JSON.generate('storageProfile' => placement.merge('vpsBackupFilesystem' => invalid)))
+          _stdout, stderr, result = Open3.capture3(environment, 'nix', 'eval', *common, '--json',
+                                                   '--apply', 'config: config.drvPath', "path:#{source}#cluster-config")
+          abort 'Storage profile accepted an invalid or overlapping VPS backup root' if result.success?
+          unless stderr.include?('VPS backup root must be valid and distinct')
+            warn stderr
+            abort 'Invalid VPS backup root did not report its placement boundary'
+          end
         end
         File.write(profile_config, JSON.generate('storageProfile' => { 'enable' => true }))
 

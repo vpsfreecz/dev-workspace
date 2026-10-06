@@ -15,6 +15,7 @@ let
     "enable"
     "enrollment"
     "backupFilesystem"
+    "vpsBackupFilesystem"
     "nasFilesystem"
     "maxDatasets"
     "resources"
@@ -22,7 +23,7 @@ let
     "namespaceBlocks"
   ];
   config = {
-    version = 1;
+    version = if selection ? vpsBackupFilesystem then 2 else 1;
     inherit enrollment;
     environmentId = seed.environment.id;
     sourcePools = map (node: {
@@ -53,6 +54,14 @@ let
       };
     packageVersion = selection.packageVersion or 1;
     namespaceBlocks = selection.namespaceBlocks or 8;
+  }
+  // lib.optionalAttrs (selection ? vpsBackupFilesystem) {
+    vpsBackupPool = {
+      nodeId = config.backupPool.nodeId;
+      filesystem = selection.vpsBackupFilesystem;
+      role = "backup";
+      maxDatasets = selection.maxDatasets or 32;
+    };
   };
   validRoot =
     value:
@@ -78,6 +87,27 @@ let
       || config.backupPool.filesystem == config.nasPool.filesystem
     then
       throw "Storage profile requires distinct valid NAS and backup roots"
+    else if
+      config.version == 2
+      && (
+        !(validRoot config.vpsBackupPool.filesystem)
+        || builtins.length sourceNodes > 8
+        || !builtins.all (pool: validRoot pool.filesystem) config.sourcePools
+        || !builtins.all
+          (
+            pool:
+            pool.nodeId != config.vpsBackupPool.nodeId || pool.filesystem != config.vpsBackupPool.filesystem
+          )
+          (
+            config.sourcePools
+            ++ [
+              config.backupPool
+              config.nasPool
+            ]
+          )
+      )
+    then
+      throw "Storage profile VPS backup root must be valid and distinct from every configured same-node root"
     else if
       !(
         boundedPositive 1024 config.nasPool.maxDatasets
