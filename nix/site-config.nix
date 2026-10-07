@@ -38,7 +38,7 @@ let
         (kb.stagingUsername or null)
       ]
     )
-    && hasExactKeys clusters [ "vpsadmin" "vpsadminos" ] [ ]
+    && hasExactKeys clusters [ "vpsadmin" "vpsadminos" ] [ "kb" ]
     && builtins.all validJsonObject (builtins.attrValues clusters);
 in
 assert lib.assertMsg valid "vpsFree development workspace site configuration is invalid";
