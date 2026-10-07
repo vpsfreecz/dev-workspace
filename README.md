@@ -2,11 +2,13 @@
 
 This repository adds vpsFree.cz tools to the reusable
 [`aither64/dev-workspace`](https://github.com/aither64/dev-workspace) runtime.
-It owns the KB commands, vpsAdmin and vpsAdminOS development-cluster providers,
+It owns the KB commands, vpsAdmin, vpsAdminOS and optional KB cluster providers,
 Codex skills, and the one-time namespace migration helper.
 
 The [vpsAdmin development cluster guide](dev-clusters/vpsadmin/README.md)
 documents its configuration, runtime credentials, and recovery steps.
+The [managed KB cluster guide](dev-clusters/kb/README.md) explains the optional
+provider and its connection to the standalone KB runtime.
 
 The generic runtime supplies the `dev-session-documentation` skill. Its
 [session guide](https://github.com/aither64/dev-workspace/blob/master/docs/dev-sessions.md#documentation-during-development)
@@ -48,6 +50,8 @@ vpsfree-dev-workspace.lib.mkPackage {
     clusterDefaults = {
       vpsadmin = ./config/vpsadmin-devcluster.json;
       vpsadminos = ./config/vpsadminos-devcluster.json;
+      # Optional: include the managed KB cluster provider.
+      kb = ./config/kb-devcluster.json;
     };
   };
 }
@@ -55,8 +59,9 @@ vpsfree-dev-workspace.lib.mkPackage {
 
 Each registered workspace keeps its portal identity and selected cluster
 providers in the `.dev-workspace.json` file at its own root. This extension
-exports `vpsadmin` and `vpsadminos`; a workspace can select either or both
-only while its package is built through this extension.
+exports `vpsadmin` and `vpsadminos`. Setting `siteConfig.clusterDefaults.kb`
+also exports `kb`; omitting it preserves the existing provider set. A workspace
+can select providers only while its package includes them.
 
 ## Catalog composition
 
@@ -71,6 +76,8 @@ The vpsFree package must continue to provide `dev-session-handoff`,
 other site skills. Its catalog must list the `vpsadmin` and `vpsadminos`
 providers, whose recorded commands and portal helper executables must be
 present in the installed package.
+When KB cluster defaults are configured, the catalog also lists `kb` and the
+package includes its fixed portable engine and public provider command.
 
 The optional `userNamespace` and `routerSocket` arguments are passed to the
 generic package constructor. They are intended for a compatibility generation

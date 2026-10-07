@@ -60,6 +60,14 @@
         pkgs.callPackage ./nix/organization-tools.nix {
           src = self;
           runtimeContract = dev-workspace.lib.runtimeContract;
+          kbRuntimePackage =
+            if siteConfig.clusterDefaults ? kb then
+              inputs.kb-runtime.packages.${pkgs.stdenv.hostPlatform.system}.kb-runtime
+            else null;
+          kbSourceMetadata =
+            if siteConfig.clusterDefaults ? kb then
+              inputs.kb-runtime.packages.${pkgs.stdenv.hostPlatform.system}.runtime-source
+            else null;
           inherit siteConfig;
         };
       mkPackage =
@@ -108,6 +116,11 @@
                   label = "vpsAdminOS";
                   command = "${tools}/bin/vpsadminos-devcluster";
                 };
+              } // lib.optionalAttrs (validatedSiteConfig.clusterDefaults ? kb) {
+                kb = {
+                  label = "KB";
+                  command = "${tools}/bin/kb-devcluster";
+                };
               };
             };
           }
@@ -144,6 +157,15 @@
       testPackage = mkPackage {
         inherit pkgs;
         siteConfig = testSiteConfig;
+      };
+      testKbSiteConfig = testSiteConfig // {
+        clusterDefaults = testSiteConfig.clusterDefaults // {
+          kb = ./test/fixtures/kb-config.json;
+        };
+      };
+      testKbPackage = mkPackage {
+        inherit pkgs;
+        siteConfig = testKbSiteConfig;
       };
       devclusterCheck = pkgs.writeShellApplication {
         name = "devcluster-check";
@@ -186,6 +208,22 @@
           // {
             clusterDefaults = testSiteConfig.clusterDefaults // {
               vpsadmin = "/tmp/mutable-vpsadmin.json";
+            };
+          }
+        )
+        (
+          testSiteConfig
+          // {
+            clusterDefaults = testSiteConfig.clusterDefaults // {
+              kb = "/tmp/mutable-kb.json";
+            };
+          }
+        )
+        (
+          testSiteConfig
+          // {
+            clusterDefaults = testSiteConfig.clusterDefaults // {
+              kb = ./test/fixtures/not-object.json;
             };
           }
         )
@@ -252,6 +290,27 @@
       checks.${system} = {
         compatibility-package = testCompatibilityPackage;
         package = testPackage;
+        kb-provider-package = testKbPackage;
+        kb-provider-contract = pkgs.runCommand "vpsfree-kb-provider-contract" { } ''
+          ${pkgs.jq}/bin/jq -e '
+            [.clusterProviders[] | { id, label }] == [
+              { id: "kb", label: "KB" },
+              { id: "vpsadmin", label: "vpsAdmin" },
+              { id: "vpsadminos", label: "vpsAdminOS" }
+            ]
+          ' ${testKbPackage}/share/dev-workspace/extensions.json >/dev/null
+          for provider in kb vpsadmin vpsadminos; do
+            command=$(${pkgs.jq}/bin/jq -er --arg provider "$provider" \
+              '.clusterProviders[] | select(.id == $provider) | .command' \
+              ${testKbPackage}/share/dev-workspace/extensions.json)
+            test -x "$command"
+            test -x ${testKbPackage}/libexec/workspace-portal/"$provider"-devcluster
+          done
+          ${pkgs.coreutils}/bin/env -i HOME="$TMPDIR" PATH=/empty \
+            ${testKbPackage}/libexec/workspace-portal/kb-devcluster --help >/dev/null
+          test ! -e ${testPackage}/libexec/workspace-portal/kb-devcluster
+          touch "$out"
+        '';
         package-metadata = pkgs.runCommand "vpsfree-dev-workspace-package-metadata" { } ''
           ${pkgs.jq}/bin/jq -e \
             --arg router ${nixpkgs.lib.escapeShellArg dev-workspace.lib.hostPaths.routerSocket} \
@@ -339,6 +398,11 @@
               cd source
               patchShebangs bin dev-clusters
               ${testEnvironment}
+              unset RUBYOPT RUBYLIB GEM_HOME GEM_PATH BUNDLE_GEMFILE BUNDLE_PATH
+              export GEM_HOME=$(${pkgs.ruby}/bin/ruby --disable-gems -rrubygems -e 'print Gem.default_dir')
+              export GEM_PATH="$GEM_HOME"
+              export VPSFREE_KB_ENGINE_METADATA=${inputs.kb-runtime.packages.${system}.runtime-source}
+              export DEV_WORKSPACE_HOST_SOURCE=${dev-workspace}
               export RUNTIME_AUTHORITY_CORPUS=${dev-workspace.lib.runtimeAuthorityCorpus}
               ruby test/devcluster_status_test.rb
               ruby test/devcluster_commands_test.rb
@@ -347,6 +411,13 @@
               ruby test/devcluster_maintenance_test.rb
               ruby test/devcluster_store_roots_test.rb
               ruby test/devcluster_storage_profile_test.rb
+              ruby test/kb_devcluster_test.rb
+              ruby test/kb_guards_test.rb
+              ruby test/kb_connection_test.rb
+              ruby test/kb_lease_test.rb
+              ruby test/kb_cli_test.rb
+              ruby test/kb_portable_test.rb
+              ruby test/kb_public_dispatch_test.rb
               ruby test/kb_cleanup_test.rb
               ruby test/kb_contract_tools_test.rb
               ruby test/kb_page_test.rb

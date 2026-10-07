@@ -1,0 +1,306 @@
+{
+  "domains": {
+    "api": "api.example.test",
+    "adminer": "adminer.example.test",
+    "auth": "auth.example.test",
+    "console": "console.example.test",
+    "download": "download.example.test",
+    "frontend": "frontend.example.test",
+    "mailpit": "mailpit.example.test",
+    "status": "status.example.test",
+    "webCs": "web-cs.example.test",
+    "webEn": "web-en.example.test",
+    "webui": "webui.example.test"
+  },
+  "tmpDomains": {
+    "api": "api-tmp.example.test",
+    "auth": "auth-tmp.example.test",
+    "console": "console-tmp.example.test",
+    "webui": "webui-tmp.example.test"
+  },
+  "network": {
+    "bridge": "br0",
+    "gateway": "172.16.106.1"
+  },
+  "local": {
+    "bindAddress": "127.0.0.1",
+    "multicastPort": 10000,
+    "ports": {
+      "services": { "ssh": 10022, "https": 10443 },
+      "node1": { "ssh": 10122 },
+      "node2": { "ssh": 10222 },
+      "backuper1": { "ssh": 10322 },
+      "dns-primary": { "ssh": 10422 },
+      "dns-secondary": { "ssh": 10522 }
+    }
+  },
+  "resolver": {
+    "mode": "cluster",
+    "upstreamNameservers": ["172.16.9.90", "172.19.9.90"]
+  },
+  "plugins": {
+    "enabled": "all"
+  },
+  "services": {
+    "ip": "172.16.106.53",
+    "name": "vpsadmin-services",
+    "memoryMiB": 4096,
+    "cpus": 4,
+    "rootDiskMiB": 12288
+  },
+  "nodectld": {
+    "zfsTransferStartDelay": 0
+  },
+  "nodes": {
+    "node1": {
+      "id": 101,
+      "name": "node1",
+      "ip": "172.16.106.41",
+      "role": "node",
+      "location": "praha",
+      "maxVps": 30,
+      "cpus": 4,
+      "memoryMiB": 4096,
+      "tankDiskGiB": 320,
+      "swapMiB": 0,
+      "sshPort": 10122
+    },
+    "node2": {
+      "id": 102,
+      "name": "node1",
+      "ip": "172.16.106.42",
+      "role": "node",
+      "location": "playground",
+      "maxVps": 30,
+      "cpus": 4,
+      "memoryMiB": 4096,
+      "tankDiskGiB": 320,
+      "swapMiB": 0,
+      "sshPort": 10222
+    },
+    "backuper1": {
+      "id": 201,
+      "name": "backuper1",
+      "ip": "172.16.106.45",
+      "role": "storage",
+      "location": "praha-storage",
+      "maxVps": 0,
+      "cpus": 4,
+      "memoryMiB": 2048,
+      "tankDiskGiB": 320,
+      "swapMiB": 0,
+      "sshPort": 10322
+    }
+  },
+  "topologies": {
+    "single": ["node1"],
+    "dual": ["node1", "node2"],
+    "storage": ["node1", "node2", "backuper1"],
+    "screenshots": ["node1", "node2", "backuper1"]
+  },
+  "mail": {
+    "capture": {
+      "enable": true,
+      "smtpPort": 1025,
+      "webPort": 8025,
+      "webAuth": {
+        "enable": true,
+        "username": "mailpit",
+        "password": "mailpitPassword"
+      }
+    }
+  },
+  "telegram": {
+    "receiveMode": "polling",
+    "webhookPath": "/_telegram/webhook",
+    "webhookPort": 9293
+  },
+  "sms": {
+    "enable": false,
+    "port": 9876,
+    "inbound": {
+      "enable": false,
+      "webhooks": []
+    }
+  },
+  "adminer": {
+    "port": 18081,
+    "webAuth": {
+      "enable": true,
+      "username": "adminer",
+      "password": "adminerPassword"
+    }
+  },
+  "web": {
+    "environmentId": 1
+  },
+  "dns": {
+    "enable": false,
+    "servers": {
+      "dns-primary": {
+        "id": 301,
+        "name": "dev-dns-primary",
+        "serverName": "ns-hidden.example.test",
+        "ip": "172.16.106.61",
+        "hidden": true,
+        "enableUserDnsZones": true,
+        "userDnsZoneType": "primary_type",
+        "cpus": 1,
+        "memoryMiB": 1024,
+        "sshPort": 10422
+      },
+      "dns-secondary": {
+        "id": 302,
+        "name": "dev-dns-secondary",
+        "serverName": "ns-public.example.test",
+        "ip": "172.16.106.62",
+        "hidden": false,
+        "enableUserDnsZones": true,
+        "userDnsZoneType": "secondary_type",
+        "cpus": 1,
+        "memoryMiB": 1024,
+        "sshPort": 10522
+      }
+    }
+  },
+  "seed": {
+    "defaultVpsResources": {
+      "cpu": 1,
+      "memory": 1024,
+      "swap": 512,
+      "diskspace": 4096
+    },
+    "userResources": {
+      "cpu": 16,
+      "memory": 65536,
+      "swap": 32768,
+      "diskspace": 1048576,
+      "ipv4": 32,
+      "ipv4_private": 256
+    },
+    "mailRecipients": [
+      {
+        "label": "Dev admins",
+        "to": "dev-admin@example.test",
+        "templates": ["daily_report"]
+      }
+    ],
+    "users": [
+      {
+        "login": "test-user1",
+        "password": "testUser1Password",
+        "fullName": "Test User One",
+        "email": "test-user1@example.test",
+        "smsNotificationsEnabled": true,
+        "level": 1,
+        "namespace": {
+          "blockStart": 9,
+          "blockCount": 8
+        },
+        "maxVpsCount": 5
+      },
+      {
+        "login": "test-user2",
+        "password": "testUser2Password",
+        "fullName": "Test User Two",
+        "email": "test-user2@example.test",
+        "smsNotificationsEnabled": true,
+        "level": 1,
+        "namespace": {
+          "blockStart": 17,
+          "blockCount": 8
+        },
+        "maxVpsCount": 5
+      }
+    ],
+    "pools": {
+      "label": "tank",
+      "filesystem": "tank/ct",
+      "role": "hypervisor",
+      "maxDatasets": 1024,
+      "totalSpaceMiB": 20971520,
+      "availableSpaceMiB": 16777216,
+      "usedSpaceMiB": 4194304
+    },
+    "networks": [
+      {
+        "label": "Dev public IPv4",
+        "address": "198.51.100.0",
+        "prefix": 24,
+        "ipVersion": 4,
+        "role": "public_access",
+        "managed": true,
+        "splitAccess": "no_access",
+        "splitPrefix": 32,
+        "purpose": "any",
+        "autopick": true,
+        "userpick": true,
+        "reverseZone": true,
+        "addresses": [
+          "198.51.100.10",
+          "198.51.100.11",
+          "198.51.100.12",
+          "198.51.100.13",
+          "198.51.100.14",
+          "198.51.100.15",
+          "198.51.100.16",
+          "198.51.100.17",
+          "198.51.100.18",
+          "198.51.100.19"
+        ]
+      },
+      {
+        "label": "Dev public IPv6",
+        "address": "2001:db8:106::",
+        "prefix": 64,
+        "ipVersion": 6,
+        "role": "public_access",
+        "managed": true,
+        "splitAccess": "no_access",
+        "splitPrefix": 128,
+        "purpose": "any",
+        "autopick": true,
+        "userpick": true,
+        "reverseZone": false,
+        "addresses": [
+          "2001:db8:106::10",
+          "2001:db8:106::11",
+          "2001:db8:106::12",
+          "2001:db8:106::13",
+          "2001:db8:106::14",
+          "2001:db8:106::15",
+          "2001:db8:106::16",
+          "2001:db8:106::17",
+          "2001:db8:106::18",
+          "2001:db8:106::19"
+        ]
+      },
+      {
+        "label": "Dev private IPv4",
+        "address": "10.106.0.0",
+        "prefix": 24,
+        "ipVersion": 4,
+        "role": "private_access",
+        "managed": true,
+        "splitAccess": "no_access",
+        "splitPrefix": 32,
+        "purpose": "vps",
+        "autopick": true,
+        "userpick": true,
+        "reverseZone": true,
+        "addresses": [
+          "10.106.0.10",
+          "10.106.0.11",
+          "10.106.0.12",
+          "10.106.0.13",
+          "10.106.0.14",
+          "10.106.0.15",
+          "10.106.0.16",
+          "10.106.0.17",
+          "10.106.0.18",
+          "10.106.0.19"
+        ]
+      }
+    ]
+  }
+}
