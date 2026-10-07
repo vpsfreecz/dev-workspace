@@ -8,6 +8,8 @@
   gnused,
   iproute2,
   jq,
+  kbRuntimePackage ? null,
+  kbSourceMetadata ? null,
   lib,
   makeWrapper,
   nix,
@@ -25,6 +27,7 @@
 let
   kb = siteConfig.kb or { };
   clusters = siteConfig.clusterDefaults or { };
+  kbProviderEnabled = clusters ? kb;
   clusterConfigurations = builtins.mapAttrs (
     name: value:
     builtins.path {
@@ -73,6 +76,8 @@ let
 in
 assert lib.assertMsg authorityPolicyValid
   "the namespace migration must be reviewed for the selected runtime authority policy";
+assert lib.assertMsg (!kbProviderEnabled || (kbRuntimePackage != null && kbSourceMetadata != null))
+  "the KB provider requires its exact published portable engine input";
 stdenvNoCC.mkDerivation {
   pname = "vpsfree-dev-workspace-tools";
   version = "0.1.0";
@@ -141,6 +146,21 @@ stdenvNoCC.mkDerivation {
       --prefix PATH : ${lib.escapeShellArg clusterRuntimePath} \
       --set VPSADMINOS_DEVCLUSTER_DEFAULT_CONFIG ${lib.escapeShellArg (toString clusterConfigurations.vpsadminos)}
 
+    ${lib.optionalString kbProviderEnabled ''
+      install -m644 ${clusterConfigurations.kb} \
+        "$out/share/vpsfree-dev-workspace/dev-clusters/kb/default-config.json"
+      substituteInPlace "$out/share/vpsfree-dev-workspace/dev-clusters/kb/bin/devcluster" \
+        --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
+      makeWrapper "$out/share/vpsfree-dev-workspace/dev-clusters/kb/bin/devcluster" \
+        "$out/bin/kb-devcluster" \
+        --prefix PATH : ${lib.escapeShellArg clusterRuntimePath} \
+        --set VPSFREE_KB_ENGINE ${kbRuntimePackage}/bin/vpsfree-kb-devcluster \
+        --set VPSFREE_KB_ENGINE_METADATA ${kbSourceMetadata} \
+        --set VPSFREE_KB_DEFAULT_CONFIG ${lib.escapeShellArg (toString clusterConfigurations.kb)} \
+        --set DEVCLUSTER_RUNTIME_CONTRACT \
+          "$out/share/vpsfree-dev-workspace/dev-clusters/runtime-contract.json"
+    ''}
+
     runHook postInstall
   '';
 
@@ -176,6 +196,14 @@ stdenvNoCC.mkDerivation {
     done
     DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" "$out/bin/vpsadmin-devcluster" --help >/dev/null
     DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" "$out/bin/vpsadminos-devcluster" --help >/dev/null
+    ${if kbProviderEnabled then ''
+      ${diffutils}/bin/cmp ${clusterConfigurations.kb} \
+        "$out/share/vpsfree-dev-workspace/dev-clusters/kb/default-config.json"
+      ${coreutils}/bin/env -i HOME="$TMPDIR" PATH=/empty "$out/bin/kb-devcluster" --help >/dev/null
+      test ! -e "$TMPDIR/workspace/.dev-clusters/kb"
+    '' else ''
+      test ! -e "$out/bin/kb-devcluster"
+    ''}
     ${coreutils}/bin/env -i HOME="$TMPDIR" PATH=/empty \
       "$out/bin/vpsfree-dev-workspace-migrate" --help >/dev/null
   '';
