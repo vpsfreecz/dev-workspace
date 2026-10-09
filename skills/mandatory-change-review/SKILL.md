@@ -1,6 +1,6 @@
 ---
 name: mandatory-change-review
-description: Run independent final review of completed substantive vpsFree.cz deliverables after all intended changes are committed and quick checks pass, before long integration tests. Includes code, schemas, APIs, protocols, configuration, documentation, instructions, tests, deployment and security changes. Routine planning, investigation, findings, session tracking and evidence alone never trigger automatic review. Earlier review requires an explicit user request, is advisory, and does not replace final review; mechanical dependency/generated updates remain exempt when they contain no substantive changes.
+description: Run independent final review of completed substantive vpsFree.cz deliverables after all intended changes are committed and quick checks pass, before long integration tests. Includes code, schemas, APIs, protocols, configuration, documentation, instructions, tests, deployment and security changes. Routine planning, investigation, findings, session tracking and evidence alone never trigger automatic review. Earlier review requires an explicit user request, is advisory, and does not replace final review; mechanical dependency/generated content remains exempt when it contains no substantive changes, while history consolidation still applies.
 ---
 
 # Mandatory Change Review
@@ -116,6 +116,8 @@ into a superficial general review.
    user request, is advisory, and does not replace this final workflow. Skip
    genuinely mechanical dependency-only updates, generated lockfile refreshes
    or metadata updates when they contain no substantive changes.
+   This skips standalone content review, not history consolidation. Include
+   generated commits in any required whole-branch final review.
 2. Make sure all intended changes are committed in every affected repository.
    Do not review a half-staged or partly uncommitted implementation.
    Before claiming an unmerged feature branch ready, arrange a final review of
@@ -138,6 +140,11 @@ into a superficial general review.
      final diff, disposition of superseded approaches and follow-up fixes,
      and migration versions with merge, release, deployment, and external-use
      provenance; explicitly state when there are no migrations;
+   - repeated dependency/channel/input or generated-artifact update streams,
+     their commits, final selected revisions and consolidation dispositions;
+     for retained intermediate updates, the concrete release, supported
+     consumer or state boundary that requires them and its evidence. Keep
+     rollout provenance separate from the rationale for retaining commits;
    - intended commit split and any deliberately bundled changes, with a
      concrete rationale for why they are inseparable;
    - explicit non-goals, rejected alternatives, and user decisions that bound
@@ -207,6 +214,13 @@ unmerged approaches remain and whether migration lineage is sound; state "no
 migrations" when the inventory is empty. If the packet lacks the complete
 series or migration inventory and provenance, request them before claiming the
 final branch was reviewed.
+
+Independently assess the packet's repeated-update streams under the general
+lane. Report superseded commits and their consolidation, or the evidenced
+boundary requiring separate updates; include an explicit conclusion when there
+are no repeated streams. Development deployment, branch publication or a prior
+review is not sufficient justification for retaining redundant pin commits.
+A mechanical-content exemption does not remove these history duties.
 
 Stay focused on the assigned lane, but report a concrete serious issue from
 another lane if you encounter one. Do not assume that another reviewer will

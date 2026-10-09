@@ -31,7 +31,24 @@ Review scope, correctness, commit history, tests, and documentation.
   appropriate. A review of only the latest commit does not complete this gate.
 - Require repeated updates to the same flake input, gem dependency, dependency
   group, lockfile, Bundix output, or generated metadata in one update stream to
-  be consolidated into one dependency-update commit.
+  be consolidated into one final dependency-update commit. Identify streams by
+  dependency, channel/role or input and logical purpose, rather than a shared
+  lockfile alone. This applies to generated commits and to feature revisions
+  already published or deployed during development.
+- Preserve supported deployed behavior and migration lineage without treating
+  deployment as an exemption for superseded pin commits. Keep rollout SHAs and
+  execution evidence in rollout records. Retain separate updates only when a
+  concrete release, supported consumer or state boundary requires them; name
+  the boundary and explain why the final update alone is insufficient. Preserve
+  any required exact source ref, and respect protections on merged history.
+- Independently group the repeated updates in the complete series and assess
+  the packet's proposed dispositions. Report superseded commits and their
+  consolidation, or the evidence requiring their retention. State explicitly
+  when no repeated update streams exist. Treat redundant updates retained
+  without that necessity as at least `Important`; an earlier review or the
+  label "deployed" or "consumed" is not a sufficient reason to accept them.
+- A mechanical-content review exemption does not exempt generated updates
+  from consolidation or from an otherwise required whole-branch history review.
 - Check commit messages against applicable `AGENTS.md` rules. Messages must
   describe the final result and rationale, not the development process. Do not
   reformat generated messages such as `confctl` commits.
