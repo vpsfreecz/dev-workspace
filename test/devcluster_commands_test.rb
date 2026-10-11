@@ -11,6 +11,51 @@ class DevclusterCommandsTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
   KINDS = %w[vpsadmin vpsadminos].freeze
 
+  def test_existing_start_preserves_selection_and_disks_before_a_failed_build
+    KINDS.each do |kind|
+      with_workspace(kind) do |env, directory|
+        FileUtils.cp(env.fetch('TEST_CONFIG'), File.join(directory, 'config.json'))
+        disk = File.join(directory, 'retained-disk.img')
+        File.write(disk, 'retained data')
+        stdout, stderr, result = Open3.capture3(
+          env.merge('FAIL_AT' => 'build'),
+          File.join(ROOT, 'dev-clusters', kind, 'bin', 'devcluster'),
+          'start', env.fetch('TEST_SLUG'), '--existing'
+        )
+        assert_equal(23, result.exitstatus, stdout + stderr)
+        build = events(env).find { |event| event['event'] == 'build' }
+        assert_equal('dual', build.fetch('environment').fetch("#{kind.upcase}_DEVCLUSTER_TOPOLOGY"))
+        assert_equal('local', build.fetch('environment').fetch("#{kind.upcase}_DEVCLUSTER_NETWORK"))
+        assert_equal("dual\n", File.read(File.join(directory, 'topology')))
+        assert_equal("local\n", File.read(File.join(directory, 'network')))
+        assert_equal('retained data', File.read(disk))
+        refute(events(env).any? { |event| event['event'] == 'run' })
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_existing_start_refuses_missing_state_configuration_or_selection
+    KINDS.product(%w[state config.json topology network]).each do |kind, missing|
+      with_workspace(kind) do |env, directory|
+        FileUtils.cp(env.fetch('TEST_CONFIG'), File.join(directory, 'config.json'))
+        if missing == 'state'
+          FileUtils.rm_rf(directory)
+        else
+          File.unlink(File.join(directory, missing))
+        end
+        stdout, stderr, result = Open3.capture3(
+          env, File.join(ROOT, 'dev-clusters', kind, 'bin', 'devcluster'),
+          'start', env.fetch('TEST_SLUG'), '--existing'
+        )
+        refute(result.success?, stdout + stderr)
+        assert_empty(events(env))
+        refute(File.exist?(directory)) if missing == 'state'
+        assert_locks_released(env)
+      end
+    end
+  end
+
   def test_failed_build_does_not_launch_or_deploy_an_old_result
     KINDS.product(%w[start update], [false, true]).each do |kind, command, retained|
       with_workspace(kind, retained:) do |env, directory|

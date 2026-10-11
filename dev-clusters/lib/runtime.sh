@@ -897,10 +897,56 @@ devcluster_with_lifecycle_lock() {
   shift 5
 
   local DEVCLUSTER_STATUS_LOCK=false
-  [ "$operation_name" != status ] || DEVCLUSTER_STATUS_LOCK=true
+  if [ "$operation_name" = status ] || [ "${DEVCLUSTER_PORTAL_CONTROLS:-}" = 1 ]; then
+    DEVCLUSTER_STATUS_LOCK=true
+  fi
   devcluster_with_lock "$DEVCLUSTER_KIND-$slug" \
     devcluster_lifecycle_callback \
     "$slug" "$require_active" "$mutation" "$operation_name" "$callback" "$@"
+}
+
+# Read retained selection under the caller's cluster lock. Never fall back to
+# first-start defaults when a portal request races with reset or partial setup.
+devcluster_existing_start_selection() {
+  local slug="$1" topology network config
+  devcluster_validate_cluster_directory "$slug" false \
+    || die "cluster '$slug' has no retained state"
+  config="$(cluster_dir "$slug")/config.json"
+  devcluster_check_regular_file "$config" "cluster configuration" \
+    || die "cluster '$slug' has no retained configuration"
+  [ -f "$config" ] || die "cluster '$slug' has no retained configuration"
+  topology="$(devcluster_read_small_file "$(topology_file "$slug")")" || return
+  network="$(devcluster_read_small_file "$(network_file "$slug")")" || return
+  [[ "$topology" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+    || die "cluster '$slug' has no valid retained topology"
+  case "$network" in
+    bridge|local) ;;
+    *) die "cluster '$slug' has no valid retained network" ;;
+  esac
+  printf '%s %s\n' "$topology" "$network"
+}
+
+# Optional reader negotiation keeps ordinary schema-2 status compatible with
+# portal generations that reject unknown fields.
+devcluster_portal_actions_json() {
+  local slug="$1" retained=false
+  if [ "${DEVCLUSTER_PORTAL_CONTROLS:-}" != 1 ]; then
+    cat
+    return
+  fi
+  [ ! -f "$(cluster_dir "$slug")/config.json" ] || retained=true
+  jq -c --argjson retained "$retained" '
+    if .found then
+      .actions = (
+        (if .state == "running" or .state == "stale" then ["stop"] else [] end) +
+        (if (.maintenance.pending // false) then [] else
+          (if .state == "stopped" and $retained and
+            (.topology | length) > 0 and (.network == "bridge" or .network == "local")
+           then ["start"] else [] end) + ["release"]
+         end)
+      )
+    else . end
+  '
 }
 
 list_cluster_slugs() {

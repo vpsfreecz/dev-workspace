@@ -18,6 +18,7 @@ usage() {
   cat <<'EOF'
 Usage:
   devcluster start <slug> [--topology single|dual|triple] [--network local|bridge] [--timeout seconds] [--force]
+  devcluster start <slug> --existing
   devcluster stop <slug>
   devcluster status <slug>
   devcluster gcroots [--cleanup] [<slug>...]
@@ -336,6 +337,14 @@ start_cluster() {
   local timeout="${VPSADMINOS_DEVCLUSTER_TIMEOUT:-900}"
   local force=0
 
+  if [ "${1:-}" = --existing ]; then
+    [ "$#" -eq 1 ] || die "existing start accepts no other arguments"
+    local selection
+    selection="$(devcluster_existing_start_selection "$slug")" || return
+    read -r topology network <<<"$selection"
+    shift
+  fi
+
   while [ $# -gt 0 ]; do
     case "$1" in
       --topology)
@@ -507,7 +516,7 @@ status_cluster() {
         .schema = 2 |
         if .found then .services = [] else . end |
         del(.links, .credentials)
-      '
+      ' | devcluster_portal_actions_json "$slug"
     return
   fi
 

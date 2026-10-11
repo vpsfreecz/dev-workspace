@@ -1,5 +1,26 @@
 # vpsAdmin Dev Clusters
 
+## Portal controls and retained starts
+
+The workspace portal offers Start/Stop and Release beside cluster readiness.
+Start runs `vpsadmin-devcluster start <slug> --existing`, which reuses the saved
+topology and network and follows normal build/boot behavior from the session's
+selected sources. It requires existing cluster state and configuration and
+accepts no other options. Stop keeps persistent disks and configuration;
+Release stops the cluster and removes them after confirmation.
+
+Use the CLI for initial setup and maintenance recovery. A pending maintenance
+hold permits Stop but disables ordinary Start and Release. Normal source/schema
+compatibility requirements still apply when starting retained disks.
+
+The providers return available `actions` only when the portal sets
+`DEVCLUSTER_PORTAL_CONTROLS=1`; ordinary status JSON stays compatible with older
+readers. This environment also makes the cluster mutation lock nonblocking, so
+overlapping portal/native operations refuse rather than queue. The generic
+runtime's [provider contract](https://github.com/aither64/dev-workspace/blob/master/docs/workspace-portal.md#cluster-provider-status-and-shutdown-contract)
+owns the HTTP and status interface. No disk or cluster-state conversion is
+required.
+
 The installed `vpsadmin-devcluster` command runs vpsAdmin development clusters
 from feature worktrees under `worktrees/<slug>/`. Run it from the registered
 workspace or pass `--workspace NAME` before the command.

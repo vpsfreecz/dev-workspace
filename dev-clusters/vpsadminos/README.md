@@ -24,6 +24,20 @@ The selected vpsAdminOS source must include commit `6f9b2c755` (June 12,
 
 ## Basic Usage
 
+The workspace portal offers Start/Stop and Release beside cluster readiness.
+Its Start action runs `vpsadminos-devcluster start <slug> --existing`: it requires
+retained state and configuration, reuses the saved topology/network and follows
+normal build/boot behavior from the session's selected sources. This option
+accepts no other arguments. Stop preserves disks and configuration; Release
+stops the cluster and deletes them after confirmation. Initial setup remains a
+CLI operation. Source compatibility requirements still apply to retained disks.
+
+The provider advertises its available actions through the generic runtime's
+[provider contract](https://github.com/aither64/dev-workspace/blob/master/docs/workspace-portal.md#cluster-provider-status-and-shutdown-contract).
+It emits this metadata only for `DEVCLUSTER_PORTAL_CONTROLS=1`, keeping ordinary
+status JSON compatible with older readers. The same environment requests
+nonblocking mutation locking. No disk or cluster-state conversion is required.
+
 ```sh
 vpsadminos-devcluster start 2026-05-31-example
 vpsadminos-devcluster info 2026-05-31-example

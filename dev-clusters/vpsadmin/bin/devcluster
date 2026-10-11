@@ -39,6 +39,7 @@ usage() {
   cat <<'EOF'
 Usage:
   devcluster start <slug> [--topology single|dual|storage] [--network bridge|local] [--force]
+  devcluster start <slug> --existing
   devcluster start <slug> --copied-config
   devcluster maintenance-recover-config <slug> --residency-evidence PATH
   devcluster maintenance-start <slug> --resident-config PATH --expect-services-toplevel PATH --residency-evidence PATH
@@ -1062,6 +1063,14 @@ start_cluster() {
   local network="${VPSADMIN_DEVCLUSTER_NETWORK:-bridge}"
   local force=0
 
+  if [ "${1:-}" = --existing ]; then
+    [ "$#" -eq 1 ] || die "existing start accepts no other arguments"
+    local selection
+    selection="$(devcluster_existing_start_selection "$slug")" || return
+    read -r topology network <<<"$selection"
+    shift
+  fi
+
   while [ $# -gt 0 ]; do
     case "$1" in
       --topology)
@@ -1374,7 +1383,7 @@ devcluster_status_v2_json() {
     if $maintenance != null then .maintenance = $maintenance else . end |
     if $maintenance.pending == true then .ready = false | .services = [] else . end |
     del(.links, .credentials)
-  ' <<<"$legacy"
+  ' <<<"$legacy" | devcluster_portal_actions_json "$slug"
 }
 
 urls_cluster() {

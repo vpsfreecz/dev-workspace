@@ -14,6 +14,22 @@ class DevclusterStatusTest < Minitest::Test
     'vpsadminos' => File.join(ROOT, 'dev-clusters/vpsadminos/bin/devcluster')
   }.freeze
 
+  def test_portal_actions_are_opt_in_and_follow_retained_state
+    HELPERS.each_key do |kind|
+      with_cluster(kind) do |workspace, directory, slug|
+        write_state(directory, 'topology', "dual\n")
+        write_state(directory, 'network', "bridge\n")
+        write_state(directory, 'config.json', '{"topologies":{"dual":["node1","node2"]}}')
+        refute(read_status(kind, workspace, slug).key?('actions'))
+        assert_equal(%w[start release], read_status(kind, workspace, slug, controls: true).fetch('actions'))
+        File.unlink(File.join(directory, 'topology'))
+        assert_equal(['release'], read_status(kind, workspace, slug, controls: true).fetch('actions'))
+        write_state(directory, 'ready', '')
+        assert_equal(%w[stop release], read_status(kind, workspace, slug, controls: true).fetch('actions'))
+      end
+    end
+  end
+
   def test_vpsadmin_json_status_groups_services_and_accounts
     with_cluster('vpsadmin') do |workspace, directory, slug|
       write_state(directory, 'topology', "single\n")
@@ -144,6 +160,9 @@ class DevclusterStatusTest < Minitest::Test
       assert_empty(status.fetch('services'))
       assert_equal({ 'version' => 1, 'mode' => 'maintenance', 'phase' => 'held',
                      'pending' => true, 'copied' => false, 'active' => false }, status.fetch('maintenance'))
+      assert_equal(['stop'], read_status('vpsadmin', workspace, slug, controls: true).fetch('actions'))
+      File.unlink(File.join(directory, 'ready'))
+      assert_empty(read_status('vpsadmin', workspace, slug, controls: true).fetch('actions'))
       %w[private-operator-reference fixture-resident-config fixture-services].each do |value|
         refute_includes(JSON.generate(status), value)
       end
@@ -1657,9 +1676,9 @@ class DevclusterStatusTest < Minitest::Test
     File.write(File.join(directory, 'state.md'), "---\nlifecycle: #{lifecycle}\n---\n")
   end
 
-  def read_status(kind, workspace, slug)
+  def read_status(kind, workspace, slug, controls: false)
     stdout, stderr, result = Open3.capture3(
-      { 'DEVCLUSTER_WORKSPACE' => workspace },
+      { 'DEVCLUSTER_WORKSPACE' => workspace, 'DEVCLUSTER_PORTAL_CONTROLS' => controls ? '1' : nil },
       HELPERS.fetch(kind), 'status', slug, '--json'
     )
     assert(result.success?, stderr)
