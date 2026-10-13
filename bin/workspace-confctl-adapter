@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/workspace_confctl_adapter'
+
+begin
+  puts JSON.generate(WorkspaceConfctlAdapter.run($stdin.read(262_145), pinned: ARGV == ['--pinned']))
+rescue StandardError => e
+  warn "workspace-confctl-adapter: #{e.message}"
+  exit 1
+end

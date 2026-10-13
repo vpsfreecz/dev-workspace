@@ -60,6 +60,7 @@
         pkgs.callPackage ./nix/organization-tools.nix {
           src = self;
           runtimeContract = dev-workspace.lib.runtimeContract;
+          coordinationCommandLibrary = dev-workspace.lib.coordinationCommandLibrary;
           kbRuntimePackage =
             if siteConfig.clusterDefaults ? kb then
               inputs.kb-runtime.packages.${pkgs.stdenv.hostPlatform.system}.kb-runtime
@@ -77,6 +78,7 @@
           routerSocket ? dev-workspace.lib.hostPaths.routerSocket,
           siteConfig,
           teamConfig ? null,
+          coordinationConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         let
@@ -88,6 +90,17 @@
         in
         (dev-workspace.lib.mkPackage (
           {
+            coordinationConfig =
+              if coordinationConfig == null then
+                null
+              else
+                coordinationConfig
+                // {
+                  adapters.confctl = {
+                    protocol = 1;
+                    command = "${tools}/bin/workspace-confctl-adapter";
+                  };
+                };
             inherit
               activationEnvironmentAliases
               pkgs
@@ -262,6 +275,7 @@
         export VPSADMINOS_DEVCLUSTER_DEFAULT_CONFIG=$PWD/test/fixtures/vpsadminos-config.json
         export DEVCLUSTER_RUNTIME_CONTRACT=${dev-workspace.lib.runtimeContract}
         export DEV_WORKSPACE_RUNTIME_CONTRACT=${dev-workspace.lib.runtimeContract}
+        export WORKSPACE_COORDINATION_COMMAND=${dev-workspace.lib.coordinationCommandLibrary}
       '';
     in
     assert invalidSiteConfigsRejected;
@@ -424,6 +438,7 @@
               ruby test/kb_stage_test.rb
               ruby test/migration_test.rb
               ruby test/skill_policy_test.rb
+              ruby test/workspace_confctl_adapter_test.rb
               touch "$out"
             '';
         organization-source = pkgs.runCommand "vpsfree-dev-workspace-source" { } ''

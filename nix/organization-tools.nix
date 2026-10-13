@@ -1,6 +1,7 @@
 {
   bash,
   coreutils,
+  coordinationCommandLibrary,
   diffutils,
   gawk,
   git,
@@ -90,6 +91,7 @@ stdenvNoCC.mkDerivation {
 
     mkdir -p "$out/share/vpsfree-dev-workspace"
     cp -R bin lib dev-clusters "$out/share/vpsfree-dev-workspace/"
+    install -Dm644 ${coordinationCommandLibrary} "$out/share/vpsfree-dev-workspace/lib/workspace-coordination-command.rb"
     install -Dm644 nix/host-paths.json \
       "$out/share/vpsfree-dev-workspace/nix/host-paths.json"
     chmod -R u+w "$out/share/vpsfree-dev-workspace"
@@ -112,6 +114,16 @@ stdenvNoCC.mkDerivation {
       runtimePath=${lib.escapeShellArg kbRuntimePath}
       if [ "$name" = vpsfree-dev-workspace-migrate ]; then
         runtimePath=${lib.escapeShellArg migrationRuntimePath}
+      elif [ "$name" = workspace-confctl-adapter ]; then
+        runtimePath=${
+          lib.escapeShellArg (
+            lib.makeBinPath [
+              git
+              nix
+              openssh
+            ]
+          )
+        }
       fi
       makeWrapper "$source" "$out/bin/$name" \
         --prefix RUBYLIB : "$out/share/vpsfree-dev-workspace/lib" \

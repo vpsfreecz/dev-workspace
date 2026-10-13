@@ -9,6 +9,8 @@ The [vpsAdmin development cluster guide](dev-clusters/vpsadmin/README.md)
 documents its configuration, runtime credentials, and recovery steps.
 The [managed KB cluster guide](dev-clusters/kb/README.md) explains the optional
 provider and its connection to the standalone KB runtime.
+The [workspace confctl adapter](docs/workspace-confctl.md) prepares and activates
+exact generations under the generic runtime's machine reservations.
 
 The generic runtime supplies the `dev-session-documentation` skill. Its
 [session guide](https://github.com/aither64/dev-workspace/blob/master/docs/dev-sessions.md#documentation-during-development)
