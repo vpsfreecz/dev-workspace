@@ -21,6 +21,12 @@ Use the generic `dev-session-documentation` workflow to preserve useful project
 knowledge during the task. The context-owning agent reconciles it before handoff;
 this step summarizes documentation already maintained through development.
 
+Sensitive sessions keep all handoff records and evidence locally under their
+excluded `work/<slug>/` or `archive/<slug>/` directory. Update state without a
+tracking commit and keep session-specific notes out of tracked `notes/` and other
+sessions. Project-code commits and integration approval remain unchanged. Portal
+links retain the existing access policy.
+
 Before handing off material work:
 
 1. Update `work/<slug>/state.md` with the current branches, test or CI results,
@@ -30,7 +36,8 @@ Before handing off material work:
    the generic documentation skill's placement rules. Briefly explain when no
    documentation change was useful. Keep temporary branch/review instructions
    in session records and distinguish prepared operations from executed and
-   verified results. Commit the checkpoint when workspace rules require it.
+   verified results. Commit an ordinary session checkpoint when workspace rules require it; never
+   commit sensitive session records.
    If feature branches are ready but the user has not explicitly directed their
    integration into the named default branches, keep the initiative active and
    say "ready, awaiting merge approval". Review, CI, deployment, or plan
