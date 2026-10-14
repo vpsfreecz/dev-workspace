@@ -109,6 +109,17 @@ into a superficial general review.
 
 ## Main Agent Workflow
 
+For a later mechanical refresh of a completed independently reviewed branch,
+the installed runtime's certified-equivalence workflow may retain the original
+review without another reviewer turn. Preserve the original report and record a
+schema-1 receipt binding reviewer, repository/target, exact base/head, accepted
+decision and migration inventory. The coordinator must independently reconstruct
+the final tree or run the installed generated-pin verifier and bind any intermediate
+deployed range. Changes to migrations, substantive baseline behavior, conflicts
+or unproved scope still require the applicable review. This exception preserves
+initial final review, history consolidation and explicit integration approval.
+Verification reuse separately requires exact derivation and input identities.
+
 1. Confirm that the intended substantive deliverable is complete. Routine
    planning, investigation, findings, session tracking and evidence alone do
    not trigger review. Completed substantive documentation and configuration

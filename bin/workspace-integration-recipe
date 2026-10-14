@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/workspace_integration_recipe'
+
+begin
+  puts JSON.generate(WorkspaceIntegrationRecipe.run($stdin.read(262_145)))
+rescue StandardError => error
+  warn "workspace-integration-recipe: #{error.message}"
+  exit 1
+end

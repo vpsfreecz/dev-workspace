@@ -77,8 +77,9 @@ let
 in
 assert lib.assertMsg authorityPolicyValid
   "the namespace migration must be reviewed for the selected runtime authority policy";
-assert lib.assertMsg (!kbProviderEnabled || (kbRuntimePackage != null && kbSourceMetadata != null))
-  "the KB provider requires its exact published portable engine input";
+assert lib.assertMsg (
+  !kbProviderEnabled || (kbRuntimePackage != null && kbSourceMetadata != null)
+) "the KB provider requires its exact published portable engine input";
 stdenvNoCC.mkDerivation {
   pname = "vpsfree-dev-workspace-tools";
   version = "0.1.0";
@@ -114,7 +115,7 @@ stdenvNoCC.mkDerivation {
       runtimePath=${lib.escapeShellArg kbRuntimePath}
       if [ "$name" = vpsfree-dev-workspace-migrate ]; then
         runtimePath=${lib.escapeShellArg migrationRuntimePath}
-      elif [ "$name" = workspace-confctl-adapter ]; then
+      elif [ "$name" = workspace-confctl-adapter ] || [ "$name" = workspace-integration-recipe ]; then
         runtimePath=${
           lib.escapeShellArg (
             lib.makeBinPath [
@@ -208,14 +209,19 @@ stdenvNoCC.mkDerivation {
     done
     DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" "$out/bin/vpsadmin-devcluster" --help >/dev/null
     DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" "$out/bin/vpsadminos-devcluster" --help >/dev/null
-    ${if kbProviderEnabled then ''
-      ${diffutils}/bin/cmp ${clusterConfigurations.kb} \
-        "$out/share/vpsfree-dev-workspace/dev-clusters/kb/default-config.json"
-      ${coreutils}/bin/env -i HOME="$TMPDIR" PATH=/empty "$out/bin/kb-devcluster" --help >/dev/null
-      test ! -e "$TMPDIR/workspace/.dev-clusters/kb"
-    '' else ''
-      test ! -e "$out/bin/kb-devcluster"
-    ''}
+    ${
+      if kbProviderEnabled then
+        ''
+          ${diffutils}/bin/cmp ${clusterConfigurations.kb} \
+            "$out/share/vpsfree-dev-workspace/dev-clusters/kb/default-config.json"
+          ${coreutils}/bin/env -i HOME="$TMPDIR" PATH=/empty "$out/bin/kb-devcluster" --help >/dev/null
+          test ! -e "$TMPDIR/workspace/.dev-clusters/kb"
+        ''
+      else
+        ''
+          test ! -e "$out/bin/kb-devcluster"
+        ''
+    }
     ${coreutils}/bin/env -i HOME="$TMPDIR" PATH=/empty \
       "$out/bin/vpsfree-dev-workspace-migrate" --help >/dev/null
   '';

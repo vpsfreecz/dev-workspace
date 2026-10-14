@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    dev-workspace.url = "github:aither64/dev-workspace/a0be88432ead4df93eb950f51d08b748ebde2e37";
+    dev-workspace.url = "github:aither64/dev-workspace/832d9f1a6a21337dd44063ddf39f7a88cfc95450";
     kb-runtime.url = "github:vpsfreecz/vpsfree-kb-contracts/ce2c8cd9358c3636e5d39343e595df813a0b197f";
     devcluster-vpsadminos.url = "github:vpsfreecz/vpsadminos/15802517e2d92dda4ddc07ebac3d1d7ea087b430";
     devcluster-vpsadmin = {
@@ -64,11 +64,13 @@
           kbRuntimePackage =
             if siteConfig.clusterDefaults ? kb then
               inputs.kb-runtime.packages.${pkgs.stdenv.hostPlatform.system}.kb-runtime
-            else null;
+            else
+              null;
           kbSourceMetadata =
             if siteConfig.clusterDefaults ? kb then
               inputs.kb-runtime.packages.${pkgs.stdenv.hostPlatform.system}.runtime-source
-            else null;
+            else
+              null;
           inherit siteConfig;
         };
       mkPackage =
@@ -79,6 +81,7 @@
           siteConfig,
           teamConfig ? null,
           coordinationConfig ? null,
+          integrationConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         let
@@ -90,6 +93,19 @@
         in
         (dev-workspace.lib.mkPackage (
           {
+            integrationConfig =
+              if integrationConfig == null then
+                null
+              else
+                integrationConfig
+                // {
+                  recipes = (integrationConfig.recipes or { }) // {
+                    workspace-pins = {
+                      protocol = 1;
+                      command = "${tools}/bin/workspace-integration-recipe";
+                    };
+                  };
+                };
             coordinationConfig =
               if coordinationConfig == null then
                 null
@@ -129,7 +145,8 @@
                   label = "vpsAdminOS";
                   command = "${tools}/bin/vpsadminos-devcluster";
                 };
-              } // lib.optionalAttrs (validatedSiteConfig.clusterDefaults ? kb) {
+              }
+              // lib.optionalAttrs (validatedSiteConfig.clusterDefaults ? kb) {
                 kb = {
                   label = "KB";
                   command = "${tools}/bin/kb-devcluster";
@@ -302,6 +319,18 @@
         migrationPackage = testPackage;
       };
       checks.${system} = {
+        integration-recipe =
+          pkgs.runCommand "workspace-integration-recipe-tests"
+            {
+              nativeBuildInputs = [
+                pkgs.ruby
+                pkgs.git
+              ];
+            }
+            ''
+              ruby ${self}/test/workspace_integration_recipe_test.rb
+              touch "$out"
+            '';
         compatibility-package = testCompatibilityPackage;
         package = testPackage;
         kb-provider-package = testKbPackage;

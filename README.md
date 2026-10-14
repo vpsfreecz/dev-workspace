@@ -127,3 +127,13 @@ Manual workflow dispatch is also available once the workflow exists on the
 default branch. Regular dependency updates retain the fast Ruby migration and host-path
 contract checks without booting this additional VM. CI requires KVM for the VM
 job and targets normal dependency-update completion within 20 minutes.
+
+## Integration recipes
+
+The package supplies the immutable `workspace-pins` protocol-1 recipe when the
+consumer enables `integrationConfig`. Consumer `refreshes` mappings select the
+registered source, nested Nix input or confctl channel/role. Site selectors and
+repository URLs remain in that configuration. The recipe verifies the exact
+source identity and preserves unrelated inputs and follows. It uses declared
+Nix/confctl commands and hooks for generation, and a separate read-only verifier
+for certificate checks. See the generic runtime's [integration guide](https://github.com/aither64/dev-workspace/blob/master/docs/integration.md).
