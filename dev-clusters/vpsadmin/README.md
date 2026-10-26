@@ -70,6 +70,11 @@ start requires proof for every guest. A build, image age or stale readiness file
 cannot supply that proof. Use the stopped recovery below when historical
 evidence supports it.
 
+Full boot proof isolates noninteractive SSH from caller stdin and checks that
+every configured guest has proved its exact system and rooted closure once.
+Failed enumeration, missing or duplicate coverage, or a failed guest proof
+leaves the boot pending without publishing a complete applied selection.
+
 ## Maintenance boot for retained disks
 
 When the cluster is stopped and the required services closure has not been

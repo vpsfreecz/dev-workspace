@@ -564,6 +564,68 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_full_boot_proves_every_configured_guest_despite_ssh_reading_stdin
+    with_workspace('vpsadmin') do |env, directory|
+      proof_env = full_boot_proof_environment(env)
+      result = run_helper('vpsadmin', proof_env, 'start')
+      assert(result.success?, @last_output)
+      names = %w[dns-primary dns-secondary node1 services]
+      proofs = events(env).select { |event| event['event'] == 'selection-proof-complete' }
+      assert_equal(names, proofs.map { |event| event.fetch('machine') })
+      operations = guest_proof_events(proof_env)
+      names.each do |name|
+        calls = operations.select { |event| event.fetch('machine') == name }.map { |event| event.fetch('argv') }
+        top = "/nix/store/fixture-#{name}"
+        assert_equal([
+          ['--query', '--requisites', top],
+          ['--check-validity', top],
+          ['--add-root', "/nix/var/nix/gcroots/vpsadmin-devcluster-applied-#{env.fetch('TEST_SLUG')}-#{name}",
+           '--indirect', '--realise', top]
+        ], calls)
+      end
+      applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      assert_nil(applied.fetch('pending'))
+      assert_equal(names, applied.fetch('provenance').keys.sort)
+      finish = events(env).index { |event| event['event'] == 'applied-finish-boot' }
+      assert(finish)
+      assert_operator(finish, :>, events(env).rindex { |event| event['event'] == 'selection-proof-complete' })
+      assert_equal([0], events(env).select { |event| event['event'] == 'proof-stdin' }.map { |event| event['bytes'] }.uniq)
+      assert_locks_released(env)
+    end
+  end
+
+  def test_full_boot_keeps_pending_when_a_middle_guest_proof_fails
+    %w[--query --add-root].each do |operation|
+      with_workspace('vpsadmin') do |env, directory|
+        proof_env = full_boot_proof_environment(env).merge(
+          'FAIL_PROOF_MACHINE' => 'dns-secondary', 'FAIL_PROOF_OPERATION' => operation
+        )
+        result = run_helper('vpsadmin', proof_env, 'start')
+        assert_equal(23, result.exitstatus, @last_output)
+        assert_equal(['dns-primary', 'dns-secondary'], guest_proof_events(proof_env).map { |event| event.fetch('machine') }.uniq)
+        assert_equal(['dns-primary'], events(env).select { |event| event['event'] == 'selection-proof-complete' }.map { |event| event['machine'] })
+        assert_full_boot_still_pending(env, directory)
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_full_boot_refuses_incomplete_duplicate_or_failed_machine_enumeration
+    %w[truncated duplicate failed authoritative-failed].each do |mode|
+      with_workspace('vpsadmin') do |env, directory|
+        proof_env = full_boot_proof_environment(env).merge('TEST_PROOF_ENUMERATION' => mode)
+        result = run_helper('vpsadmin', proof_env, 'start')
+        refute(result.success?, "#{mode}: #{@last_output}")
+        assert_full_boot_still_pending(env, directory)
+        if %w[failed authoritative-failed].include?(mode)
+          assert_equal(23, result.exitstatus, @last_output)
+          refute(events(env).any? { |event| event['event'] == 'selection-proof' })
+        end
+        assert_locks_released(env)
+      end
+    end
+  end
+
   def test_failed_applied_source_root_leaves_pending_before_copy
     with_workspace('vpsadmin') do |env, directory|
       result = run_helper('vpsadmin', env.merge('FAIL_GC_ROOT' => '1'), 'update', 'node1')
@@ -804,6 +866,30 @@ class DevclusterCommandsTest < Minitest::Test
 
   private
 
+  def full_boot_proof_environment(env)
+    machines = %w[dns-primary dns-secondary node1 services].to_h do |name|
+      template = fixture_machines.fetch(name == 'node1' ? 'node1' : 'services')
+      original = name == 'node1' ? 'node1' : 'services'
+      [name, JSON.parse(JSON.generate(template).gsub("fixture-#{original}", "fixture-#{name}"))]
+    end
+    write_host_payloads(env.fetch('TEST_STORE'), machines)
+    selection_proof_environment(env).merge('TEST_BUILT_MACHINES' => JSON.generate(machines),
+      'DRAIN_PROOF_STDIN' => '1')
+  end
+
+  def guest_proof_events(env)
+    path = env.fetch('TEST_GUEST_PROOF_EVENTS')
+    File.exist?(path) ? File.readlines(path, chomp: true).map { |line| JSON.parse(line) } : []
+  end
+
+  def assert_full_boot_still_pending(env, directory)
+    applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+    assert_equal('boot', applied.fetch('pending').fetch('operation'))
+    assert_equal(%w[dns-primary dns-secondary node1 services], applied.fetch('configuration').fetch('machines').keys.sort)
+    assert_empty(applied.fetch('provenance'))
+    refute(events(env).any? { |event| event['event'] == 'applied-finish-boot' })
+  end
+
   def assert_payload_root_refusal(env, attempt, item)
     directory = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), '.dev-clusters', 'vpsadmin', 'clusters', env.fetch('TEST_SLUG'))
     root = File.join(directory, "maintenance-payload-#{Digest::SHA256.hexdigest(item)}")
@@ -923,7 +1009,14 @@ class DevclusterCommandsTest < Minitest::Test
     FileUtils.mkdir_p(bin)
     path = File.join(bin, 'nix-store')
     File.write(path, "#!#{RbConfig.ruby}\n" + <<~'RUBY')
+      require 'json'
       File.open(ENV.fetch('TEST_PROOF_EVENTS'), 'a') { |file| file.puts(ARGV.first) }
+      if ENV['TEST_PROOF_MACHINE']
+        File.open(ENV.fetch('TEST_GUEST_PROOF_EVENTS'), 'a') do |file|
+          file.puts(JSON.generate('machine' => ENV.fetch('TEST_PROOF_MACHINE'), 'argv' => ARGV))
+        end
+        exit 23 if ENV['FAIL_PROOF_MACHINE'] == ENV['TEST_PROOF_MACHINE'] && ARGV.first == ENV['FAIL_PROOF_OPERATION']
+      end
       if ARGV.first == '--query'
         exit 23 if ENV['FAIL_PROOF_QUERY'] == '1'
         puts ENV.fetch('TEST_PROOF_TOP')
@@ -931,7 +1024,8 @@ class DevclusterCommandsTest < Minitest::Test
     RUBY
     File.chmod(0o755, path)
     env.merge('RUN_SELECTION_PROOF' => '1', 'TEST_PROOF_BIN' => bin,
-              'TEST_PROOF_EVENTS' => File.join(bin, 'events'))
+              'TEST_PROOF_EVENTS' => File.join(bin, 'events'),
+              'TEST_GUEST_PROOF_EVENTS' => File.join(bin, 'guest-events'))
   end
 
   def enable_storage_profile(env, directory, enrollment: :omitted)
@@ -1120,6 +1214,9 @@ class DevclusterCommandsTest < Minitest::Test
       if command == 'ruby'
         helper = ARGV.first
         if helper && helper.end_with?('/vpsadmin/lib/maintenance.rb')
+          if ARGV.include?('applied-finish-boot')
+            File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => 'applied-finish-boot')) }
+          end
           require helper
           DevClusters::VpsAdminMaintenance.prepend(Module.new do
             def initialize(**identity)
@@ -1181,6 +1278,21 @@ class DevclusterCommandsTest < Minitest::Test
       end
       if command == 'jq'
         abort 'obsolete source metadata jq write' if ARGV.include?('-n') && ARGV.include?('revision')
+        if ARGV.include?('.machines | keys') && ENV['TEST_PROOF_ENUMERATION'] == 'authoritative-failed'
+          exit 23
+        end
+        if ARGV.include?('.machines | keys[]') && ENV['TEST_PROOF_ENUMERATION']
+          names = JSON.parse(File.read(ARGV.last)).fetch('machines').keys.sort
+          case ENV.fetch('TEST_PROOF_ENUMERATION')
+          when 'truncated' then names = names.first(2)
+          when 'duplicate' then names = [names.first, names.first, *names.drop(1)]
+          when 'failed'
+            puts names.first
+            exit 23
+          end
+          puts names
+          exit 0
+        end
         exec ENV.fetch('TEST_REAL_JQ'), *ARGV
       end
       if command == 'mktemp'
@@ -1292,6 +1404,12 @@ class DevclusterCommandsTest < Minitest::Test
             require 'open3'
             remote = ARGV.last
             top = remote.match(/= '([^']+)'/).captures.first
+            root = remote.match(/--add-root '([^']+)'/).captures.first
+            machine = root.delete_prefix("/nix/var/nix/gcroots/vpsadmin-devcluster-applied-#{ENV.fetch('TEST_SLUG')}-")
+            if ENV['DRAIN_PROOF_STDIN'] == '1'
+              input = ARGV.include?('-n') ? '' : STDIN.read
+              File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => 'proof-stdin', 'bytes' => input.bytesize)) }
+            end
             prelude = <<~SH
               readlink() { printf '%s\n' '#{top}'; }
               test() {
@@ -1299,9 +1417,13 @@ class DevclusterCommandsTest < Minitest::Test
                 command test "$@"
               }
             SH
-            output, errors, result = Open3.capture3({ 'PATH' => "#{ENV.fetch('TEST_PROOF_BIN')}:#{ENV.fetch('PATH')}", 'TEST_PROOF_TOP' => top }, 'bash', '-c', prelude + remote)
+            output, errors, result = Open3.capture3({ 'PATH' => "#{ENV.fetch('TEST_PROOF_BIN')}:#{ENV.fetch('PATH')}", 'TEST_PROOF_TOP' => top,
+              'TEST_PROOF_MACHINE' => machine }, 'bash', '-c', prelude + remote)
             print output
             warn errors unless errors.empty?
+            if result.success?
+              File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => 'selection-proof-complete', 'machine' => machine)) }
+            end
             exit result.exitstatus
           end
           exit 0
