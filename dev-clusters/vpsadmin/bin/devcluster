@@ -1734,18 +1734,28 @@ prove_machine_selection() {
   [[ "$top" =~ ^/nix/store/[A-Za-z0-9+._-]+$ ]] || die "invalid candidate system path"
   [ "$spin" != nixos ] || init_check="test -x '$top/init';"
   # shellcheck disable=SC2086
-  timeout --kill-after=5s 120s ssh $opts "root@$host" "set -eu; test \"\$(readlink -e /run/current-system)\" = '$top'; $init_check requisites=\"\$(nix-store --query --requisites '$top')\" || exit \$?; test -n \"\$requisites\"; printf '%s\\n' \"\$requisites\" | xargs -r nix-store --check-validity; nix-store --add-root '/nix/var/nix/gcroots/vpsadmin-devcluster-applied-$slug-$machine' --indirect --realise '$top' >/dev/null"
+  timeout --kill-after=5s 120s ssh -n $opts "root@$host" "set -eu; test \"\$(readlink -e /run/current-system)\" = '$top'; $init_check requisites=\"\$(nix-store --query --requisites '$top')\" || exit \$?; test -n \"\$requisites\"; printf '%s\\n' \"\$requisites\" | xargs -r nix-store --check-validity; nix-store --add-root '/nix/var/nix/gcroots/vpsadmin-devcluster-applied-$slug-$machine' --indirect --realise '$top' >/dev/null"
 }
 
 prove_full_applied_boot() {
-  local slug="$1" config="$2" machine top names
+  local slug="$1" config="$2" machine top spin names expected coverage
+  local -a machines=()
+  local -A proved=()
   root_applied_source "$slug" "$config" || return
+  expected="$(jq -c '.machines | keys' "$config")" || return
   names="$(jq -r '.machines | keys[]' "$config")" || return
   [ -n "$names" ] || die "full boot proof requires every configured machine"
-  while IFS= read -r machine; do
+  # Keep enumeration off stdin even if a child command starts reading it.
+  mapfile -t machines <<<"$names"
+  for machine in "${machines[@]}"; do
+    [ -z "${proved[$machine]+present}" ] || die "duplicate machine in full boot proof"
     top="$(jq -r --arg machine "$machine" '.machines[$machine].toplevel' "$config")" || return
-    prove_machine_selection "$slug" "$machine" "$top" "$(jq -r --arg machine "$machine" '.machines[$machine].spin' "$config")" || return
-  done <<<"$names"
+    spin="$(jq -r --arg machine "$machine" '.machines[$machine].spin' "$config")" || return
+    prove_machine_selection "$slug" "$machine" "$top" "$spin" || return
+    proved[$machine]=1
+  done
+  coverage="$(printf '%s\n' "${!proved[@]}" | jq -Rsc 'split("\n")[:-1] | sort')" || return
+  [ "$coverage" = "$expected" ] || die "full boot proof did not cover every configured machine"
   maintenance_state "$slug" applied-finish-boot "$config" "public full boot proved all current systems and rooted closures after refresh"
 }
 
