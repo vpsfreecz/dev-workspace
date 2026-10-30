@@ -412,6 +412,99 @@ class DevclusterMaintenanceTest < Minitest::Test
     end
   end
 
+  def test_applied_os_source_is_read_only_and_allows_partial_unrelated_provenance
+    with_applied_fixture(os_source: true) do |maintenance, paths|
+      applied = read_applied(paths)
+      applied.fetch('provenance').delete('node1')
+      write_json(paths.fetch(:applied), applied)
+      before = File.binread(paths.fetch(:applied))
+      assert_equal(paths.fetch(:os_source), maintenance.applied_os_source)
+      assert_equal(before, File.binread(paths.fetch(:applied)))
+    end
+  end
+
+  def test_applied_os_source_uses_old_configuration_during_same_target_pending_retry
+    with_applied_fixture(os_source: true) do |maintenance, paths|
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'services')
+      # A pending candidate can differ; it is not evidence of an applied OS.
+      pending = read_applied(paths)
+      candidate = JSON.parse(File.read(paths.fetch(:candidate)))
+      candidate.fetch('machines').each_value { |machine| machine.fetch('sharedFileSystems')['vpsadminos'] = '/mutable/candidate' }
+      path = paths.fetch(:candidate) + '-different-os.json'
+      write_json(path, candidate)
+      pending.fetch('pending').merge!('candidate' => path, 'candidate_sha256' => Digest::SHA256.file(path).hexdigest)
+      write_json(paths.fetch(:applied), pending)
+      before = File.binread(paths.fetch(:applied))
+      assert_equal(paths.fetch(:os_source), maintenance.applied_os_source)
+      assert_equal(before, File.binread(paths.fetch(:applied)))
+    end
+  end
+
+  def test_applied_os_source_refuses_conflicting_pending_operations
+    ['node1', 'boot', 'copied_boot'].each do |operation|
+      with_applied_fixture(os_source: true) do |maintenance, paths|
+        maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'node1')
+        applied = read_applied(paths)
+        if operation != 'node1'
+          applied.fetch('pending').merge!('operation' => operation, 'targets' => %w[services node1])
+          write_json(paths.fetch(:applied), applied)
+        end
+        before = File.binread(paths.fetch(:applied))
+        assert_raises(Maintenance::Invalid) { maintenance.applied_os_source }
+        assert_equal(before, File.binread(paths.fetch(:applied)))
+      end
+    end
+  end
+
+  def test_applied_os_source_requires_services_proof_and_available_source
+    %w[missing_record unproved missing_mount mixed_mount non_store missing_source missing_flake missing_lock].each do |failure|
+      with_applied_fixture(os_source: true) do |maintenance, paths|
+        applied = read_applied(paths)
+        case failure
+        when 'missing_record' then File.unlink(paths.fetch(:applied))
+        when 'unproved'
+          applied.fetch('provenance').delete('services')
+          write_json(paths.fetch(:applied), applied)
+        when 'missing_source' then FileUtils.rm_rf(paths.fetch(:os_source))
+        when 'missing_flake' then File.unlink(File.join(paths.fetch(:os_source), 'flake.nix'))
+        when 'missing_lock' then File.unlink(File.join(paths.fetch(:os_source), 'flake.lock'))
+        else
+          machines = applied.fetch('configuration').fetch('machines')
+          if failure == 'missing_mount'
+            machines.fetch('services').delete('sharedFileSystems')
+          elsif failure == 'mixed_mount'
+            machines.fetch('node1').fetch('sharedFileSystems')['vpsadminos'] += '-different'
+          else
+            machines.each_value { |machine| machine.fetch('sharedFileSystems')['vpsadminos'] = '/mutable/source' }
+          end
+          write_applied_configuration(paths, applied)
+        end
+        before = File.file?(paths.fetch(:applied)) && File.binread(paths.fetch(:applied))
+        error = assert_raises(Maintenance::Invalid, failure) { maintenance.applied_os_source }
+        assert_includes(error.message, 'A services update requires a verified immutable OS source:')
+        assert_equal(before, File.file?(paths.fetch(:applied)) && File.binread(paths.fetch(:applied)))
+      end
+    end
+  end
+
+  def test_services_os_selection_keeps_strict_mount_layout_and_untouched_node_proof
+    with_applied_fixture(os_source: true) do |maintenance, paths|
+      before = read_applied(paths)
+      assert_equal(paths.fetch(:os_source), maintenance.applied_os_source)
+      changed = JSON.parse(File.read(paths.fetch(:candidate)))
+      changed.fetch('machines').fetch('services').fetch('sharedFileSystems')['vpsadminos'] += '-changed'
+      path = paths.fetch(:candidate) + '-mount-changed.json'
+      write_json(path, changed)
+      assert_raises(Maintenance::Invalid) { maintenance.begin_update!(candidate_path: path, target: 'services') }
+      assert_equal(before, read_applied(paths))
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'services')
+      maintenance.promote_update!(target: 'services', proof_reference: 'fixture services update')
+      after = read_applied(paths)
+      assert_equal(before.dig('configuration', 'machines', 'node1'), after.dig('configuration', 'machines', 'node1'))
+      assert_equal(before.dig('provenance', 'node1'), after.dig('provenance', 'node1'))
+    end
+  end
+
   def test_legacy_target_update_does_not_prove_untouched_images
     with_fixture do |maintenance, paths|
       assert_raises(Maintenance::Invalid) { maintenance.begin_boot!(config_path: paths.fetch(:resident), operation: 'boot') }
@@ -622,12 +715,21 @@ class DevclusterMaintenanceTest < Minitest::Test
     maintenance.begin_copy!(candidate_path: paths.fetch(:candidate), **identity.merge(overrides))
   end
 
+  def write_applied_configuration(paths, applied)
+    source = paths.fetch(:resident) + '-os-proof.json'
+    write_json(source, applied.fetch('configuration'))
+    applied.fetch('provenance').each_value do |proof|
+      proof.merge!('source_config' => source, 'source_config_sha256' => Digest::SHA256.file(source).hexdigest)
+    end
+    write_json(paths.fetch(:applied), applied)
+  end
+
   def read_applied(paths)
     JSON.parse(File.read(paths.fetch(:applied)))
   end
 
-  def with_applied_fixture
-    with_fixture do |maintenance, paths|
+  def with_applied_fixture(os_source: false)
+    with_fixture(os_source:) do |maintenance, paths|
       prepare(maintenance, paths)
       bind_boot(maintenance)
       begin_copy(maintenance, paths)
@@ -705,7 +807,7 @@ class DevclusterMaintenanceTest < Minitest::Test
     write_json(paths.fetch(:evidence), evidence)
   end
 
-  def with_fixture
+  def with_fixture(os_source: false)
     Dir.mktmpdir('maintenance-test') do |workspace|
       slug = '2026-10-02-maintenance-fixture'
       directory = File.join(workspace, '.dev-clusters', 'vpsadmin', 'clusters', slug)
@@ -729,6 +831,12 @@ class DevclusterMaintenanceTest < Minitest::Test
       File.binwrite(File.join(services.fetch('qemu'), 'bin/qemu-system-x86_64'), 'fixture')
       File.chmod(0o755, File.join(services.fetch('qemu'), 'bin/qemu-system-x86_64'))
       File.symlink('qemu-system-x86_64', File.join(services.fetch('qemu'), 'bin/qemu-kvm'))
+      if os_source
+        paths[:os_source] = File.join(store, 'retained-os-source')
+        FileUtils.mkdir_p(paths.fetch(:os_source))
+        %w[flake.nix flake.lock].each { |name| File.write(File.join(paths.fetch(:os_source), name), '{}') }
+        [services, node].each { |machine| machine['sharedFileSystems'] = { 'vpsadminos' => paths.fetch(:os_source) } }
+      end
       write_json(paths.fetch(:resident), { 'machines' => { 'services' => services, 'node1' => node } })
       File.binwrite(paths.fetch(:services_disk), 'retained services payload')
       File.binwrite(paths.fetch(:node_disk), 'retained node payload')

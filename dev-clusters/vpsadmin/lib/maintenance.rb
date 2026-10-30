@@ -572,6 +572,31 @@ module DevClusters
       !applied_record.nil?
     end
 
+    def applied_os_source
+      applied = applied_record || raise(Invalid, 'the applied selection is missing')
+      unless applied.fetch('provenance').key?('services')
+        raise Invalid, 'the applied record does not prove the services selection'
+      end
+      pending = applied.fetch('pending')
+      if pending && (pending.fetch('operation') != 'update' || pending.fetch('targets') != ['services'])
+        raise Invalid, 'another operation remains unresolved'
+      end
+      sources = applied.fetch('configuration').fetch('machines').values.map do |machine|
+        shares = machine.fetch('sharedFileSystems', {})
+        raise Invalid, 'the recorded OS source is unavailable or incomplete' unless shares.is_a?(Hash) && shares.key?('vpsadminos')
+
+        shares.fetch('vpsadminos')
+      end
+      source = store_path!(sources.first)
+      raise Invalid, 'the recorded OS source paths differ between machines' unless sources.all? { |path| path == source }
+      unless File.directory?(source) && %w[flake.nix flake.lock].all? { |name| File.file?(File.join(source, name)) && File.readable?(File.join(source, name)) }
+        raise Invalid, 'the recorded OS source is unavailable or incomplete'
+      end
+      source
+    rescue Invalid, KeyError => e
+      raise Invalid, "A services update requires a verified immutable OS source: #{e.message.delete_suffix('.')}. Resolve the applied selection through the existing recovery workflow before retrying."
+    end
+
     # Raw added JSON has no registered references to paths in its contents.
     # Keep host inputs independently rooted; this establishes no guest proof.
     def root_host_payloads!(config_path:, machines: nil)
@@ -1200,6 +1225,14 @@ if $PROGRAM_NAME == __FILE__
       maintenance.retained_config!(output_path: arguments.fetch(0), candidate_path: arguments[1])
     when 'applied-present'
       puts maintenance.retained_selection? ? 'true' : 'false'
+    when 'applied-os-source'
+      raise DevClusters::VpsAdminMaintenance::Invalid, 'unexpected applied OS source arguments' unless arguments.empty?
+      begin
+        puts maintenance.applied_os_source
+      rescue DevClusters::VpsAdminMaintenance::Invalid => e
+        warn "error: #{e.message}"
+        exit 1
+      end
     when 'recover-prepare'
       raise DevClusters::VpsAdminMaintenance::Invalid, 'invalid recovery arguments' unless arguments.length == 1
       puts JSON.generate(maintenance.prepare_recovery!(evidence_path: arguments.fetch(0), output_path: File.join(directory, 'recovery-next.json')))

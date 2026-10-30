@@ -756,6 +756,18 @@ vpsadmin-devcluster update <slug> node1
 which rebuilds the machine config, copies the new closure to the running VM,
 and runs `switch-to-configuration`.
 
+Services-only updates reuse the immutable vpsAdminOS source recorded in the
+applied configuration. Both OS inputs and the source mount keep that path when
+staging or an optional OS worktree changes. The source content identifies this
+selection; its Git revision is reported as unknown. A retry of a pending services
+update uses the previously applied source. The update stops before preparing
+credentials or building if the applied record does not prove the services
+selection, another operation remains unresolved, or the recorded OS source is
+unavailable, incomplete or differs between machines. Resolve the applied selection
+through the existing recovery workflow before retrying. The updater does not fall
+back to a mutable source. Start, updates of other targets and maintenance copy-only
+operations keep their existing selection behavior.
+
 When changing Ruby code packaged as gems, rebuild vpsAdmin packaged gems before
 updating the cluster:
 

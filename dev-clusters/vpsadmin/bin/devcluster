@@ -669,6 +669,7 @@ build_config_with_credentials() {
   local slug="$1"
   local topology="$2"
   local network="$3"
+  local retained_os_source="${4:-}"
 
   if webui_enabled "$slug"; then
     [ "$network" = bridge ] || die "React WebUI requires bridge networking; disable newWebui.enable for local mode"
@@ -676,7 +677,7 @@ build_config_with_credentials() {
   fi
   ensure_shared_credentials "$slug" || return
   ensure_webui_credentials "$slug" || return
-  build_config "$slug" "$topology" "$network"
+  build_config "$slug" "$topology" "$network" "$retained_os_source"
 }
 
 slug_vpsadmin_path() {
@@ -741,6 +742,7 @@ nix_common_env() {
   local vpsf_status_path="${10}"
   local vpsadmin_go_client_path="${11}"
   local vpsadmin_webui_path="${12}"
+  local retained_os_source="${13:-}"
 
   export VPSADMIN_DEVCLUSTER_WORKSPACE="$WORKSPACE"
   export VPSADMIN_DEVCLUSTER_SLUG="$slug"
@@ -757,9 +759,14 @@ nix_common_env() {
   export VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY
   VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY="$(source_dirty "$vpsadmin_path")" || return
   export VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION
-  VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION="$(source_revision "$vpsadminos_path")" || return
   export VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY
-  VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY="$(source_dirty "$vpsadminos_path")" || return
+  if [ -n "$retained_os_source" ]; then
+    VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION=""
+    VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY=0
+  else
+    VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION="$(source_revision "$vpsadminos_path")" || return
+    VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY="$(source_dirty "$vpsadminos_path")" || return
+  fi
   export VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION
   if [ -n "$vpsadmin_webui_path" ]; then
     VPSADMIN_DEVCLUSTER_VPSADMIN_WEBUI_REVISION="$(source_revision "$vpsadmin_webui_path")" || return
@@ -811,6 +818,7 @@ build_config() {
   local slug="$1"
   local topology="$2"
   local network="$3"
+  local retained_os_source="${4:-}"
   local dir
   local vpsadmin_path
   local vpsadminos_path
@@ -828,7 +836,13 @@ build_config() {
   ensure_cluster_config "$slug" || return
 
   vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
-  vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
+  if [ -n "$retained_os_source" ]; then
+    vpsadminos_path="$retained_os_source"
+    vpsadminos_input_value="path:$retained_os_source"
+  else
+    vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
+    vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
+  fi
   haveapi_path="$(slug_optional_path "$slug" haveapi || true)"
   config_source_path="$(slug_optional_path "$slug" vpsfree-cz-configuration || true)"
   mail_templates_path="$(slug_optional_path "$slug" vpsfree-mail-templates || true)"
@@ -836,13 +850,12 @@ build_config() {
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_go_client_path="$(slug_optional_path "$slug" vpsadmin-go-client || true)"
   vpsadmin_webui_path="$(slug_optional_path "$slug" vpsadmin-webui || true)"
-  vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
 
   if [ -z "$vpsadminos_path" ]; then
     vpsadminos_path=""
   fi
 
-  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path" "$vpsadmin_webui_path" || return
+  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path" "$vpsadmin_webui_path" "$retained_os_source" || return
 
   local -a overrides=()
   while IFS= read -r -d '' item; do
@@ -1438,10 +1451,14 @@ update_cluster() {
   topology="$(cluster_topology "$slug")"
   local network
   network="$(cluster_network "$slug")"
+  local retained_os_source=""
+  if [ "$target" = services ]; then
+    retained_os_source="$(maintenance_state "$slug" applied-os-source)" || return
+  fi
 
   maintenance_state "$slug" root-applied-payloads || return
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
-    build_config_with_credentials "$slug" "$topology" "$network" || return
+    build_config_with_credentials "$slug" "$topology" "$network" "$retained_os_source" || return
 
   need_cmd jq
 
