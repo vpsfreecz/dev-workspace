@@ -18,6 +18,13 @@ vpsFree technical documentation.
 ## Workflow
 
 1. Establish the supported behavior and factual claims before editing style.
+   Prefer versionless prose, install commands, links, and examples when the
+   actual client or protocol permits. Verify defaults before omitting version
+   selectors. Keep an exact version only for a demonstrated compatibility,
+   protocol, migration, recovery, or reproducibility requirement, or when an
+   established update process keeps it current. State the reason or link to
+   maintained guidance from the owning component. A URL, argument, or other
+   machine-significant value is not itself an exemption.
 2. Inventory every fact, command, value, link, identifier, and warning that must
    survive.
 3. Rewrite the prose in embedded mode. Keep the draft, self-audit, and comparison
@@ -72,6 +79,9 @@ requires a change:
 - commands, options, executable lines, configuration keys and values;
 - IP addresses, ports, paths, hashes, versions, names, and URLs;
 - table structure and list syntax that affects rendering.
+
+This protection does not prevent removing optional versions in requested factual
+updates, following the workflow above.
 
 Visible labels and explanatory prose may change. In localized code samples,
 translate human-readable comments but preserve shebangs, tool directives,
