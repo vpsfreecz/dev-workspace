@@ -7,6 +7,82 @@ $stdout.sync = true
 
 # Run outside the build sandbox: Nix evaluates the installed provider flakes
 # through the daemon, using locked test inputs and disposable configuration.
+if ARGV.first == '--projection-only'
+  root = File.expand_path("..", __dir__)
+  expression = <<~'NIX'
+    let
+      repo = builtins.getFlake (builtins.getEnv "PROJECTION_SOURCE");
+      provider = import (builtins.getEnv "PROJECTION_SOURCE" + "/dev-clusters/vpsadmin/flake.nix");
+      project = (provider.outputs { self = { }; nixpkgs = repo.inputs.nixpkgs;
+        vpsadmin = { }; vpsadminos = { }; vpsadminWebui = { }; vpsfStatus = { };
+      }).lib.projectUpdateConfig;
+      machine = spin: {
+        inherit spin;
+        qemu = "/nix/store/old-qemu"; virtiofsd = "/nix/store/old-virtiofsd";
+        sharedFileSystems = { vpsadminos = "/boot/source"; vpsadmin = "/same/source"; };
+        memory = 4096; cpus = 4; disks = [ ]; networks = [ ]; kernelParams = [ ];
+        kernel = "/old/kernel"; initrd = "/old/initrd"; toplevel = "/old/system";
+      };
+      old = { machines = {
+        services = (machine "nixos") // { rootDisk = { device = "root.img"; image = "/old/image"; }; };
+        node1 = (machine "vpsadminos") // { squashfs = "/old/squashfs"; };
+      }; labels = { old = true; }; };
+      next = old // { machines = builtins.mapAttrs (name: m: m // {
+        qemu = "/nix/store/new-qemu"; virtiofsd = "/nix/store/new-virtiofsd";
+        sharedFileSystems = m.sharedFileSystems // { vpsadminos = "/selected/source"; };
+        kernel = "/new/kernel"; initrd = "/new/initrd"; toplevel = "/new/system";
+      } // (if name == "services" then { rootDisk = m.rootDisk // { image = "/new/image"; }; }
+      else { squashfs = "/new/squashfs"; })) old.machines; labels.selectedRevision = "new"; };
+      lazy = next // { machines = next.machines // { node1 = next.machines.node1 // {
+        toplevel = throw "unrelated node system forced"; kernel = throw "unrelated node kernel forced";
+        initrd = throw "unrelated node initrd forced"; squashfs = throw "unrelated node squashfs forced";
+      }; }; };
+      services = project old "services" lazy;
+      node = project old "node1" next;
+      all = project old "all" next;
+      boot = project old "boot" lazy;
+      withoutImage = old // { machines = old.machines // { services = old.machines.services // {
+        rootDisk = builtins.removeAttrs old.machines.services.rootDisk [ "image" ];
+      }; }; };
+      absentImage = project withoutImage "services" next;
+      mutations = [
+        (m: m // { memory = 8192; }) (m: m // { cpus = 8; })
+        (m: m // { disks = [ { device = "another.img"; } ]; })
+        (m: m // { networks = [ { type = "user"; } ]; })
+        (m: m // { sharedFileSystems = m.sharedFileSystems // { vpsadmin = "/different"; }; })
+        (m: m // { sharedFileSystems = builtins.removeAttrs m.sharedFileSystems [ "vpsadminos" ]; })
+        (m: m // { bootMode = "firmware"; }) (m: m // { kernelParams = [ "changed" ]; })
+        (m: m // { rootDisk = m.rootDisk // { device = "other.img"; }; })
+      ];
+      refused = change: !(builtins.tryEval (builtins.deepSeq (project old "services" (next // {
+        machines = next.machines // { services = change next.machines.services; };
+      })) true)).success;
+    in
+    assert services.machines.node1 == old.machines.node1;
+    assert services.machines.services.toplevel == "/new/system";
+    assert services.machines.services.kernel == "/new/kernel";
+    assert services.machines.services.rootDisk.image == "/old/image";
+    assert services.machines.services.qemu == old.machines.services.qemu;
+    assert services.machines.services.virtiofsd == old.machines.services.virtiofsd;
+    assert services.machines.services.sharedFileSystems.vpsadminos == "/boot/source";
+    assert services.labels.selectedRevision == "new";
+    assert node.machines.services == old.machines.services;
+    assert node.machines.node1.squashfs == "/new/squashfs";
+    assert all.machines.services.toplevel == "/new/system" && all.machines.node1.toplevel == "/new/system";
+    assert boot.machines == old.machines;
+    assert !(absentImage.machines.services.rootDisk ? image);
+    assert builtins.all refused mutations;
+    assert !(builtins.tryEval (builtins.deepSeq (project old "services" (next // {
+      machines = builtins.removeAttrs next.machines [ "node1" ];
+    })) true)).success;
+    { lazyServices = true; retainedBoot = true; absentImagePreserved = true; selectedTargets = true; refusedLayoutChanges = builtins.length mutations + 1; }
+  NIX
+  stdout, stderr, result = Open3.capture3({ 'PROJECTION_SOURCE' => root }, 'nix', 'eval', '--impure', '--json', '--expr', expression)
+  abort stderr unless result.success?
+  puts stdout
+  exit 0
+end
+
 storage_profile = ARGV.delete('--storage-profile')
 unless ARGV.length == 5
   abort 'Usage: devcluster_nix_smoke.rb PACKAGE VPSADMIN VPSADMINOS VPSF_STATUS VPSADMIN_WEBUI [--storage-profile]'
@@ -62,6 +138,7 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
       abort 'WebUI frontend/BFF package provenance differs' unless provenance.fetch('frontend') == provenance.fetch('bff')
     end
 
+    rendered = nil
     # Forcing drvPath evaluates the actual machine configuration without
     # realising its VM closure or starting a kernel build.
     %w[bridge local].each do |network|
@@ -109,6 +186,34 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
         end
         puts "#{kind}: #{network} #{variant} configuration evaluated"
       end
+    end
+
+    if kind == 'vpsadmin'
+      retained = JSON.parse(JSON.generate(rendered))
+      retained.fetch('machines').each_value do |machine|
+        machine.fetch('sharedFileSystems')['vpsadminos'] = '/recorded/boot-export'
+      end
+      context = File.join(workspace, 'applied-vm-context.json')
+      File.write(context, JSON.generate(retained))
+      File.chmod(0o600, context)
+      environment["#{prefix}APPLIED_CONFIG"] = context
+      environment["#{prefix}UPDATE_TARGET"] = 'services'
+      result = JSON.parse(run!(environment, 'nix', 'eval', *common, '--json',
+                               '--apply', 'config: { drvPath = config.drvPath; text = config.text; }',
+                               "path:#{source}#cluster-config"))
+      projected = JSON.parse(result.fetch('text'))
+      retained.fetch('machines').each do |name, machine|
+        if name == 'services'
+          %w[qemu virtiofsd sharedFileSystems rootDisk].each do |field|
+            abort "Services update changed recorded #{field}" unless projected.fetch('machines').fetch(name).fetch(field) == machine.fetch(field)
+          end
+        else
+          abort 'Services update changed an untouched descriptor' unless projected.fetch('machines').fetch(name) == machine
+        end
+      end
+      environment["#{prefix}APPLIED_CONFIG"] = nil
+      environment["#{prefix}UPDATE_TARGET"] = nil
+      puts 'vpsadmin: services projection retains boot metadata and untouched descriptors'
     end
 
     if kind == 'vpsadmin'

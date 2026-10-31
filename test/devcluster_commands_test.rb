@@ -58,7 +58,7 @@ class DevclusterCommandsTest < Minitest::Test
 
   def test_failed_build_does_not_launch_or_deploy_an_old_result
     KINDS.product(%w[start update], [false, true]).each do |kind, command, retained|
-      with_workspace(kind, retained:) do |env, directory|
+      with_workspace(kind, retained:, applied: kind == 'vpsadmin' && command == 'update') do |env, directory|
         before = retained ? File.readlink(File.join(directory, 'result-config')) : nil
         result = run_helper(kind, env.merge('FAIL_AT' => 'build'), command)
         assert_equal(23, result.exitstatus, "#{kind} #{command}")
@@ -78,7 +78,7 @@ class DevclusterCommandsTest < Minitest::Test
     KINDS.product(%w[start update]).each do |kind, command|
       failures = kind == 'vpsadmin' ? %w[keygen genrsa req x509] : %w[keygen]
       failures.each do |failure|
-        with_workspace(kind) do |env, _directory|
+        with_workspace(kind, applied: kind == 'vpsadmin' && command == 'update') do |env, _directory|
           result = run_helper(kind, env.merge('FAIL_AT' => failure), command)
           assert_equal(23, result.exitstatus, "#{kind} #{command} #{failure}")
           refute(events(env).any? { |event| %w[build run copy activate ssh].include?(event['event']) })
@@ -89,12 +89,26 @@ class DevclusterCommandsTest < Minitest::Test
   end
 
   def test_react_webui_credentials_are_stable_and_source_is_recorded
-    with_workspace('vpsadmin') do |env, directory|
+    with_workspace('vpsadmin', applied: true) do |env, directory|
       env = enable_react_webui(env, directory)
       File.write(File.join(directory, 'network'), "bridge\n")
       FileUtils.mkdir_p(File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadmin-webui'))
+      old = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
       first = run_helper('vpsadmin', env, 'update', 'services')
       assert(first.success?, @last_output)
+      after = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      %w[node1 node2].each do |name|
+        assert_equal(old.dig('configuration', 'machines', name), after.dig('configuration', 'machines', name))
+        assert_equal(old.dig('provenance', name), after.dig('provenance', name))
+      end
+      calls = events(env)
+      assert_equal(1, calls.count { |event| event['event'] == 'copy' })
+      assert_equal(1, calls.count { |event| event['event'] == 'activate' })
+      activation = calls.index { |event| event['event'] == 'activate' }
+      restart = calls.index { |event| event['event'] == 'ssh' && event['argv'].last.include?('systemctl restart vpsadmin-api.service') }
+      refresh = calls.index { |event| event['event'] == 'ssh-ready' }
+      assert_operator(activation, :<, restart)
+      assert_operator(restart, :<, refresh)
       bundle = File.join(directory, 'webui-credentials')
       assert_equal(0o700, File.stat(bundle).mode & 0o777)
       values = %w[oauth-client-id oauth-client-secret session-secret].to_h do |name|
@@ -122,9 +136,116 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_creation_and_every_update_use_the_same_os_selector
+    [false, true].product([nil, 'services', 'node1', 'all']).each do |worktree, target|
+      with_workspace('vpsadmin', applied: !target.nil?) do |env, directory|
+        selected = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadminos')
+        FileUtils.rm_rf(selected) unless worktree
+        before = File.binread(File.join(directory, 'applied-config.json')) if target
+        result = run_helper('vpsadmin', env.merge('FAIL_AT' => 'build', 'TEST_GIT_DIRTY' => '1'), target ? 'update' : 'start', target)
+        assert_equal(23, result.exitstatus, @last_output)
+        build = events(env).find { |event| event['event'] == 'build' }
+        overrides = {}
+        build.fetch('argv').each_cons(3) { |flag, name, value| overrides[name] = value if flag == '--override-input' }
+        expected = worktree ? "path:#{selected}" : "git+file://#{env.fetch('DEVCLUSTER_WORKSPACE')}/repos/vpsadminos.git?ref=refs/remotes/origin/staging"
+        assert_equal(expected, overrides.fetch('vpsadminos'))
+        assert_equal(expected, overrides.fetch('vpsadmin/vpsadminos'))
+        variables = build.fetch('environment')
+        assert_equal(worktree ? selected : '', variables.fetch('VPSADMIN_DEVCLUSTER_VPSADMINOS_SOURCE'))
+        assert_equal(worktree ? '1' * 40 : '', variables.fetch('VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION'))
+        assert_equal(worktree ? '1' : '0', variables.fetch('VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY'))
+        if target
+          assert_equal(JSON.parse(before).fetch('configuration'), build.fetch('build_context'))
+          refute_equal(selected, build.fetch('build_context').dig('machines', 'services', 'sharedFileSystems', 'vpsadminos'))
+          assert_equal(before, File.binread(File.join(directory, 'applied-config.json')))
+        else
+          assert_nil(build['build_context'])
+        end
+        refute(events(env).any? { |event| %w[copy activate run].include?(event['event']) })
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_unproved_target_or_conflicting_pending_refuses_before_build_and_credentials
+    %w[missing unproved all_partial conflict].each do |failure|
+      with_workspace('vpsadmin', applied: true) do |env, directory|
+        path = File.join(directory, 'applied-config.json')
+        applied = JSON.parse(File.read(path))
+        if failure == 'missing'
+          File.unlink(path)
+        else
+          applied.fetch('provenance').delete(failure == 'all_partial' ? 'node1' : 'services') if %w[unproved all_partial].include?(failure)
+          if failure == 'conflict'
+            applied['pending'] = { 'operation' => 'update', 'targets' => ['node1'],
+              'candidate' => File.join(env.fetch('TEST_STORE'), 'applied.json'),
+              'candidate_sha256' => Digest::SHA256.file(File.join(env.fetch('TEST_STORE'), 'applied.json')).hexdigest }
+          end
+          File.write(path, JSON.generate(applied))
+        end
+        before = File.exist?(path) && File.binread(path)
+        result = run_helper('vpsadmin', env, 'update', failure == 'all_partial' ? 'all' : 'services')
+        refute(result.success?, failure + @last_output)
+        diagnostic = case failure
+                     when 'missing' then 'Applied VM context is unknown; use residency recovery only with supporting historical evidence.'
+                     when 'conflict' then 'Another applied operation remains uncertain.'
+                     else 'Applied VM context is unproved for the requested target.'
+                     end
+        assert_includes(@last_output, diagnostic)
+        assert_empty(events(env))
+        assert_equal(before, File.exist?(path) && File.binread(path))
+        refute(File.exist?(File.join(env.fetch('DEVCLUSTER_WORKSPACE'), '.dev-clusters/vpsadmin/ssh')))
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_proven_services_retry_keeps_old_context_and_unproved_peers
+    with_workspace('vpsadmin', applied: true) do |env, directory|
+      path = File.join(directory, 'applied-config.json')
+      applied = JSON.parse(File.read(path))
+      applied.fetch('provenance').delete('node1')
+      File.write(path, JSON.generate(applied))
+      result = run_helper('vpsadmin', env.merge('FAIL_AT' => 'copy'), 'update', 'services')
+      assert_equal(23, result.exitstatus, @last_output)
+      assert_equal(['services'], JSON.parse(File.read(path)).dig('pending', 'targets'))
+      before = File.binread(path)
+      result = run_helper('vpsadmin', env.merge('FAIL_AT' => 'build'), 'update', 'services')
+      assert_equal(23, result.exitstatus, @last_output)
+      build = events(env).reverse.find { |event| event['event'] == 'build' }
+      assert_equal(applied.fetch('configuration'), build.fetch('build_context'))
+      assert_equal(before, File.binread(path))
+      refute(JSON.parse(before).fetch('provenance').key?('node1'))
+      assert_locks_released(env)
+    end
+  end
+
+  def test_all_promotes_only_completed_targets_before_a_later_copy_failure
+    with_workspace('vpsadmin', applied: true) do |env, directory|
+      path = File.join(directory, 'applied-config.json')
+      before = JSON.parse(File.read(path))
+      machines = JSON.parse(env.fetch('TEST_BUILT_MACHINES'))
+      machines.each_value { |machine| machine['toplevel'] += '-next' }
+      env = env.merge('TEST_BUILT_MACHINES' => JSON.generate(machines), 'FAIL_COPY_SYSTEM' => machines.fetch('node1').fetch('toplevel'))
+      result = run_helper('vpsadmin', env, 'update', 'all')
+      assert_equal(23, result.exitstatus, @last_output)
+      after = JSON.parse(File.read(path))
+      assert_equal(machines.fetch('services'), after.dig('configuration', 'machines', 'services'))
+      %w[node1 node2].each do |name|
+        assert_equal(before.dig('configuration', 'machines', name), after.dig('configuration', 'machines', name))
+        assert_equal(before.dig('provenance', name), after.dig('provenance', name))
+      end
+      assert_equal(['node1'], after.dig('pending', 'targets'))
+      assert_equal([machines.fetch('services').fetch('toplevel'), machines.fetch('node1').fetch('toplevel')],
+        events(env).select { |event| event['event'] == 'copy' }.map { |event| event['argv'].last })
+      assert_equal(1, events(env).count { |event| event['event'] == 'activate' })
+      assert_locks_released(env)
+    end
+  end
+
   def test_post_publication_failure_keeps_one_selected_result_without_deployment
     [false, true].product(%w[start update]).each do |retained, command|
-      with_workspace('vpsadmin', retained:) do |env, directory|
+      with_workspace('vpsadmin', retained:, applied: command == 'update') do |env, directory|
         env = enable_react_webui(env, directory)
         File.write(File.join(directory, 'network'), "bridge\n")
         env['TEST_START_NETWORK'] = 'bridge'
@@ -155,7 +276,7 @@ class DevclusterCommandsTest < Minitest::Test
 
   def test_post_build_result_parse_failure_stops_before_deployment
     %w[TEST_INVALID_RESULT TEST_PARTIAL_LABELS].each do |failure|
-      with_workspace('vpsadmin') do |env, directory|
+      with_workspace('vpsadmin', applied: true) do |env, directory|
         env = enable_react_webui(env, directory)
         File.write(File.join(directory, 'network'), "bridge\n")
         result = run_helper('vpsadmin', env.merge(failure => '1'), 'update', 'services')
@@ -167,7 +288,7 @@ class DevclusterCommandsTest < Minitest::Test
   end
 
   def test_disabled_post_publication_failure_has_no_source_labels
-    with_workspace('vpsadmin') do |env, directory|
+    with_workspace('vpsadmin', applied: true) do |env, directory|
       result = run_helper('vpsadmin', env.merge('FAIL_AFTER_LINK' => '1'), 'update', 'services')
       assert_equal(23, result.exitstatus)
       selected = JSON.parse(File.read(File.realpath(File.join(directory, 'result-config'))))
@@ -179,7 +300,7 @@ class DevclusterCommandsTest < Minitest::Test
   end
 
   def test_source_kind_and_dirty_state_come_from_the_selected_source
-    with_workspace('vpsadmin') do |env, directory|
+    with_workspace('vpsadmin', applied: true) do |env, directory|
       env = enable_react_webui(env, directory)
       File.write(File.join(directory, 'network'), "bridge\n")
       source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadmin-webui')
@@ -196,7 +317,7 @@ class DevclusterCommandsTest < Minitest::Test
   end
 
   def test_source_inspection_failure_stops_before_build
-    with_workspace('vpsadmin') do |env, directory|
+    with_workspace('vpsadmin', applied: true) do |env, directory|
       env = enable_react_webui(env, directory)
       File.write(File.join(directory, 'network'), "bridge\n")
       source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadmin-webui')
@@ -209,7 +330,7 @@ class DevclusterCommandsTest < Minitest::Test
 
   def test_react_webui_rejects_invalid_bundles_before_build
     %w[missing malformed permissions symlink foreign].each do |failure|
-      with_workspace('vpsadmin') do |env, directory|
+      with_workspace('vpsadmin', applied: true) do |env, directory|
         env = enable_react_webui(env, directory)
         File.write(File.join(directory, 'network'), "bridge\n")
         bundle = File.join(directory, 'webui-credentials')
@@ -249,7 +370,7 @@ class DevclusterCommandsTest < Minitest::Test
   end
 
   def test_react_webui_random_generation_failure_removes_temporary_bundle
-    with_workspace('vpsadmin') do |env, directory|
+    with_workspace('vpsadmin', applied: true) do |env, directory|
       env = enable_react_webui(env, directory)
       File.write(File.join(directory, 'network'), "bridge\n")
       result = run_helper('vpsadmin', env.merge('FAIL_AT' => 'rand'), 'update', 'services')
@@ -262,7 +383,7 @@ class DevclusterCommandsTest < Minitest::Test
 
   def test_react_webui_rejects_invalid_or_duplicate_domain_before_certificates
     ['bad/host.example.test', 'api.devhost.int.vpsfree.cz'].each do |domain|
-      with_workspace('vpsadmin') do |env, directory|
+      with_workspace('vpsadmin', applied: true) do |env, directory|
         env = enable_react_webui(env, directory)
         config_path = File.join(directory, 'config.json')
         config = JSON.parse(File.read(config_path))
@@ -273,14 +394,14 @@ class DevclusterCommandsTest < Minitest::Test
         refute(result.success?)
         assert_includes(@last_output, 'distinct valid domains.newadmin')
         refute(File.exist?(File.join(directory, 'webui-credentials')))
-        assert_empty(events(env))
+        assert(events(env).all? { |event| event['event'] == 'payload-root' })
       end
     end
   end
 
   def test_failed_copy_or_activation_stops_the_remaining_update
     KINDS.product(%w[copy activate]).each do |kind, failure|
-      with_workspace(kind) do |env, _directory|
+      with_workspace(kind, applied: kind == 'vpsadmin') do |env, _directory|
         result = run_helper(kind, env.merge('FAIL_AT' => failure), 'update')
         assert_equal(23, result.exitstatus, "#{kind} #{failure}")
         calls = events(env).map { |event| event.fetch('event') }.grep(/build|copy|activate|ssh/)
@@ -540,54 +661,64 @@ class DevclusterCommandsTest < Minitest::Test
   end
 
   def test_failed_guest_requisite_query_keeps_target_pending_without_root_or_promotion
-    with_workspace('vpsadmin') do |env, directory|
+    with_workspace('vpsadmin', applied: true) do |env, directory|
+      before = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
       proof_env = selection_proof_environment(env).merge('FAIL_PROOF_QUERY' => '1')
       result = run_helper('vpsadmin', proof_env, 'update', 'node1')
       assert_equal(23, result.exitstatus, @last_output)
       applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
       assert_equal(['node1'], applied.fetch('pending').fetch('targets'))
-      assert_empty(applied.fetch('provenance'))
+      assert_equal(before.fetch('provenance'), applied.fetch('provenance'))
       assert_equal(['--query'], File.readlines(proof_env.fetch('TEST_PROOF_EVENTS'), chomp: true))
       assert_locks_released(env)
     end
   end
 
   def test_guest_closure_and_root_proof_promotes_only_the_updated_target
-    with_workspace('vpsadmin') do |env, directory|
+    with_workspace('vpsadmin', applied: true) do |env, directory|
+      before = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
       proof_env = selection_proof_environment(env)
       result = run_helper('vpsadmin', proof_env, 'update', 'node1')
       assert(result.success?, @last_output)
       applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
       assert_nil(applied.fetch('pending'))
-      assert_equal(['node1'], applied.fetch('provenance').keys)
+      %w[services node2].each { |name| assert_equal(before.dig('provenance', name), applied.dig('provenance', name)) }
+      refute_equal(before.dig('provenance', 'node1'), applied.dig('provenance', 'node1'))
       assert_equal(%w[--query --check-validity --add-root], File.readlines(proof_env.fetch('TEST_PROOF_EVENTS'), chomp: true))
     end
   end
 
   def test_failed_applied_source_root_leaves_pending_before_copy
-    with_workspace('vpsadmin') do |env, directory|
-      result = run_helper('vpsadmin', env.merge('FAIL_GC_ROOT' => '1'), 'update', 'node1')
+    with_workspace('vpsadmin', applied: true) do |env, directory|
+      before = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      result = run_helper('vpsadmin', env.merge('FAIL_CANDIDATE_ROOT' => '1'), 'update', 'node1')
       refute(result.success?, @last_output)
       applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
       assert_equal(['node1'], applied.fetch('pending').fetch('targets'))
-      assert_empty(applied.fetch('provenance'))
+      assert_equal(before.fetch('provenance'), applied.fetch('provenance'))
       refute(events(env).any? { |event| %w[copy activate].include?(event['event']) })
     end
   end
 
   def test_payload_registration_failure_prevents_fresh_runner_and_target_effects
     %w[start update].each do |operation|
-      with_workspace('vpsadmin') do |env, directory|
+      with_workspace('vpsadmin', applied: operation == 'update') do |env, directory|
+        before = JSON.parse(File.read(File.join(directory, 'applied-config.json'))) if operation == 'update'
+        machines = JSON.parse(env.fetch('TEST_BUILT_MACHINES'))
+        target = operation == 'update' ? 'node1' : 'services'
+        machines.fetch(target)['kernel'] += '-candidate'
+        failure_item = machines.fetch(target).fetch('kernel').sub('/nix/store/', env.fetch('TEST_STORE') + '/')
         attempt = events(env).length
-        result = run_helper('vpsadmin', env.merge('FAIL_PAYLOAD_ROOT' => '1'), operation, operation == 'update' ? 'node1' : nil)
+        result = run_helper('vpsadmin', env.merge('TEST_BUILT_MACHINES' => JSON.generate(machines),
+          'FAIL_PAYLOAD_ROOT_ITEM' => failure_item), operation, operation == 'update' ? 'node1' : nil)
         refute(result.success?, @last_output)
         target = operation == 'update' ? 'node1' : 'services'
-        assert_payload_root_refusal(env, attempt, File.join(env.fetch('TEST_STORE'), "fixture-#{target}-kernel"))
+        assert_payload_root_refusal(env, attempt, File.join(env.fetch('TEST_STORE'), "fixture-#{target}-kernel-candidate"))
         refute(events(env).any? { |event| %w[run copy activate selection-proof].include?(event['event']) })
         if operation == 'update'
           applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
           assert_equal(['node1'], applied.fetch('pending').fetch('targets'))
-          assert_empty(applied.fetch('provenance'))
+          assert_equal(before.fetch('provenance'), applied.fetch('provenance'))
         else
           refute(File.exist?(File.join(directory, 'applied-config.json')))
         end
@@ -599,7 +730,7 @@ class DevclusterCommandsTest < Minitest::Test
     with_workspace('vpsadmin') do |env, directory|
       assert(run_helper('vpsadmin', env, 'start').success?, @last_output)
       old_roots = Dir.glob(File.join(directory, 'maintenance-payload-*'))
-      machines = fixture_machines
+      machines = JSON.parse(env.fetch('TEST_BUILT_MACHINES'))
       machines.fetch('services')['toplevel'] += '-unproved'
       machines.fetch('node1')['squashfs'] += '-updated'
       env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
@@ -761,14 +892,14 @@ class DevclusterCommandsTest < Minitest::Test
       assert(run_helper('vpsadmin', env, 'start').success?, @last_output)
       original = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
       pending_before = File.binread(File.join(directory, 'applied-config.json'))
-      machines = fixture_machines
+      machines = JSON.parse(JSON.generate(original.fetch('configuration').fetch('machines')))
       machines.fetch('node1')['networks'] = [{ 'type' => 'bridge', 'name' => 'changed-routing' }]
       env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
       runs = events(env).count { |event| event['event'] == 'run' }
       refute(run_helper('vpsadmin', env, 'start').success?)
       assert_equal(runs, events(env).count { |event| event['event'] == 'run' })
       assert_equal(pending_before, File.binread(File.join(directory, 'applied-config.json')))
-      machines = fixture_machines
+      machines = JSON.parse(JSON.generate(original.fetch('configuration').fetch('machines')))
       machines.fetch('services')['toplevel'] += '-new-unapplied'
       machines.fetch('node1')['squashfs'] += '-new-unapplied'
       env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
@@ -974,7 +1105,26 @@ class DevclusterCommandsTest < Minitest::Test
     env.merge('TEST_CONFIG' => path)
   end
 
-  def with_workspace(kind, retained: false)
+  def prepare_applied(env, directory)
+    machines = JSON.parse(env.fetch('TEST_BUILT_MACHINES'))
+    export = File.join(env.fetch('TEST_STORE'), 'boot-os-source')
+    FileUtils.mkdir_p(export)
+    machines.each_value { |machine| machine['sharedFileSystems'] = { 'vpsadminos' => export } }
+    env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
+    source = File.join(env.fetch('TEST_STORE'), 'applied.json')
+    File.write(source, JSON.generate('machines' => machines, 'labels' => {}))
+    state = File.join(directory, 'state')
+    FileUtils.mkdir_p(state)
+    machines.each_key { |name| File.write(File.join(state, "#{name}-root.img"), 'retained fixture disk') }
+    helper = DevClusters::VpsAdminMaintenance.new(workspace: env.fetch('DEVCLUSTER_WORKSPACE'),
+      slug: env.fetch('TEST_SLUG'), directory:, store_root: env.fetch('TEST_STORE'))
+    machines.each_key do |name|
+      helper.begin_update!(candidate_path: source, target: name)
+      helper.promote_update!(target: name, proof_reference: 'fixture prior activation')
+    end
+  end
+
+  def with_workspace(kind, retained: false, applied: false)
     Dir.mktmpdir('devcluster-commands') do |workspace|
       slug = '2026-09-11-command-test'
       directory = File.join(workspace, '.dev-clusters', kind, 'clusters', slug)
@@ -993,6 +1143,10 @@ class DevclusterCommandsTest < Minitest::Test
       store = File.join(workspace, 'store')
       FileUtils.mkdir_p(store)
       machines = fixture_machines
+      machines.each_value do |machine|
+        %w[qemu virtiofsd].each { |key| machine[key] = machine.fetch(key).sub('/nix/store/', store + '/') }
+        machine['sharedFileSystems'] = { 'vpsadminos' => File.join(workspace, 'worktrees', slug, 'vpsadminos') }
+      end
       write_host_payloads(store, machines)
       built = File.join(store, 'built.json')
       File.write(built, JSON.generate('machines' => machines, 'labels' => {}))
@@ -1020,6 +1174,7 @@ class DevclusterCommandsTest < Minitest::Test
         'PATH' => "#{bin}:#{ENV.fetch('PATH')}",
         "#{kind.upcase}_DEVCLUSTER_DEFAULT_CONFIG" => config
       }
+      prepare_applied(env, directory) if applied
       yield env, directory
     ensure
       FileUtils.rm_rf(socket) if socket
@@ -1152,11 +1307,12 @@ class DevclusterCommandsTest < Minitest::Test
           exit 23 if ENV['FAIL_GC_ROOT'] == '1'
           link = ARGV.fetch(1)
           target = ARGV.last
+          exit 23 if ENV['FAIL_CANDIDATE_ROOT'] == '1' && File.basename(target).start_with?('built-')
           FileUtils.mkdir_p(File.dirname(link))
           FileUtils.rm_f(link)
           File.symlink(target, link)
           if File.basename(link).start_with?('maintenance-payload-')
-            if ENV['FAIL_PAYLOAD_ROOT'] == '1'
+            if ENV['FAIL_PAYLOAD_ROOT'] == '1' || ENV['FAIL_PAYLOAD_ROOT_ITEM'] == target
               File.open(ENV.fetch('TEST_EVENTS'), 'a') do |file|
                 file.puts(JSON.generate('event' => 'payload-root-refused', 'item' => target, 'root' => link))
               end
@@ -1223,9 +1379,12 @@ class DevclusterCommandsTest < Minitest::Test
         puts '1111111111111111111111111111111111111111' if ARGV.include?('rev-parse')
         exit 0
       end
+      context = ENV['VPSADMIN_DEVCLUSTER_APPLIED_CONFIG']
+      build_context = context && !context.empty? ? JSON.parse(File.read(context)) : nil
       environment = ENV.select { |key, _| key.start_with?("#{ENV.fetch('TEST_KIND').upcase}_DEVCLUSTER_") }
-      File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => event, 'environment' => environment, 'argv' => ARGV)) }
+      File.open(ENV.fetch('TEST_EVENTS'), 'a') { |file| file.puts(JSON.generate('event' => event, 'environment' => environment, 'argv' => ARGV, 'build_context' => build_context)) }
       exit 23 if ENV['FAIL_AT'] == event
+      exit 23 if event == 'copy' && ENV['FAIL_COPY_SYSTEM'] == ARGV.last
       def value_after(option)
         index = ARGV.index(option)
         index && ARGV[index + 1]

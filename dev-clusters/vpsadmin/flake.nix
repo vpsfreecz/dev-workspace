@@ -67,6 +67,110 @@
         name = "devcluster-runner-lib";
       };
 
+      # Build selection stays current; these fields describe the booted host.
+      projectUpdateConfig =
+        applied: target: requested:
+        let
+          payloadFields =
+            machine:
+            if (machine.bootMode or "direct") != "direct" then
+              [ ]
+            else if machine.spin == "nixos" then
+              [
+                "toplevel"
+                "kernel"
+                "initrd"
+              ]
+            else if machine.spin == "vpsadminos" then
+              [
+                "toplevel"
+                "kernel"
+                "initrd"
+                "squashfs"
+              ]
+            else
+              [ ];
+          layout =
+            machine:
+            let
+              rest = builtins.removeAttrs machine (payloadFields machine);
+            in
+            rest
+            //
+              lib.optionalAttrs
+                (machine.spin == "nixos" && (machine.bootMode or "direct") == "direct" && machine ? rootDisk)
+                {
+                  rootDisk = builtins.removeAttrs machine.rootDisk [ "image" ];
+                };
+          bootHost =
+            name: machine:
+            let
+              old = applied.machines.${name};
+            in
+            if !(machine ? qemu && machine ? virtiofsd && machine.sharedFileSystems ? vpsadminos) then
+              throw "The requested configuration changes the retained VM topology or layout."
+            else
+              machine
+              // {
+                inherit (old) qemu virtiofsd;
+                sharedFileSystems = machine.sharedFileSystems // {
+                  inherit (old.sharedFileSystems) vpsadminos;
+                };
+              };
+          requestedMachines = lib.mapAttrs bootHost requested.machines;
+          selected = name: target == "all" || target == name;
+          valid =
+            builtins.attrNames requested.machines == builtins.attrNames applied.machines
+            && (target == "all" || target == "boot" || builtins.hasAttr target applied.machines)
+            &&
+              builtins.removeAttrs requested [
+                "machines"
+                "labels"
+              ] == builtins.removeAttrs applied [
+                "machines"
+                "labels"
+              ]
+            && lib.all (name: layout requestedMachines.${name} == layout applied.machines.${name}) (
+              builtins.attrNames applied.machines
+            );
+        in
+        if !valid then
+          throw "The requested configuration changes the retained VM topology or layout."
+        else
+          requested
+          // {
+            machines = lib.mapAttrs (
+              name: machine:
+              if !selected name then
+                applied.machines.${name}
+              else
+                machine
+                //
+                  lib.optionalAttrs
+                    (machine.spin == "nixos" && (machine.bootMode or "direct") == "direct" && machine ? rootDisk)
+                    {
+                      rootDisk =
+                        builtins.removeAttrs machine.rootDisk [ "image" ]
+                        // lib.optionalAttrs (applied.machines.${name}.rootDisk ? image) {
+                          inherit (applied.machines.${name}.rootDisk) image;
+                        };
+                    }
+            ) requestedMachines;
+          };
+      appliedConfigFile = env "VPSADMIN_DEVCLUSTER_APPLIED_CONFIG" "";
+      updateTarget = env "VPSADMIN_DEVCLUSTER_UPDATE_TARGET" "";
+      selectedConfig =
+        if appliedConfigFile == "" then
+          clusterConfig.json
+        else
+          nixpkgs.legacyPackages.${system}.writeText "vpsadmin-devcluster-${slug}-${updateTarget}.json" (
+            builtins.toJSON (
+              projectUpdateConfig (builtins.fromJSON (
+                builtins.readFile appliedConfigFile
+              )) updateTarget clusterConfig.config
+            )
+          );
+
       clusterTest = import ./nix/test.nix {
         inherit
           lib
@@ -124,15 +228,16 @@
       };
     in
     {
+      lib.projectUpdateConfig = projectUpdateConfig;
       lib.webuiPackageProvenance = {
         frontend = vpsadminWebui.packages.${system}.frontend.provenance.buildInfo;
         bff = vpsadminWebui.packages.${system}.bff.provenance.buildInfo;
       };
 
       packages.${system} = {
-        cluster-config = clusterConfig.json;
+        cluster-config = selectedConfig;
         inherit runner;
-        default = clusterConfig.json;
+        default = selectedConfig;
       };
 
       apps.${system} = {

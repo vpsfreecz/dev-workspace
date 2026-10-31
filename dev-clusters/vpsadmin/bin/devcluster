@@ -669,6 +669,10 @@ build_config_with_credentials() {
   local slug="$1"
   local topology="$2"
   local network="$3"
+  local operation="${4:-}" context="${5:-}"
+  if [ -n "$operation" ] && [ -z "$context" ]; then
+    context="$(maintenance_state "$slug" build-context "$operation")" || return
+  fi
 
   if webui_enabled "$slug"; then
     [ "$network" = bridge ] || die "React WebUI requires bridge networking; disable newWebui.enable for local mode"
@@ -676,7 +680,7 @@ build_config_with_credentials() {
   fi
   ensure_shared_credentials "$slug" || return
   ensure_webui_credentials "$slug" || return
-  build_config "$slug" "$topology" "$network"
+  build_config "$slug" "$topology" "$network" "$context" "$operation"
 }
 
 slug_vpsadmin_path() {
@@ -811,6 +815,7 @@ build_config() {
   local slug="$1"
   local topology="$2"
   local network="$3"
+  local context="${4:-}" operation="${5:-}" context_file="" result=0
   local dir
   local vpsadmin_path
   local vpsadminos_path
@@ -849,11 +854,22 @@ build_config() {
     overrides+=("$item")
   done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$vpsadmin_webui_path")
 
-  nix build \
+  if [ -n "$context" ] && [ "$context" != null ]; then
+    context_file="$(umask 077; mktemp "$dir/.build-context.XXXXXXXX")" || return
+    printf '%s\n' "$context" > "$context_file" || return
+    printf 'Builds use the selected OS source. /mnt/vpsadminos and host VM tools keep their recorded boot paths.\n'
+  fi
+  VPSADMIN_DEVCLUSTER_APPLIED_CONFIG="$context_file" \
+    VPSADMIN_DEVCLUSTER_UPDATE_TARGET="$operation" \
+    nix build \
     --impure \
     "${overrides[@]}" \
     --out-link "$(result_link "$slug")" \
-    "path:$CLUSTER_DIR#cluster-config" || return
+    "path:$CLUSTER_DIR#cluster-config" || result=$?
+  if [ -n "$context_file" ]; then
+    rm -f -- "$context_file" || return
+  fi
+  [ "$result" -eq 0 ] || return "$result"
 
   local selected_source
   [ -e "$(result_link "$slug")" ] || die "selected cluster result is missing after build"
@@ -1113,10 +1129,12 @@ start_cluster() {
     die "$service_ip responds; stop the existing dev frontend or use --force"
   fi
 
+  local build_context
+  build_context="$(maintenance_state "$slug" build-context boot)" || return
   maintenance_state "$slug" root-applied-payloads || return
   kill_socket_processes "$slug" || return
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
-    build_config_with_credentials "$slug" "$topology" "$network" || return
+    build_config_with_credentials "$slug" "$topology" "$network" boot "$build_context" || return
   local vpsadmin_path vpsadminos_input_value vpsf_status_path vpsadmin_webui_path
   vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
   vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
@@ -1439,9 +1457,11 @@ update_cluster() {
   local network
   network="$(cluster_network "$slug")"
 
+  local build_context
+  build_context="$(maintenance_state "$slug" build-context "$target")" || return
   maintenance_state "$slug" root-applied-payloads || return
   devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
-    build_config_with_credentials "$slug" "$topology" "$network" || return
+    build_config_with_credentials "$slug" "$topology" "$network" "$target" "$build_context" || return
 
   need_cmd jq
 
