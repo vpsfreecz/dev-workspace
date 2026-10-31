@@ -7,13 +7,13 @@ $stdout.sync = true
 
 # Run outside the build sandbox: Nix evaluates the installed provider flakes
 # through the daemon, using locked test inputs and disposable configuration.
-if ARGV.first == '--projection-only'
-  root = File.expand_path("..", __dir__)
+def check_projection_contract(provider:, nixpkgs:, vpsadmin:)
   expression = <<~'NIX'
     let
-      repo = builtins.getFlake (builtins.getEnv "PROJECTION_SOURCE");
-      provider = import (builtins.getEnv "PROJECTION_SOURCE" + "/dev-clusters/vpsadmin/flake.nix");
-      project = (provider.outputs { self = { }; nixpkgs = repo.inputs.nixpkgs;
+      nixpkgs = builtins.getFlake (builtins.getEnv "PROJECTION_NIXPKGS");
+      vpsadmin = { outPath = builtins.getEnv "PROJECTION_VPSADMIN"; };
+      provider = import (builtins.getEnv "PROJECTION_PROVIDER" + "/flake.nix");
+      project = (provider.outputs { self = { }; inherit nixpkgs;
         vpsadmin = { }; vpsadminos = { }; vpsadminWebui = { }; vpsfStatus = { };
       }).lib.projectUpdateConfig;
       machine = spin: {
@@ -45,11 +45,16 @@ if ARGV.first == '--projection-only'
         rootDisk = builtins.removeAttrs old.machines.services.rootDisk [ "image" ];
       }; }; };
       absentImage = project withoutImage "services" next;
+      withConfig = old // { machines = builtins.mapAttrs (_: m: m // {
+        sharedFileSystems = m.sharedFileSystems // { config = "/recorded/configuration"; };
+      }) old.machines; };
+      configRemoved = !(builtins.tryEval (builtins.deepSeq (project withConfig "services" next) true)).success;
       mutations = [
         (m: m // { memory = 8192; }) (m: m // { cpus = 8; })
         (m: m // { disks = [ { device = "another.img"; } ]; })
         (m: m // { networks = [ { type = "user"; } ]; })
         (m: m // { sharedFileSystems = m.sharedFileSystems // { vpsadmin = "/different"; }; })
+        (m: m // { sharedFileSystems = m.sharedFileSystems // { config = "/new/configuration"; }; })
         (m: m // { sharedFileSystems = builtins.removeAttrs m.sharedFileSystems [ "vpsadminos" ]; })
         (m: m // { bootMode = "firmware"; }) (m: m // { kernelParams = [ "changed" ]; })
         (m: m // { rootDisk = m.rootDisk // { device = "other.img"; }; })
@@ -57,6 +62,24 @@ if ARGV.first == '--projection-only'
       refused = change: !(builtins.tryEval (builtins.deepSeq (project old "services" (next // {
         machines = next.machines // { services = change next.machines.services; };
       })) true)).success;
+      testModule = import (builtins.getEnv "PROJECTION_PROVIDER" + "/nix/test.nix");
+      fixture = configSourcePath: (testModule (
+        builtins.mapAttrs (_: _: "") (builtins.functionArgs testModule) // {
+          lib = nixpkgs.lib; inherit vpsadmin;
+          topology = "single"; networkMode = "local"; workspace = "/fixture"; slug = "config-export";
+          inherit configSourcePath;
+        }
+      )) { pkgs = throw "unrelated package forced by config export fixture"; };
+      noConfig = fixture "";
+      config = fixture "/selected/configuration";
+      guestMounts = test: {
+        services = ((builtins.elemAt test.machines.services.config.imports 1) {
+          config = { }; pkgs = { }; lib = nixpkgs.lib;
+        }).fileSystems;
+        node1 = ((builtins.elemAt test.machines.node1.config.imports 2) {
+          pkgs = { }; lib = nixpkgs.lib;
+        }).fileSystems;
+      };
     in
     assert services.machines.node1 == old.machines.node1;
     assert services.machines.services.toplevel == "/new/system";
@@ -71,15 +94,43 @@ if ARGV.first == '--projection-only'
     assert all.machines.services.toplevel == "/new/system" && all.machines.node1.toplevel == "/new/system";
     assert boot.machines == old.machines;
     assert !(absentImage.machines.services.rootDisk ? image);
+    assert !(services.machines.services.sharedFileSystems ? config);
+    assert configRemoved;
+    assert builtins.all (m: !(m.sharedFileSystems ? config)) (builtins.attrValues noConfig.machines);
+    assert builtins.all (m: m.sharedFileSystems.config == "/selected/configuration") (builtins.attrValues config.machines);
+    assert builtins.all (mounts: !(builtins.hasAttr "/mnt/configuration" mounts)) (builtins.attrValues (guestMounts noConfig));
+    assert builtins.all (mounts: mounts."/mnt/configuration".device == "config") (builtins.attrValues (guestMounts config));
     assert builtins.all refused mutations;
     assert !(builtins.tryEval (builtins.deepSeq (project old "services" (next // {
       machines = builtins.removeAttrs next.machines [ "node1" ];
     })) true)).success;
-    { lazyServices = true; retainedBoot = true; absentImagePreserved = true; selectedTargets = true; refusedLayoutChanges = builtins.length mutations + 1; }
+    { lazyServices = true; retainedBoot = true; absentImagePreserved = true; selectedTargets = true;
+      configExportAndGuestMount = true; refusedLayoutChanges = builtins.length mutations + 2; }
   NIX
-  stdout, stderr, result = Open3.capture3({ 'PROJECTION_SOURCE' => root }, 'nix', 'eval', '--impure', '--json', '--expr', expression)
+  stdout, stderr, result = Open3.capture3({ 'PROJECTION_PROVIDER' => provider,
+    'PROJECTION_NIXPKGS' => nixpkgs, 'PROJECTION_VPSADMIN' => vpsadmin },
+    'nix', 'eval', '--impure', '--json', '--expr', expression)
   abort stderr unless result.success?
   puts stdout
+end
+
+if ARGV.first == '--projection-only'
+  root = File.expand_path("..", __dir__)
+  stdout, stderr, result = Open3.capture3({ 'PROJECTION_SOURCE' => root },
+    'nix', 'eval', '--impure', '--json', '--expr', <<~'NIX')
+      let repo = builtins.getFlake (builtins.getEnv "PROJECTION_SOURCE"); in {
+        nixpkgs = repo.inputs.nixpkgs.outPath;
+        vpsadmin = repo.inputs.devcluster-vpsadmin.outPath;
+      }
+    NIX
+  abort stderr unless result.success?
+  inputs = JSON.parse(stdout)
+  Dir.mktmpdir('devcluster-projection') do |directory|
+    provider = File.join(directory, 'provider')
+    FileUtils.cp_r(File.join(root, 'dev-clusters/vpsadmin'), provider)
+    FileUtils.cp(File.join(root, 'test/fixtures/vpsadmin-config.json'), File.join(provider, 'default-config.json'))
+    check_projection_contract(provider:, nixpkgs: inputs.fetch('nixpkgs'), vpsadmin: inputs.fetch('vpsadmin'))
+  end
   exit 0
 end
 
@@ -133,6 +184,10 @@ Dir.mktmpdir('devcluster-nix-smoke') do |workspace|
     common = ['--impure', '--no-write-lock-file', *overrides]
 
     if kind == 'vpsadmin'
+      nixpkgs = JSON.parse(run!({ 'PROJECTION_OS_SOURCE' => vpsadminos },
+        'nix', 'eval', '--impure', '--json', '--expr',
+        '(builtins.getFlake (builtins.getEnv "PROJECTION_OS_SOURCE")).inputs.nixpkgs.outPath'))
+      check_projection_contract(provider: source, nixpkgs:, vpsadmin:)
       provenance = JSON.parse(run!(environment, 'nix', 'eval', *common, '--json',
                                    "path:#{source}#lib.webuiPackageProvenance"))
       abort 'WebUI frontend/BFF package provenance differs' unless provenance.fetch('frontend') == provenance.fetch('bff')

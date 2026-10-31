@@ -914,6 +914,107 @@ class DevclusterCommandsTest < Minitest::Test
     end
   end
 
+  def test_fresh_config_checkout_is_exported
+    with_workspace('vpsadmin') do |env, directory|
+      source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsfree-cz-configuration')
+      FileUtils.mkdir_p(source)
+      assert(run_helper('vpsadmin', env, 'start').success?, @last_output)
+      build = events(env).find { |event| event['event'] == 'build' }
+      assert_equal(source, build.fetch('environment').fetch('VPSADMIN_DEVCLUSTER_CONFIG_SOURCE'))
+      applied = JSON.parse(File.read(File.join(directory, 'applied-config.json')))
+      applied.fetch('configuration').fetch('machines').each_value do |machine|
+        assert_equal(source, machine.fetch('sharedFileSystems').fetch('config'))
+      end
+      assert_locks_released(env)
+    end
+  end
+
+  def test_retained_absent_config_export_ignores_a_later_checkout
+    [['start', nil], ['update', 'services'], ['update', 'node1'], ['update', 'all'], ['update', 'services', true]].each do |command, target, pending|
+      with_workspace('vpsadmin') do |env, directory|
+        if target == 'all'
+          machines = JSON.parse(env.fetch('TEST_BUILT_MACHINES'))
+          %w[dns-primary dns-secondary].each do |name|
+            machines[name] = JSON.parse(JSON.generate(machines.fetch('services')))
+          end
+          env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
+        end
+        prepare_applied(env, directory)
+        source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsfree-cz-configuration')
+        FileUtils.mkdir_p(source)
+        applied_path = File.join(directory, 'applied-config.json')
+        before = JSON.parse(File.read(applied_path))
+        if pending
+          helper = DevClusters::VpsAdminMaintenance.new(workspace: env.fetch('DEVCLUSTER_WORKSPACE'),
+            slug: env.fetch('TEST_SLUG'), directory:, store_root: env.fetch('TEST_STORE'))
+          helper.begin_update!(candidate_path: File.join(env.fetch('TEST_STORE'), 'applied.json'), target:)
+        end
+        assert(run_helper('vpsadmin', env, command, target).success?, @last_output)
+        build = events(env).find { |event| event['event'] == 'build' }
+        assert_equal('', build.fetch('environment').fetch('VPSADMIN_DEVCLUSTER_CONFIG_SOURCE'))
+        assert_equal(before.fetch('configuration'), build.fetch('build_context'))
+        after = JSON.parse(File.read(applied_path))
+        after.fetch('configuration').fetch('machines').each_value do |machine|
+          refute(machine.fetch('sharedFileSystems').key?('config'))
+        end
+        assert_equal(before.fetch('configuration'), after.fetch('configuration'))
+        assert_nil(after.fetch('pending'))
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_retained_config_export_keeps_the_matching_checkout
+    %w[start update].each do |command|
+      with_workspace('vpsadmin') do |env, directory|
+        source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsfree-cz-configuration')
+        FileUtils.mkdir_p(source)
+        prepare_applied(env, directory, config_exports: fixture_machines.keys.to_h { |name| [name, source] })
+        before = JSON.parse(File.read(File.join(directory, 'applied-config.json'))).fetch('configuration')
+        assert(run_helper('vpsadmin', env, command, command == 'update' ? 'services' : nil).success?, @last_output)
+        build = events(env).find { |event| event['event'] == 'build' }
+        assert_equal(source, build.fetch('environment').fetch('VPSADMIN_DEVCLUSTER_CONFIG_SOURCE'))
+        assert_equal(before, JSON.parse(File.read(File.join(directory, 'applied-config.json'))).fetch('configuration'))
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_retained_config_export_refuses_removal_retargeting_and_mixed_layout
+    %w[start update].product(%w[missing retargeted mixed]).each do |command, change|
+      with_workspace('vpsadmin') do |env, directory|
+        source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsfree-cz-configuration')
+        FileUtils.mkdir_p(source) unless change == 'missing'
+        recorded = change == 'retargeted' ? source + '-original' : source
+        exports = fixture_machines.keys.to_h { |name| [name, recorded] }
+        exports.delete('node1') if change == 'mixed'
+        prepare_applied(env, directory, config_exports: exports)
+        applied_path = File.join(directory, 'applied-config.json')
+        before = File.binread(applied_path)
+        refute(run_helper('vpsadmin', env, command, command == 'update' ? 'services' : nil).success?, @last_output)
+        build = events(env).find { |event| event['event'] == 'build' }
+        assert_equal(change == 'missing' ? '' : source, build.fetch('environment').fetch('VPSADMIN_DEVCLUSTER_CONFIG_SOURCE'))
+        assert_equal(JSON.parse(before).fetch('configuration'), build.fetch('build_context'))
+        assert_equal(before, File.binread(applied_path))
+        refute(events(env).any? { |event| %w[run copy activate ssh].include?(event['event']) })
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_malformed_build_context_cannot_disable_config_export_detection
+    with_workspace('vpsadmin', applied: true) do |env, directory|
+      source = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsfree-cz-configuration')
+      FileUtils.mkdir_p(source)
+      before = File.binread(File.join(directory, 'applied-config.json'))
+      refute(run_helper('vpsadmin', env.merge('TEST_MALFORMED_BUILD_CONTEXT' => '1'), 'update', 'services').success?, @last_output)
+      assert_match(/parse error/, @last_output)
+      assert_equal(before, File.binread(File.join(directory, 'applied-config.json')))
+      refute(events(env).any? { |event| %w[build run copy activate ssh].include?(event['event']) })
+      assert_locks_released(env)
+    end
+  end
+
   def test_recovery_accepts_only_fixed_evidence_argument_and_refuses_a_live_runner
     with_workspace('vpsadmin') do |env, directory|
       with_profile_runner(env, directory) do
@@ -1107,11 +1208,14 @@ class DevclusterCommandsTest < Minitest::Test
     env.merge('TEST_CONFIG' => path)
   end
 
-  def prepare_applied(env, directory)
+  def prepare_applied(env, directory, config_exports: {})
     machines = JSON.parse(env.fetch('TEST_BUILT_MACHINES'))
     export = File.join(env.fetch('TEST_STORE'), 'boot-os-source')
     FileUtils.mkdir_p(export)
-    machines.each_value { |machine| machine['sharedFileSystems'] = { 'vpsadminos' => export } }
+    machines.each do |name, machine|
+      machine['sharedFileSystems'] = { 'vpsadminos' => export }
+      machine['sharedFileSystems']['config'] = config_exports.fetch(name) if config_exports.key?(name)
+    end
     env['TEST_BUILT_MACHINES'] = JSON.generate(machines)
     source = File.join(env.fetch('TEST_STORE'), 'applied.json')
     File.write(source, JSON.generate('machines' => machines, 'labels' => {}))
@@ -1277,6 +1381,10 @@ class DevclusterCommandsTest < Minitest::Test
       if command == 'ruby'
         helper = ARGV.first
         if helper && helper.end_with?('/vpsadmin/lib/maintenance.rb')
+          if ENV['TEST_MALFORMED_BUILD_CONTEXT'] == '1' && ARGV[4] == 'build-context'
+            puts '{invalid'
+            exit 0
+          end
           require helper
           DevClusters::VpsAdminMaintenance.prepend(Module.new do
             def initialize(**identity)
@@ -1399,6 +1507,16 @@ class DevclusterCommandsTest < Minitest::Test
           workspace = ENV.fetch('DEVCLUSTER_WORKSPACE')
           config = JSON.parse(File.read(ENV.fetch('TEST_CONFIG')))
           machines = JSON.parse(ENV.fetch('TEST_BUILT_MACHINES'))
+          if ENV.fetch('TEST_KIND') == 'vpsadmin'
+            source = environment.fetch('VPSADMIN_DEVCLUSTER_CONFIG_SOURCE')
+            machines.each_value do |machine|
+              if source.empty?
+                machine.fetch('sharedFileSystems').delete('config')
+              else
+                machine.fetch('sharedFileSystems')['config'] = source
+              end
+            end
+          end
           store = ENV.fetch('TEST_STORE')
           machines.each_value do |machine|
             %w[toplevel qemu virtiofsd].each do |field|

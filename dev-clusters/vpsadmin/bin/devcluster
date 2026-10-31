@@ -836,6 +836,12 @@ build_config() {
   vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
   haveapi_path="$(slug_optional_path "$slug" haveapi || true)"
   config_source_path="$(slug_optional_path "$slug" vpsfree-cz-configuration || true)"
+  if [ -n "$context" ] && [ "$context" != null ]; then
+    config_source_path="$(jq -r --arg path "$config_source_path" '
+      if (.machines | length > 0) and all(.machines[]; (.sharedFileSystems // {}) | has("config") | not)
+      then "" else $path end
+    ' <<< "$context")" || return
+  fi
   mail_templates_path="$(slug_optional_path "$slug" vpsfree-mail-templates || true)"
   web_path="$(slug_optional_path "$slug" web || true)"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"

@@ -768,6 +768,15 @@ build does not retarget the export. If the export points to a worktree, its cont
 still follow that worktree. Every other requested topology or layout change must
 match the retained configuration.
 
+A new cluster shares `worktrees/<slug>/vpsfree-cz-configuration` at
+`/mnt/configuration` when that checkout exists. When the applied configuration
+records no configuration export in any guest, retained starts and updates leave
+it absent, even if the checkout has since been created. If the export is recorded,
+its path must match the selected checkout; missing or changed paths and
+inconsistent guest exports still fail the layout checks. Adding the export to an
+existing cluster requires a separate layout transition, which these commands do
+not provide.
+
 A `services` update builds only the services payloads, copies and switches the
 services system, then completes the existing API restart and node refresh. A named
 node or storage update switches only that guest. `all` updates the configured
