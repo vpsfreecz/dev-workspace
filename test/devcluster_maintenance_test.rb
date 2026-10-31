@@ -412,6 +412,53 @@ class DevclusterMaintenanceTest < Minitest::Test
     end
   end
 
+  def test_build_context_requires_target_proof_but_preserves_unproved_peers
+    with_applied_fixture(os_source: true) do |maintenance, paths|
+      applied = read_applied(paths)
+      applied.fetch('provenance').delete('node1')
+      write_json(paths.fetch(:applied), applied)
+      before = File.binread(paths.fetch(:applied))
+      assert_equal(applied.fetch('configuration'), maintenance.build_context(target: 'services'))
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'node1') }
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'all') }
+      assert_equal(before, File.binread(paths.fetch(:applied)))
+    end
+  end
+
+  def test_build_context_retry_uses_old_applied_metadata_and_rejects_conflicting_pending
+    with_applied_fixture(os_source: true) do |maintenance, paths|
+      old = read_applied(paths).fetch('configuration')
+      maintenance.begin_update!(candidate_path: paths.fetch(:candidate), target: 'services')
+      assert_equal(old, maintenance.build_context(target: 'services'))
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'node1') }
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'all') }
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'boot') }
+      applied = read_applied(paths)
+      applied.fetch('provenance').delete('services')
+      write_json(paths.fetch(:applied), applied)
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'services') }
+    end
+  end
+
+  def test_build_context_accepts_recorded_mutable_export_and_refuses_missing_context
+    with_applied_fixture(os_source: true) do |maintenance, paths|
+      applied = read_applied(paths)
+      mutable = File.join(File.dirname(paths.fetch(:record)), 'own-os-worktree')
+      FileUtils.mkdir_p(mutable)
+      applied.fetch('configuration').fetch('machines').each_value do |machine|
+        machine.fetch('sharedFileSystems')['vpsadminos'] = mutable
+      end
+      write_applied_configuration(paths, applied)
+      assert_equal(mutable, maintenance.build_context(target: 'all').dig('machines', 'services', 'sharedFileSystems', 'vpsadminos'))
+      assert_equal(applied.fetch('configuration'), maintenance.build_context(target: 'boot'))
+      FileUtils.rmdir(mutable)
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'services') }
+      File.unlink(paths.fetch(:applied))
+      assert_nil(maintenance.build_context(target: 'boot'))
+      assert_raises(Maintenance::Invalid) { maintenance.build_context(target: 'services') }
+    end
+  end
+
   def test_legacy_target_update_does_not_prove_untouched_images
     with_fixture do |maintenance, paths|
       assert_raises(Maintenance::Invalid) { maintenance.begin_boot!(config_path: paths.fetch(:resident), operation: 'boot') }
@@ -622,12 +669,21 @@ class DevclusterMaintenanceTest < Minitest::Test
     maintenance.begin_copy!(candidate_path: paths.fetch(:candidate), **identity.merge(overrides))
   end
 
+  def write_applied_configuration(paths, applied)
+    source = paths.fetch(:resident) + '-os-proof.json'
+    write_json(source, applied.fetch('configuration'))
+    applied.fetch('provenance').each_value do |proof|
+      proof.merge!('source_config' => source, 'source_config_sha256' => Digest::SHA256.file(source).hexdigest)
+    end
+    write_json(paths.fetch(:applied), applied)
+  end
+
   def read_applied(paths)
     JSON.parse(File.read(paths.fetch(:applied)))
   end
 
-  def with_applied_fixture
-    with_fixture do |maintenance, paths|
+  def with_applied_fixture(os_source: false)
+    with_fixture(os_source:) do |maintenance, paths|
       prepare(maintenance, paths)
       bind_boot(maintenance)
       begin_copy(maintenance, paths)
@@ -705,7 +761,7 @@ class DevclusterMaintenanceTest < Minitest::Test
     write_json(paths.fetch(:evidence), evidence)
   end
 
-  def with_fixture
+  def with_fixture(os_source: false)
     Dir.mktmpdir('maintenance-test') do |workspace|
       slug = '2026-10-02-maintenance-fixture'
       directory = File.join(workspace, '.dev-clusters', 'vpsadmin', 'clusters', slug)
@@ -729,6 +785,16 @@ class DevclusterMaintenanceTest < Minitest::Test
       File.binwrite(File.join(services.fetch('qemu'), 'bin/qemu-system-x86_64'), 'fixture')
       File.chmod(0o755, File.join(services.fetch('qemu'), 'bin/qemu-system-x86_64'))
       File.symlink('qemu-system-x86_64', File.join(services.fetch('qemu'), 'bin/qemu-kvm'))
+      if os_source
+        paths[:os_source] = File.join(store, 'retained-os-source')
+        FileUtils.mkdir_p(paths.fetch(:os_source))
+        %w[flake.nix flake.lock].each { |name| File.write(File.join(paths.fetch(:os_source), name), '{}') }
+        [services, node].each do |machine|
+          machine['qemu'] = services.fetch('qemu')
+          machine['virtiofsd'] = services.fetch('qemu')
+          machine['sharedFileSystems'] = { 'vpsadminos' => paths.fetch(:os_source) }
+        end
+      end
       write_json(paths.fetch(:resident), { 'machines' => { 'services' => services, 'node1' => node } })
       File.binwrite(paths.fetch(:services_disk), 'retained services payload')
       File.binwrite(paths.fetch(:node_disk), 'retained node payload')

@@ -568,6 +568,36 @@ module DevClusters
       write_private_json(output_path, applied.fetch('configuration'), max_bytes: MAX_CONFIG_BYTES)
     end
 
+    # This is boot metadata, not a source selector or proof of new residency.
+    def build_context(target:)
+      applied = applied_record
+      return nil if target == 'boot' && applied.nil?
+      raise Invalid, 'Applied VM context is unknown; use residency recovery only with supporting historical evidence.' unless applied
+      machines = applied.fetch('configuration').fetch('machines')
+      unless target == 'boot' || target == 'all' || machines.key?(target)
+        raise Invalid, 'The requested update target is absent from the applied topology.'
+      end
+      targets = target == 'all' || target == 'boot' ? machines.keys : [target]
+      unless (targets - applied.fetch('provenance').keys).empty?
+        raise Invalid, 'Applied VM context is unproved for the requested target.'
+      end
+      pending = applied.fetch('pending')
+      if pending && (pending.fetch('operation') != 'update' || pending.fetch('targets') != [target])
+        raise Invalid, 'Another applied operation remains uncertain.'
+      end
+      if target == 'boot' && !complete_applied?(applied)
+        raise Invalid, 'The retained selection is incomplete or pending.'
+      end
+      machines.each_value do |machine|
+        %w[qemu virtiofsd].each { |key| store_path!(machine.fetch(key)) }
+        source = string!(machine.fetch('sharedFileSystems').fetch('vpsadminos'))
+        unless source.start_with?('/') && File.directory?(source)
+          raise Invalid, 'The recorded OS source export is unavailable.'
+        end
+      end
+      applied.fetch('configuration')
+    end
+
     def retained_selection?
       !applied_record.nil?
     end
@@ -1198,6 +1228,14 @@ if $PROGRAM_NAME == __FILE__
     when 'applied-config'
       raise DevClusters::VpsAdminMaintenance::Invalid, 'invalid applied render arguments' unless arguments.length.between?(1, 2)
       maintenance.retained_config!(output_path: arguments.fetch(0), candidate_path: arguments[1])
+    when 'build-context'
+      raise DevClusters::VpsAdminMaintenance::Invalid, 'invalid build context arguments' unless arguments.one?
+      begin
+        puts JSON.generate(maintenance.build_context(target: arguments.fetch(0)))
+      rescue DevClusters::VpsAdminMaintenance::Invalid => e
+        $stderr.puts "error: #{e.message}"
+        exit 1
+      end
     when 'applied-present'
       puts maintenance.retained_selection? ? 'true' : 'false'
     when 'recover-prepare'
