@@ -82,6 +82,7 @@
           teamConfig ? null,
           coordinationConfig ? null,
           integrationConfig ? null,
+          machineIdentityConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         let
@@ -155,6 +156,7 @@
             };
           }
           // lib.optionalAttrs (teamConfig != null) { inherit teamConfig; }
+          // lib.optionalAttrs (machineIdentityConfig != null) { inherit machineIdentityConfig; }
         )).overrideAttrs
           (previous: {
             postInstall = (previous.postInstall or "") + ''

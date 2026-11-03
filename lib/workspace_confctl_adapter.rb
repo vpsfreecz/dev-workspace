@@ -5,11 +5,12 @@ require 'digest'
 require 'open3'
 require 'fileutils'
 require 'securerandom'
+require 'uri'
 command_library = File.join(__dir__, 'workspace-coordination-command.rb')
 require(File.file?(command_library) ? command_library : ENV.fetch('WORKSPACE_COORDINATION_COMMAND'))
 
-# Build and copy in preparation. All subsequent operations execute in the
-# configuration's retained immutable confctl gem environment, without Nix eval.
+# Machine resolution evaluates only committed metadata. Deployment preparation
+# builds and copies; later deployment operations use its retained environment.
 module WorkspaceConfctlAdapter
   LIMIT = 262_144
   class StrictHash < Hash
@@ -42,10 +43,56 @@ module WorkspaceConfctlAdapter
     out
   end
 
+  def self.identity_text?(value)
+    value.is_a?(String) && value.encoding == Encoding::UTF_8 && value.valid_encoding? &&
+      value.bytesize.between?(1, 256) && !value.match?(/[[:cntrl:]]|\A[[:space:]]|[[:space:]]\z/)
+  end
+
+  def self.resolve_machine(request)
+    unless request.keys.sort == %w[operation schema selector source] && request['schema'].is_a?(Integer) &&
+           identity_text?(request['selector'])
+      raise 'invalid machine resolution request'
+    end
+    source = request['source']
+    unless source.is_a?(Hash) && source.keys.sort == %w[path revision] &&
+           source['path'].is_a?(String) && source['path'].start_with?('/') &&
+           source['revision'].is_a?(String) && source['revision'].match?(/\A[0-9a-f]{40}\z/)
+      raise 'invalid machine resolution source'
+    end
+    revision = source.fetch('revision')
+    path = File.realpath(source.fetch('path'))
+    unless capture('git', '-C', path, 'rev-parse', '--verify', "#{revision}^{commit}").strip == revision
+      raise 'machine resolution source is not the requested commit'
+    end
+    flake = "git+file://#{URI::DEFAULT_PARSER.escape(path, /[^a-zA-Z0-9\/_.~-]/)}?rev=#{revision}"
+    expression = <<~NIX
+      let
+        f = builtins.getFlake #{JSON.generate(flake).gsub('${') { '\${' }};
+        machine = builtins.getAttr #{JSON.generate(request['selector']).gsub('${') { '\${' }} f.confctl.machines;
+        labels = machine.metaConfig.labels or {};
+        shared = if !builtins.isAttrs labels then throw "invalid machine labels"
+          else if builtins.hasAttr "dev-workspace.lock-id" labels then
+            if builtins.isString labels."dev-workspace.lock-id" then labels."dev-workspace.lock-id"
+            else throw "invalid dev-workspace.lock-id label"
+          else null;
+      in { schema = 1; name = machine.name; sharedLockId = shared; }
+    NIX
+    result = parse(capture('nix', 'eval', '--offline', '--no-write-lock-file', '--no-update-lock-file',
+      '--option', 'allow-import-from-derivation', 'false', '--json', '--expr', expression))
+    unless result.is_a?(Hash) && result.keys.sort == %w[name schema sharedLockId] &&
+           result['schema'].is_a?(Integer) && result['schema'] == 1 &&
+           identity_text?(result['name']) && result['name'] == request['selector'] &&
+           (result['sharedLockId'].nil? || identity_text?(result['sharedLockId']))
+      raise 'invalid machine resolution result'
+    end
+    result
+  end
+
   def self.run(bytes, pinned: false)
     request = parse(bytes)
     @diagnostics = WorkspaceCoordination::Command::Log.new
     raise 'unsupported adapter protocol' unless request['schema'] == 1
+    return resolve_machine(request) if request['operation'] == 'resolve-machine'
     fields = %w[schema operation target machine]
     case request['operation']
     when 'prepare' then fields += %w[requestId source stateRoot]
@@ -168,7 +215,7 @@ module WorkspaceConfctlAdapter
       end
     end
   ensure
-    if @diagnostics && request && !pinned
+    if @diagnostics && request && !pinned && request['operation'] != 'resolve-machine'
       directory = request['operation'] == 'prepare' ? File.join(request.fetch('stateRoot'), 'preparation', request.fetch('requestId')) : request['attemptDirectory']
       if directory
         FileUtils.mkdir_p(directory, mode: 0o700)
