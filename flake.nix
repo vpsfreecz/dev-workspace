@@ -456,6 +456,7 @@
               ruby test/devcluster_maintenance_test.rb
               ruby test/devcluster_store_roots_test.rb
               ruby test/devcluster_storage_profile_test.rb
+              ruby test/devcluster_image_repository_test.rb
               ruby test/kb_devcluster_test.rb
               ruby test/kb_guards_test.rb
               ruby test/kb_connection_test.rb
