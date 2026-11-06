@@ -44,6 +44,32 @@ let
     devConfig.topologies.${topology}
       or (throw "Unsupported vpsAdminOS devcluster topology '${topology}'");
 
+  imageRepository = devConfig.imageRepository or { };
+  repositoryEnabled = imageRepository.enable or false;
+  repositoryNode = imageRepository.node or "node1";
+  repositorySettings = {
+    port = imageRepository.port or 8080;
+    seed = imageRepository.seed or true;
+    limits = {
+      maxBytes = 67108864;
+      reserveBytes = 16777216;
+      maxUploadBytes = 8388608;
+      maxRuns = 8;
+      leaseSeconds = 86400;
+    }
+    // (imageRepository.limits or { });
+  };
+  repositoryValid =
+    !repositoryEnabled
+    || (
+      if !(builtins.elem repositoryNode topologyNodeNames) then
+        throw "imageRepository.node must exist in the selected topology"
+      else if repositorySettings.port != 8080 then
+        throw "imageRepository.port must be guest loopback port 8080"
+      else
+        true
+    );
+
   networkConfig = devConfig.network;
   localPrefixLength = networkConfig.localPrefixLength or 24;
   bridgePrefixLength = networkConfig.prefixLength or 24;
@@ -63,13 +89,15 @@ let
     }
   ) devConfig.nodes;
 
-  selectedNodes = map (
-    machineName:
-    if builtins.hasAttr machineName availableNodes then
-      availableNodes.${machineName}
-    else
-      throw "Topology '${topology}' references unknown node '${machineName}'"
-  ) topologyNodeNames;
+  selectedNodes =
+    assert repositoryValid;
+    map (
+      machineName:
+      if builtins.hasAttr machineName availableNodes then
+        availableNodes.${machineName}
+      else
+        throw "Topology '${topology}' references unknown node '${machineName}'"
+    ) topologyNodeNames;
 
   peerHosts = listToAttrs (
     map (
@@ -187,7 +215,13 @@ let
       imports = [
         (vpsadminos.outPath + "/tests/configs/vpsadminos/pool-tank.nix")
         (nodeModule node)
-      ];
+      ]
+      ++ lib.optional (repositoryEnabled && node.machineName == repositoryNode) (
+        import ./image-repository.nix {
+          inherit vpsadminos;
+          settings = repositorySettings;
+        }
+      );
 
       boot.qemu = {
         memory = node.memoryMiB;

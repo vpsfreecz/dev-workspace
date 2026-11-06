@@ -9,6 +9,8 @@ The [vpsAdmin development cluster guide](dev-clusters/vpsadmin/README.md)
 documents its configuration, runtime credentials, and recovery steps.
 The [managed KB cluster guide](dev-clusters/kb/README.md) explains the optional
 provider and its connection to the standalone KB runtime.
+The [vpsAdminOS cluster guide](dev-clusters/vpsadminos/README.md) includes the
+optional synthetic image repository demo.
 The [workspace confctl adapter](docs/workspace-confctl.md) prepares and activates
 exact generations under the generic runtime's machine reservations.
 

@@ -122,6 +122,75 @@ port, local resolvers, or upstream resolvers.
 If `worktrees/<slug>/vpsadminos` exists, the cluster is built from that worktree.
 Otherwise it is built from `repos/vpsadminos.git` `origin/staging`.
 
+### Optional image repository demo
+
+The optional addon uses `osctl-repo-server` from the selected vpsAdminOS package.
+That source must export `packages.<system>.osctl-repo-server`. Omit
+`imageRepository`, or set `enable` to `false`, to keep the normal cluster unchanged.
+
+```json
+{
+  "imageRepository": {
+    "enable": true,
+    "node": "node1",
+    "port": 8080,
+    "seed": true,
+    "limits": {
+      "maxBytes": 67108864,
+      "reserveBytes": 16777216,
+      "maxUploadBytes": 8388608,
+      "maxRuns": 8,
+      "leaseSeconds": 86400
+    }
+  }
+}
+```
+
+The node must belong to the selected topology. The native runit service
+`osctl-repo-server-demo` listens on `127.0.0.1:8080` in that guest. It does not
+change container repositories or open a network port. The consuming site owns
+any TLS proxy and explicit SSH forwarding. The requester header is
+`X-Repo-Client-IP`, trusted only from `127.0.0.1/32`; a proxy must overwrite it.
+Local callers can supply this header, so it is diagnostic data, not identity.
+
+The dedicated `tank/osctl-repo-server-demo` dataset mounts at
+`/var/lib/osctl-repo-server-demo`. State and logs are private to `osctl-repo-demo`;
+role sockets are under `/run/osctl-repo-server-demo`, with separate
+`repo-demo-producer`, `repo-demo-publisher` and `repo-demo-admin` groups.
+The dataset property `com.vpsfree:repo-demo=1` and `DEMO` marker identify it.
+An existing unmarked dataset or conflicting mountpoint fails explicitly.
+Restarts and ordinary updates retain data. Nothing is seeded or erased on boot.
+
+Run the installed command explicitly as guest root:
+
+```sh
+vpsadminos-devcluster ssh <slug> node1 -- osctl-repo-demo-seed
+```
+
+Setting `seed` to `false` omits this command. The seed command imports two tiny
+deterministic tar archives labelled as synthetic data and creates sealed, pending and failed
+demo runs through the existing control protocol. No OS build or test takes place;
+the fixture's verified state only exercises the protocol. The command emits run
+keys and expected SHA256 hashes and saves them in `seed.json` beside the marker.
+Identical retries reuse stable request IDs and preserve existing payloads. Changed
+fixture files fail rather than being replaced. The command has a three-minute
+deadline and generates eight local HTTP requests once, including HEAD, Range and
+error responses. An interrupted traffic batch can repeat that bounded batch.
+It makes no external downloads or direct database writes.
+
+Limits are fixture capacity, not production sizing: at most 64 MiB payload,
+8 MiB per upload, three to eight runs, and leases from one hour to one day.
+Statistics retain seven days with at most 256 rows. Access logs retain two 1 MiB
+files in total; service logs keep a current 1 MiB file and two rotated files.
+Requester IP/UA remain in private
+JSONL logs; public views contain aggregate counters only. Native guest cron runs
+nonoverlapping, bounded `expire` then `reclaim` hourly through the admin socket.
+Active leases and public references survive maintenance. Expired run fixtures
+are not recreated by replaying old request IDs; inspect `seed.json` before use.
+Refreshing expired data requires an explicitly authorized reset of this demo
+dataset while the service is stopped. The addon supplies no reset command and
+never resets the cluster or an unknown root.
+
 `start` and `update` keep the built cluster config rooted at
 `.dev-clusters/vpsadminos/clusters/<slug>/result-config` while the cluster is in
 use. `stop` removes that root after the runner exits, and `reset` removes it
