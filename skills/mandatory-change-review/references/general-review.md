@@ -79,22 +79,55 @@ Use these vpsAdmin-specific commit red flags:
   after the transfer. Metadata-only assertions are insufficient.
 - Check that behavior changes update the appropriate documentation, man pages,
   API docs, migration notes, and operational documentation.
-- Check that consequential rationale and constraints have a durable home in the
-  owning project and are discoverable from its documentation entry point.
-  Assess the explanation needed by the change; a short rationale can be enough.
-  Do not require a fixed document bundle or historical backfill.
-- Apply the generic dev-session-documentation skill's placement rules. Feature
-  explanations must remain useful after rollout; temporary branch state and
-  individual deployment checklists belong in operational/session records, even
-  without dates or revision hashes. Check that reusable procedures and supported
-  upgrade paths have discoverable, appropriately scoped guidance. Moving mixed
-  material must preserve lasting feature constraints and recovery requirements.
-  Distinguish application transaction rollback from reverting deployed software.
-- Reconcile design and operational guidance with the final implementation and
-  evidence. Distinguish supported behavior, proposals, historical decisions,
-  inferred rationale, and prepared versus executed rollouts. Check applicable
-  versions, deployment order, verification, and recovery limits when relevant.
-  Evaluate documentation gaps using the existing finding severities.
+
+## Documentation
+
+Apply the generic dev-session-documentation skill's placement and README
+convention, including existing-layout equivalents and repository-local
+destinations. Assess the explanation needed by the change; a short rationale
+can be enough. Use the existing packet's compact inventory, without requiring
+a fixed document bundle, page metadata, historical backfill or another reviewer.
+For affected documentation, answer these seven questions with paths/sections
+and any exception:
+
+1. Can the intended reader reach the explanation from the README or index, and
+   does the README stay an entry point for purpose, basic start and grouped
+   links, with any prerequisite or warning needed to start safely?
+2. Does each changed passage have the right audience, owner and home:
+   reference, how-to, reusable operations, supported upgrade, or individual
+   execution? Keep consequential rationale and lasting constraints with their
+   owning project. Distinguish application transaction rollback from operations
+   that revert deployed software.
+3. Would current reference remain useful after the initiative finishes, without
+   branch status or private session context? Temporary branch state and one
+   rollout's checklists belong in session or locally permitted execution
+   records, even without dates or revision hashes.
+4. Do commands, behavior, examples and stated verification agree with the final
+   source and evidence, distinguishing prepared, tested and deployed claims?
+   Keep supported behavior, proposals, historical decisions and inferred
+   rationale distinct; disclose unverified instructions and evidence gaps.
+5. Have moves preserved every consequential prerequisite, failure or partial
+   success condition, compatibility restriction, deployment ordering, data-loss
+   warning and recovery step or limit? Split mixed passages without burying
+   feature contracts or losing operational safety requirements.
+6. Are upgrade applicability and retirement conditions explicit where relevant,
+   including source/target versions or state boundaries, old persisted state,
+   backup restoration and rollback? Retain supported paths until their owner
+   explicitly retires them with evidence; disclose unknown applicability rather
+   than treating a completed rollout or missing evidence as permission to retire.
+7. Is there one authoritative explanation per contract, with working links and
+   anchors, and do prose edits preserve factual meaning and required writing
+   rules? Check old entry points when moving content and keep public supported
+   guidance accessible without private session records.
+
+Record an explicit documentation placement and preservation conclusion, naming
+exceptions and remaining gaps, rather than only "docs checked." If no update
+was useful, assess the packet's brief justification. Apply existing finding
+severities by consequence: losing a required queue-recovery instruction can
+block delivery; a harmless heading preference is advisory. These questions
+belong to the existing general lane and do not change review timing or the
+exemption for routine planning, investigation, findings, tracking and evidence.
+
 - For KB or DokuWiki changes, manually enumerate instructions that perform a
   vpsAdmin WebUI action and require each to be wrapped in a semantic
   `<vpsadmin-nav>` annotation bound to the affected language pages. A green
