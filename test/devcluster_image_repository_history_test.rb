@@ -5,6 +5,8 @@ require_relative '../dev-clusters/vpsadminos/lib/image-repository-history'
 class ImageRepositoryHistoryTest < Minitest::Test
   SQLITE = ENV.fetch('DEMO_SQLITE')
   SERVER = ENV.fetch('DEMO_SCHEMA_SERVER')
+  SCHEMA = Integer(ENV.fetch('DEMO_SCHEMA_VERSION', '2'))
+  raise 'Tests require a compiled schema-2 or schema-3 server' unless [2, 3].include?(SCHEMA)
   SEED_TIME = '2026-11-10T14:10:21.949194Z'.freeze
 
   class CommitGap < ImageRepositoryHistory
@@ -30,7 +32,7 @@ class ImageRepositoryHistoryTest < Minitest::Test
       refute_equal 124, status.exitstatus
       assert_includes out + err, 'explicit bounded HTTP measurement options required'
       db = File.join(state, 'catalog.sqlite')
-      assert_equal [{ 'user_version' => 2 }], @history.query(db, 'PRAGMA user_version;', readonly: true)
+      assert_equal [{ 'user_version' => SCHEMA }], @history.query(db, 'PRAGMA user_version;', readonly: true)
       File.write(File.join(root, 'DEMO'), "osctl-repo-server synthetic demo v1\n")
       @history.query(db, <<~SQL)
         INSERT INTO catalogs(id,repository,document,modified,retain_until)
@@ -111,9 +113,16 @@ class ImageRepositoryHistoryTest < Minitest::Test
         writer.flock(File::LOCK_EX)
         assert_raises(RuntimeError) { @history.apply(root, sample) }
       end
-      @history.query(db, 'PRAGMA user_version=3;')
-      assert_raises(RuntimeError) { @history.apply(root, sample) }
-      @history.query(db, 'PRAGMA user_version=2;')
+      [0, 1, 4].each do |unsupported|
+        @history.query(db, "PRAGMA user_version=#{unsupported};")
+        error = assert_raises(RuntimeError) { @history.apply(root, sample) }
+        assert_includes error.message, 'supports schemas 2 and 3 only'
+        refute File.exist?(File.join(root, 'synthetic-history-v1.json'))
+        # The transaction independently refuses an unsupported version too.
+        assert_raises(RuntimeError) { @history.apply_transaction(db, @history.sample(SEED_TIME)) }
+        assert_equal 0, own_count(db)
+      end
+      @history.query(db, "PRAGMA user_version=#{SCHEMA};")
       File.write(File.join(root, 'DEMO'), 'wrong')
       assert_raises(RuntimeError) { @history.apply(root, sample) }
       File.write(File.join(root, 'DEMO'), "osctl-repo-server synthetic demo v1\n")

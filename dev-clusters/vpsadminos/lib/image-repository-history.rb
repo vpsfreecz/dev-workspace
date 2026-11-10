@@ -103,7 +103,7 @@ class ImageRepositoryHistory
       raise 'Service writer must be stopped before offline fixture import' unless writer.flock(File::LOCK_EX | File::LOCK_NB)
 
       version = query(db, 'PRAGMA user_version;', readonly: true)
-      raise 'Offline fixture requires schema exactly 2' unless version == [{ 'user_version' => 2 }]
+      raise 'Offline fixture supports schemas 2 and 3 only' unless [[{ 'user_version' => 2 }], [{ 'user_version' => 3 }]].include?(version)
       raise 'Offline fixture requires existing demo repository' unless query(db, "SELECT id FROM repositories WHERE id='demo';", readonly: true) == [{ 'id' => 'demo' }]
 
       if File.exist?(manifest) || File.symlink?(manifest)
@@ -136,7 +136,7 @@ class ImageRepositoryHistory
       PRAGMA busy_timeout=0;
       BEGIN EXCLUSIVE;
       CREATE TEMP TABLE fixture_guard(value INTEGER CHECK(value=1));
-      INSERT INTO fixture_guard SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=2 THEN 1 ELSE 0 END;
+      INSERT INTO fixture_guard SELECT CASE WHEN (SELECT user_version FROM pragma_user_version) IN (2,3) THEN 1 ELSE 0 END;
       CREATE TEMP TABLE fixture_expected AS SELECT #{projections} FROM json_each(CAST(@fixture AS TEXT),'$.rows');
       INSERT INTO fixture_guard SELECT CASE WHEN
         ((SELECT count(*) FROM http_daily WHERE #{own})=0 AND (SELECT count(*) FROM http_measurement WHERE #{own})=0)

@@ -45,3 +45,10 @@ state, reclaim old payloads during acceptance, or reset/recreate the dataset.
 Existing runs, receipts and measurement history are not rewritten. Retrying the
 same prepared request uses its original request ID/path; a new current generation
 or collision requires reconciliation rather than a forced replacement.
+
+The offline historical sample accepts only schemas 2 and 3, which share its
+17 daily columns and measurement metadata. Schema 3 changes only the usage index;
+the helper neither migrates the schema nor rewrites existing instance data.
+Retain a coherent dataset, fixture manifest and configuration backup matching the
+binary version. A schema-2 rollback requires the complete pre-upgrade schema-2
+set, with all writers stopped; changing the version number alone is not recovery.

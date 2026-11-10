@@ -213,9 +213,11 @@ backup. Never import the raw 178-entry catalog as a replacement or run the old
 seed to enrich current data. Concurrent public generation changes or collisions
 require reconciliation before import; do not force a replacement or reset the dataset.
 
-The addon-only history helper uses its packaged SQLite CLI and refuses any schema
-other than exactly 2, an unmarked root, another repository/instance, or an active
-writer. It inserts at most 50,000 typed daily rows and one metadata row for
+The addon-only history helper uses its packaged SQLite CLI and accepts only
+schemas 2 and 3; schema 3 changes the usage index, retaining the same daily and
+measurement columns. The helper performs no schema conversion. It refuses an
+unmarked root, another repository/instance, or an active writer. It inserts at
+most 50,000 typed daily rows and one metadata row for
 `synthetic-history-v1` in a single exclusive transaction. Original
 `synthetic-demo` data remains unchanged. Dates are explicit in the preceding
 365-day window at a fixed real UTC seed time; quiet dates, full/range responses,
@@ -226,9 +228,11 @@ manifest reconciles a commit-before-marker interruption only if every row and
 metadata value matches exactly. An applied manifest returns already-applied and
 never overwrites subsequent preview observations or pruned history. Unknown
 content or a lost marker with changed data refuses. Restore a coherent matching
-schema-2 dataset/manifest/config with writers stopped; deleting some counter rows
-or replaying against stale WAL is not rollback. Preserve older backups for their
-original version boundary. No automatic dataset reset or cleanup is provided.
+dataset/manifest/config with writers stopped; a schema-2 binary requires the
+complete pre-upgrade schema-2 backup. Deleting some counter rows, changing the
+schema version alone or replaying against stale WAL is not rollback. Preserve
+older backups for their original version boundary. No automatic dataset reset or
+cleanup is provided.
 
 Run the installed command explicitly as guest root:
 
