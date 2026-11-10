@@ -67,6 +67,16 @@ class ImageRepositoryDemoSeed
     end
   end
 
+  # Preparation is separate from the original explicit seed. This only writes a
+  # portable union and request receipt; it never calls ctl or imports a catalog.
+  def prepare_catalog(export_path:, output:, expected_generation:, allow_default_transition: false)
+    raise 'Refusing an unmarked repository root' unless File.file?("#{@root}/DEMO") && !File.symlink?("#{@root}/DEMO") &&
+                                                       File.read("#{@root}/DEMO") == MARKER
+
+    require_relative 'image-repository-fixtures'
+    ImageRepositoryFixtures.new.prepare_union(export_path:, output:, expected_generation:, allow_default_transition:)
+  end
+
   def seed_locked
     legacy = "#{@root}/fixture-import"
     images = %w[1 0].map do |version|
@@ -138,6 +148,14 @@ class ImageRepositoryDemoSeed
 end
 
 if $PROGRAM_NAME == __FILE__
-  abort 'Usage: image-repository-seed.rb ROOT SERVER LEASE_SECONDS' unless ARGV.length == 3
-  ImageRepositoryDemoSeed.new(*ARGV).seed
+  if ARGV.first == 'prepare-catalog'
+    ARGV.shift
+    abort 'Usage: prepare-catalog ROOT EXPORT OUTPUT EXPECTED_GENERATION --accept-default-transition' unless ARGV.length == 5 && ARGV.last == '--accept-default-transition'
+    root, export_path, output, expected_generation = ARGV.first(4)
+    result = ImageRepositoryDemoSeed.new(root, nil, 0).prepare_catalog(export_path:, output:, expected_generation:, allow_default_transition: true)
+    puts JSON.generate(result)
+  else
+    abort 'Usage: image-repository-seed.rb ROOT SERVER LEASE_SECONDS' unless ARGV.length == 3
+    ImageRepositoryDemoSeed.new(*ARGV).seed
+  end
 end

@@ -14,6 +14,11 @@ let
   binary = "${server}/bin/osctl-repo-server";
   finite =
     name: maximum: builtins.isInt limits.${name} && limits.${name} > 0 && limits.${name} <= maximum;
+  text =
+    value: maximum:
+    builtins.isString value
+    && builtins.stringLength value <= maximum
+    && builtins.match ".*[[:cntrl:]].*" value == null;
   valid = builtins.all (x: x) [
     (finite "maxBytes" 67108864)
     (finite "reserveBytes" 67108864)
@@ -24,7 +29,20 @@ let
     (limits.maxUploadBytes <= limits.maxBytes)
     (limits.leaseSeconds >= 3600)
     (builtins.isBool settings.seed)
+    (text settings.displayName 128)
+    (text settings.purpose 512)
+    (builtins.isString settings.instance)
+    (builtins.match "[A-Za-z0-9][A-Za-z0-9_.-]{0,127}" settings.instance != null)
+    (builtins.isInt settings.statsDays && settings.statsDays >= 1 && settings.statsDays <= 365)
+    (
+      builtins.isInt settings.statsMaxRows && settings.statsMaxRows >= 1 && settings.statsMaxRows <= 65536
+    )
   ];
+  presentationArgs =
+    lib.optionalString (
+      settings.displayName != ""
+    ) " --display-name ${lib.escapeShellArg settings.displayName}"
+    + lib.optionalString (settings.purpose != "") " --purpose ${lib.escapeShellArg settings.purpose}";
   prepare = pkgs.writeShellScript "prepare-repository-demo" ''
     set -euo pipefail
     export PATH=${
@@ -57,8 +75,35 @@ let
     set -euo pipefail
     test "$#" -eq 0
     exec ${pkgs.coreutils}/bin/timeout --kill-after=5 180 ${pkgs.runit}/bin/chpst -u ${account}:${account} \
-      ${pkgs.ruby}/bin/ruby ${../lib/image-repository-seed.rb} \
+      ${pkgs.ruby}/bin/ruby ${../.}/lib/image-repository-seed.rb \
       ${root} ${binary} ${toString limits.leaseSeconds}
+  '';
+  fixtures = pkgs.writeShellScriptBin "osctl-repo-demo-fixtures" ''
+    set -euo pipefail
+    exec ${pkgs.runit}/bin/chpst -u ${account}:${account} \
+      ${pkgs.ruby}/bin/ruby ${../.}/lib/image-repository-fixtures.rb "$@"
+  '';
+  catalog = pkgs.writeShellScriptBin "osctl-repo-demo-prepare-catalog" ''
+    set -euo pipefail
+    exec ${pkgs.runit}/bin/chpst -u ${account}:${account} \
+      ${pkgs.ruby}/bin/ruby ${../.}/lib/image-repository-seed.rb prepare-catalog ${root} "$@"
+  '';
+  history = pkgs.writeShellScriptBin "osctl-repo-demo-history" ''
+    set -euo pipefail
+    case "''${1-}" in
+      generate)
+        test "$#" -eq 3
+        exec ${pkgs.runit}/bin/chpst -u ${account}:${account} \
+          ${pkgs.ruby}/bin/ruby ${../.}/lib/image-repository-history.rb "$@"
+        ;;
+      apply)
+        test "$#" -eq 2
+        exec ${pkgs.runit}/bin/chpst -u ${account}:${account} \
+          ${pkgs.ruby}/bin/ruby ${../.}/lib/image-repository-history.rb apply \
+          ${pkgs.sqlite}/bin/sqlite3 ${root} "$2"
+        ;;
+      *) echo 'Explicit generate or offline apply operation required' >&2; exit 2 ;;
+    esac
   '';
   maintenance = pkgs.writeShellScript "repository-demo-maintenance" ''
     set -euo pipefail
@@ -92,14 +137,23 @@ assert
       "repo-demo-admin"
     ];
   };
-  environment.systemPackages = [ server ] ++ lib.optional settings.seed seed;
+  environment.systemPackages = [
+    server
+  ]
+  ++ lib.optionals settings.seed [
+    seed
+    fixtures
+    catalog
+    history
+  ];
   runit.services.osctl-repo-server-demo = {
     run = ''
       set -e
       waitForService pool-tank
       ${prepare}
       exec ${pkgs.runit}/bin/chpst -u ${account}:${account}:repo-demo-producer:repo-demo-publisher:repo-demo-admin \
-        ${binary} serve --root ${root}/state --listen 127.0.0.1:8080 --repository demo --instance synthetic-demo \
+        ${binary} serve --root ${root}/state --listen 127.0.0.1:8080 --repository demo \
+        --instance ${lib.escapeShellArg settings.instance}${presentationArgs} \
         --producer-socket ${sockets}/producer.sock --producer-group repo-demo-producer \
         --publisher-socket ${sockets}/publisher.sock --publisher-group repo-demo-publisher \
         --admin-socket ${sockets}/admin.sock --admin-group repo-demo-admin \
@@ -107,7 +161,7 @@ assert
         --max-upload-bytes ${toString limits.maxUploadBytes} --max-runs ${toString limits.maxRuns} \
         --max-lease ${toString limits.leaseSeconds}s --export-lease 1h \
         --access-log ${root}/logs/access.jsonl --access-log-max-bytes 1048576 --access-log-files 2 \
-        --stats-days 7 --stats-max-rows 256 --event-queue 64 \
+        --stats-days ${toString settings.statsDays} --stats-max-rows ${toString settings.statsMaxRows} --event-queue 64 \
         --client-ip-header X-Repo-Client-IP --trusted-proxy 127.0.0.1/32
     '';
     check = "test -S ${sockets}/admin.sock";

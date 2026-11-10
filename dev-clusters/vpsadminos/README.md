@@ -161,6 +161,75 @@ The dataset property `com.vpsfree:repo-demo=1` and `DEMO` marker identify it.
 An existing unmarked dataset or conflicting mountpoint fails explicitly.
 Restarts and ordinary updates retain data. Nothing is seeded or erased on boot.
 
+Optional `displayName` and `purpose` set the repository name and description
+shown by the server. The addon accepts up to 128 and 512 bytes respectively,
+without control characters. Empty values display the repository ID and omit the
+description. `instance`, `statsDays` and `statsMaxRows` default to
+`synthetic-demo`, 7 and 256. The instance must be a safe path component; retention
+accepts 1 to 365 days and the row cap accepts 1 to 65,536. Changing the instance
+does not move or erase old measurements. Payload, log and run limits are separate.
+
+A representative test preview can explicitly select:
+
+```json
+{
+  "imageRepository": {
+    "enable": true,
+    "displayName": "Synthetic image catalog preview",
+    "purpose": "Synthetic files and simulated usage; new measurements come from preview traffic, not production downloads.",
+    "instance": "synthetic-history-v1",
+    "statsDays": 365,
+    "statsMaxRows": 65536
+  }
+}
+```
+
+The page shows this purpose above the statistics and catalog. Distribution names
+come from a frozen public metadata snapshot; the tiny archives are **not operating systems**,
+and the ZFS placeholders are **not valid streams**. Simulated large transfer
+values describe a historical fixture, never the actual tiny file sizes or
+production usage. Source provenance and complete-union preparation are documented
+in [the fixture guide](fixtures/image-repository/README.md).
+
+Run these preparation and maintenance commands explicitly. They require a marked
+existing demo and a coherent backup. Stop the service and maintenance before
+changing data.
+
+```sh
+osctl-repo-demo-fixtures /absolute/new-synthetic-catalog
+osctl-repo-demo-prepare-catalog /absolute/coherent-export /absolute/new-union EXPECTED_GENERATION --accept-default-transition
+osctl-repo-demo-history generate /absolute/new-history.json RECORDED_REAL_UTC_SEED_TIME
+# Only with the service, statistics writer and maintenance stopped:
+osctl-repo-demo-history apply /absolute/new-history.json
+```
+
+The catalog command prepares a complete portable union and CAS request without
+submitting it. The union preserves current tuples, file IDs and bytes. Import
+preserves runs, receipts and history. The `default` alias changes to
+`vpsadminos/minimal` only when explicitly accepted; existing `demo/minimal`
+canonical and nonconflicting tag paths remain. Validate the output and apply its
+stable `import-request.json` through the existing admin ctl, after review and
+backup. Never import the raw 178-entry catalog as a replacement or run the old
+seed to enrich current data. Concurrent public generation changes or collisions
+require reconciliation before import; do not force a replacement or reset the dataset.
+
+The addon-only history helper uses its packaged SQLite CLI and refuses any schema
+other than exactly 2, an unmarked root, another repository/instance, or an active
+writer. It inserts at most 50,000 typed daily rows and one metadata row for
+`synthetic-history-v1` in a single exclusive transaction. Original
+`synthetic-demo` data remains unchanged. Dates are explicit in the preceding
+365-day window at a fixed real UTC seed time; quiet dates, full/range responses,
+interruptions and errors are deliberately simulated. It writes no access events.
+
+Keep the private `synthetic-history-v1.json` manifest in backups. A prepared
+manifest reconciles a commit-before-marker interruption only if every row and
+metadata value matches exactly. An applied manifest returns already-applied and
+never overwrites subsequent preview observations or pruned history. Unknown
+content or a lost marker with changed data refuses. Restore a coherent matching
+schema-2 dataset/manifest/config with writers stopped; deleting some counter rows
+or replaying against stale WAL is not rollback. Preserve older backups for their
+original version boundary. No automatic dataset reset or cleanup is provided.
+
 Run the installed command explicitly as guest root:
 
 ```sh

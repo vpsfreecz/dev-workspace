@@ -50,6 +50,11 @@ let
   repositorySettings = {
     port = imageRepository.port or 8080;
     seed = imageRepository.seed or true;
+    displayName = imageRepository.displayName or "";
+    purpose = imageRepository.purpose or "";
+    instance = imageRepository.instance or "synthetic-demo";
+    statsDays = imageRepository.statsDays or 7;
+    statsMaxRows = imageRepository.statsMaxRows or 256;
     limits = {
       maxBytes = 67108864;
       reserveBytes = 16777216;

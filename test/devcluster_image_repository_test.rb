@@ -1,6 +1,7 @@
 require 'minitest/autorun'
 require 'tmpdir'
 require_relative '../dev-clusters/vpsadminos/lib/image-repository-seed'
+require_relative 'devcluster_image_repository_fixtures_test'
 
 class ImageRepositoryDemoSeedTest < Minitest::Test
   class Fixture < ImageRepositoryDemoSeed

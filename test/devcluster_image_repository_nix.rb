@@ -108,6 +108,17 @@ Dir.mktmpdir('image-repository-module-') do |tmp|
   abort 'Native service account missing' unless enabled['users'].include?('osctl-repo-demo')
   abort 'Bounded maintenance missing' unless enabled['cron'].any? { |x| x.include?('17 * * * * osctl-repo-demo') }
   abort 'Seed command missing' unless enabled['packages'].any? { |x| x.end_with?('-osctl-repo-demo-seed') }
+  abort 'Backward-compatible measurement defaults changed' unless enabled['run'].match?(/--instance '?synthetic-demo'?(?:\s|$)/) &&
+                                                               enabled['run'].include?('--stats-days 7 --stats-max-rows 256') &&
+                                                               !enabled['run'].include?('--display-name') && !enabled['run'].include?('--purpose')
+  rich = evaluate.call({ 'enable' => true, 'displayName' => 'Synthetic image catalog preview',
+                         'purpose' => 'Synthetic archive bytes and simulated history; later observations are preview traffic, not production downloads.',
+                         'instance' => 'synthetic-history-v1', 'statsDays' => 365, 'statsMaxRows' => 65_536 })
+  abort 'Explicit preview fields/limits missing' unless rich['run'].match?(/--instance '?synthetic-history-v1'?(?:\s|$)/) &&
+                                                      rich['run'].include?("--display-name 'Synthetic image catalog preview'") &&
+                                                      rich['run'].include?('--stats-days 365 --stats-max-rows 65536') &&
+                                                      rich['run'].include?('--max-bytes 67108864')
+  abort 'Explicit offline fixture helper missing' unless rich['packages'].any? { |x| x.end_with?('-osctl-repo-demo-history') }
   check_generated_logger(tmp, enabled)
   no_seed = evaluate.call({ 'enable' => true, 'seed' => false })
   abort 'Seed command present despite disabled seed' if no_seed['packages'].any? { |x| x.end_with?('-osctl-repo-demo-seed') }
@@ -117,6 +128,11 @@ Dir.mktmpdir('image-repository-module-') do |tmp|
   abort 'Wrong port error missing' unless wrong_port.include?('loopback port 8080')
   unbounded = evaluate.call({ 'enable' => true, 'limits' => { 'maxRuns' => 0 } }, success: false)
   abort 'Finite bound error missing' unless unbounded.include?('finite demo bounds')
-  puts JSON.generate(source: enabled.fetch('source'), service_package: enabled.fetch('servicePackage'), truths: 7,
+  [ { 'statsDays' => 0 }, { 'statsDays' => 366 }, { 'statsMaxRows' => 65_537 },
+    { 'instance' => '../escape' }, { 'displayName' => "bad\nname" }, { 'purpose' => 'x' * 513 } ].each do |fields|
+    error = evaluate.call({ 'enable' => true }.merge(fields), success: false)
+    abort 'Invalid optional presentation/measurement field accepted' unless error.include?('finite demo bounds')
+  end
+  puts JSON.generate(source: enabled.fetch('source'), service_package: enabled.fetch('servicePackage'), truths: 16,
                      generated_logger: 'helper loaded; pool -> prepare -> logger; missing-helper failure reproduced', result: 'pass')
 end
