@@ -67,6 +67,11 @@ wrappers, and pins such as those used by vpsAdmin and other workspace projects.
   repeated behavioral rules, policy, validation, normalization, query logic,
   protocol handling, error translation, orchestration, and test
   infrastructure.
+- For new or changed confctl cluster configuration, trace shared machine
+  addresses and metadata to authoritative machine module fields. Flag avoidable
+  duplicated literals when a suitable field already exists, unless a documented
+  intentional exception justifies them. Do not require refactoring unrelated
+  constants or unchanged references.
 - Require one owning abstraction when repeated logic must stay equivalent and
   has a credible drift, omission, or inconsistent-fix risk. The abstraction
   must preserve clear ownership and should be tested at the shared boundary.
