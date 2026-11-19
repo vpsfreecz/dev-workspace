@@ -371,6 +371,27 @@ let
     cp ${../lib/storage_profile.rb} "$out/storage_profile_impl.rb"
     cp ${storageProfileJson} "$out/storage-profile.json"
   '';
+  incidentPolicyFile = devConfig.incidentPolicyFile or null;
+  incidentPolicyText =
+    if !(builtins.isString incidentPolicyFile) || !lib.hasPrefix "/" incidentPolicyFile then
+      throw "incidentPolicyFile must be an absolute pathname or null"
+    else if
+      !(builtins.pathExists incidentPolicyFile)
+      || ((builtins.readDir (builtins.dirOf incidentPolicyFile)).${builtins.baseNameOf incidentPolicyFile} or null)
+      != "regular"
+    then
+      throw "incidentPolicyFile must name a readable regular non-symlink file"
+    else
+      builtins.readFile incidentPolicyFile;
+  incidentPolicySnapshot = pkgs.writeText "incident_escalation.rb" incidentPolicyText;
+  incidentPolicyConfigDir = pkgs.runCommand "vpsadmin-incident-policy-config" { } ''
+    mkdir -p "$out"
+    cp -R ${if storageProfile.enable then storageProfileConfigDir else vpsadmin.outPath + "/tests/configs/vpsadmin/api"}/. "$out/"
+    cp --remove-destination ${incidentPolicySnapshot} "$out/incident_escalation.rb"
+  '';
+  overrideApiConfig = storageProfile.enable || incidentPolicyFile != null;
+  apiConfigDir =
+    if incidentPolicyFile != null then incidentPolicyConfigDir else storageProfileConfigDir;
   nodeInventoryRecords = map (node: {
     inherit (node)
       id
@@ -1514,11 +1535,9 @@ let
           "test.nix"
           "${devSeed}"
         ];
-        databaseSetup.configDirectory = lib.mkIf storageProfile.enable (
-          lib.mkForce storageProfileConfigDir
-        );
-        api.configDirectory = lib.mkIf storageProfile.enable (lib.mkForce storageProfileConfigDir);
-        supervisor.configDirectory = lib.mkIf storageProfile.enable (lib.mkForce storageProfileConfigDir);
+        databaseSetup.configDirectory = lib.mkIf overrideApiConfig (lib.mkForce apiConfigDir);
+        api.configDirectory = lib.mkIf overrideApiConfig (lib.mkForce apiConfigDir);
+        supervisor.configDirectory = lib.mkIf overrideApiConfig (lib.mkForce apiConfigDir);
         # The default API does not declare this profile-only scheduler option.
         # mkIf false retains its option path; omit the definition instead.
         api.scheduler = lib.optionalAttrs storageProfile.enable {

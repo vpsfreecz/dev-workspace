@@ -114,6 +114,140 @@ def check_projection_contract(provider:, nixpkgs:, vpsadmin:)
   puts stdout
 end
 
+# Evaluate only the real incident-file selection with tiny fixture directories.
+# The module system merges its actual mkIf/mkForce definitions; no VM is selected.
+def check_incident_policy_contract(root)
+  stdout, stderr, result = Open3.capture3({ 'INCIDENT_POLICY_ROOT' => root },
+    'nix', 'eval', '--impure', '--json', '--expr',
+    '(builtins.getFlake (builtins.getEnv "INCIDENT_POLICY_ROOT")).inputs.nixpkgs.outPath')
+  abort stderr unless result.success?
+  nixpkgs = JSON.parse(stdout)
+  expression = <<~'NIX'
+    let
+      pkgs = import (builtins.getEnv "INCIDENT_POLICY_NIXPKGS") { system = "x86_64-linux"; };
+      lib = pkgs.lib;
+      testModule = import (builtins.getEnv "INCIDENT_POLICY_ROOT" + "/dev-clusters/vpsadmin/nix/test.nix");
+      vpsadmin = { outPath = builtins.path {
+        path = builtins.getEnv "INCIDENT_POLICY_FIXTURE"; name = "incident-policy-smoke-source";
+      }; };
+      test = (testModule (builtins.mapAttrs (_: _: "") (builtins.functionArgs testModule) // {
+        inherit lib vpsadmin;
+        workspace = "/fixture"; slug = "incident-policy-smoke"; networkMode = "local";
+        topology = builtins.getEnv "INCIDENT_POLICY_TOPOLOGY";
+        clusterConfigFile = builtins.getEnv "INCIDENT_POLICY_CONFIG";
+      })) { inherit pkgs; };
+      services = (builtins.elemAt test.machines.services.config.imports 1) { inherit pkgs lib; config = { }; };
+      components = [ "api" "supervisor" "databaseSetup" ];
+      merged = lib.evalModules { modules = [ {
+        options.vpsadmin = lib.genAttrs components (_: { configDirectory = lib.mkOption {
+          type = lib.types.path; default = vpsadmin.outPath + "/tests/configs/vpsadmin/api";
+        }; });
+        config.vpsadmin = lib.genAttrs components (name: {
+          configDirectory = services.vpsadmin.${name}.configDirectory;
+        });
+      } ]; };
+      directory = merged.config.vpsadmin.api.configDirectory;
+    in {
+      directories = lib.genAttrs components (name: toString merged.config.vpsadmin.${name}.configDirectory);
+      drvPath = if builtins.isAttrs directory then directory.drvPath else null;
+      fixture = vpsadmin.outPath + "/tests/configs/vpsadmin/api";
+    }
+  NIX
+  Dir.mktmpdir('devcluster-incident-policy') do |temporary|
+    provider = File.join(temporary, 'provider')
+    FileUtils.cp_r(File.join(root, 'dev-clusters/vpsadmin'), provider)
+    FileUtils.cp(File.join(root, 'test/fixtures/vpsadmin-config.json'), File.join(provider, 'default-config.json'))
+    fixture = File.join(temporary, 'fixture')
+    config_dir = File.join(fixture, 'tests/configs/vpsadmin/api')
+    FileUtils.mkdir_p([File.join(fixture, 'api/db/seeds'), config_dir])
+    File.write(File.join(fixture, 'api/db/seeds/test.nix'),
+      '{ location = { id = 1; domain = "example.test"; }; environment.id = 1; }')
+    { 'incident_escalation.rb' => "fixture policy\n", 'hooks.rb' => "fixture hooks\n",
+      'dataset_plans.rb' => "fixture plans\n", 'dataset_properties.rb' => "fixture properties\n" }.each do |name, text|
+      File.write(File.join(config_dir, name), text)
+    end
+    selected = File.join(temporary, 'selected-policy.rb')
+    selected_bytes = "# exact local snapshot\nraise 'must not execute during evaluation'\n"
+    File.write(selected, selected_bytes)
+    config = File.join(temporary, 'config.json')
+    environment = { 'INCIDENT_POLICY_ROOT' => root, 'INCIDENT_POLICY_NIXPKGS' => nixpkgs,
+      'INCIDENT_POLICY_FIXTURE' => fixture, 'INCIDENT_POLICY_CONFIG' => config,
+      'INCIDENT_POLICY_TOPOLOGY' => 'single' }
+    # Use a disposable copy only to supply the existing default-config.json input.
+    expression = expression.sub('builtins.getEnv "INCIDENT_POLICY_ROOT" + "/dev-clusters/vpsadmin/nix/test.nix"',
+      'builtins.getEnv "INCIDENT_POLICY_PROVIDER" + "/nix/test.nix"')
+    environment['INCIDENT_POLICY_PROVIDER'] = provider
+    evaluate = lambda do |values, topology = 'single', invalid: false|
+      File.write(config, JSON.generate(values))
+      environment['INCIDENT_POLICY_TOPOLOGY'] = topology
+      out, err, status = Open3.capture3(environment, 'nix', 'eval', '--impure', '--json', '--expr', expression)
+      if invalid
+        abort "Invalid incidentPolicyFile accepted: #{values.inspect}" if status.success?
+        next
+      end
+      abort err unless status.success?
+      value = JSON.parse(out)
+      abort 'Components selected different config directories' unless value.fetch('directories').values.uniq.length == 1
+      value
+    end
+    absent = evaluate.call({})
+    null = evaluate.call({ 'incidentPolicyFile' => nil })
+    abort 'Absent/null changed original fixture identity' unless absent == null && absent.fetch('directories').values == [absent.fetch('fixture')] * 3
+    chosen = evaluate.call({ 'incidentPolicyFile' => selected })
+    profile = { 'storageProfile' => { 'enable' => true } }
+    storage = evaluate.call(profile, 'storage')
+    storage_null = evaluate.call(profile.merge('incidentPolicyFile' => nil), 'storage')
+    abort 'Null changed storage profile identity' unless storage == storage_null
+    storage_chosen = evaluate.call(profile.merge('incidentPolicyFile' => selected), 'storage')
+    symlink = File.join(temporary, 'symlink.rb')
+    File.symlink(selected, symlink)
+    [false, true, 1, [], {}, '', 'relative.rb', File.join(temporary, 'missing.rb'), temporary, symlink].each do |invalid|
+      evaluate.call({ 'incidentPolicyFile' => invalid }, invalid: true)
+    end
+    File.chmod(0, selected)
+    begin
+      evaluate.call({ 'incidentPolicyFile' => selected }, invalid: true)
+    ensure
+      File.chmod(0o600, selected)
+    end
+    # Snapshot contents already belong to the evaluated derivation, even if the
+    # mutable host file changes before its tiny output is realized.
+    File.write(selected, "# changed after evaluation\n")
+    derivations = [chosen, storage, storage_chosen].map { |v| v.fetch('drvPath') }
+    abort 'Expected only tiny config derivations' if derivations.any?(&:nil?)
+    command = ['nix-store', '--realise', '--max-jobs', '1', '--cores', '1', *derivations]
+    plan_out, plan_err, plan_status = Open3.capture3(*command, '--dry-run')
+    abort plan_err unless plan_status.success?
+    puts plan_out, plan_err
+    missing = (plan_out + plan_err).scan(%r{/nix/store/[^\s]+\.drv}).uniq
+    allowed = /-(?:vpsadmin-incident-policy-config|vpsadmin-storage-profile-config|vpsadmin-storage-profile\.json|incident_escalation\.rb)\.drv\z/
+    if missing.any? { |path| !allowed.match?(path) } || (plan_out + plan_err).match?(/will be (?:fetched|substituted)/)
+      abort 'Incident-policy smoke requires additional package realization; stop before building'
+    end
+    puts "incidentPolicyFile: selected only #{derivations.join(' ')}"
+    out, err, status = Open3.capture3(*command)
+    abort err unless status.success?
+    directory = ->(value) { value.fetch('directories').fetch('api') }
+    [chosen, storage_chosen].each do |value|
+      abort 'Selected bytes changed after evaluation' unless File.binread(File.join(directory.call(value), 'incident_escalation.rb')) == selected_bytes
+    end
+    [ [absent, chosen], [storage, storage_chosen] ].each do |original, replacement|
+      siblings = Dir.children(directory.call(original)) - ['incident_escalation.rb']
+      abort 'Sibling names changed' unless siblings.sort == (Dir.children(directory.call(replacement)) - ['incident_escalation.rb']).sort
+      siblings.each do |name|
+        abort "Sibling #{name} changed" unless File.binread(File.join(directory.call(original), name)) == File.binread(File.join(directory.call(replacement), name))
+      end
+    end
+    abort 'Storage hooks were lost' unless File.binread(File.join(directory.call(storage_chosen), 'hooks.rb')) == File.binread(File.join(root, 'dev-clusters/vpsadmin/nix/storage-profile/hooks.rb'))
+    puts 'incidentPolicyFile: absent/null identity, exact snapshot, three components, invalid inputs and storage siblings passed'
+  end
+end
+
+if ARGV == ['--incident-policy-only']
+  check_incident_policy_contract(File.expand_path('..', __dir__))
+  exit 0
+end
+
 if ARGV.first == '--projection-only'
   root = File.expand_path("..", __dir__)
   stdout, stderr, result = Open3.capture3({ 'PROJECTION_SOURCE' => root },
