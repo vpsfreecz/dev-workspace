@@ -10,7 +10,7 @@
       inputs.vpsadmin.follows = "vpsadmin";
     };
     vpsfStatus = {
-      url = "github:vpsfreecz/vpsf-status/master";
+      url = "github:vpsfreecz/vpsf-status/f783d045ac49a0ae9e8501a8f9a38d0523177b9e";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.vpsadmin.follows = "vpsadmin";
       inputs.vpsadminos.follows = "vpsadminos";
