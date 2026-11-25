@@ -271,6 +271,20 @@ prove registration, not observed survival through collection.
 
 ## Basic Usage
 
+For a new cluster that needs React, complete the
+[Web UI preparation](#optional-react-web-ui) before its first boot. Keep React
+enabled in the cluster config, select a distinct `domains.newadmin`, and start
+with bridge networking:
+
+```sh
+vpsadmin-devcluster start <slug> --topology dual --network bridge
+```
+
+The initial enabled layout includes the Web UI credential mount. Enabling React
+after boot changes that layout; ordinary `update` and `start --existing` cannot
+add the mount to retained guests. Prepare the source and configuration before
+creating review fixtures that need to be preserved.
+
 ```sh
 vpsadmin-devcluster start 2026-05-29-security-advisories --topology dual
 vpsadmin-devcluster urls 2026-05-29-security-advisories
@@ -627,6 +641,20 @@ when these settings are absent. Enabled clusters require bridge networking;
 proxies to the new container's private nginx on loopback port 18082. Its OAuth
 BFF listens on loopback port 3001 inside that container. The
 container uses the cluster CA to validate its HTTPS calls to the auth service.
+
+Before the first boot, prepare the selected API and WebUI sources together.
+Verify that the generated TypeScript SDK actually contains the API actions being
+reviewed; its version label alone does not establish action support. Build and
+check the matching frontend and BFF packages from the same WebUI source. For a
+local archive and `importNpmLock`, follow `docs/design/PACKAGING.md` in the exact
+WebUI checkout/revision selected for this cluster.
+Leave an enabled setting supplied by the consuming workspace in place; this
+preparation does not require changing workspace defaults.
+
+With React enabled from the first boot, the ordinary provider supplies the
+credential mount, separate OAuth client, packaged frontend/BFF services and TLS
+route. A successful build establishes package readiness; verify the applied
+services source and real OAuth/UI behavior after the ordinary start.
 
 The enabled service uses API version 7.0 and a separate, nondefault OAuth
 client with 20-minute access tokens and 30-day refresh tokens. Its callback is
