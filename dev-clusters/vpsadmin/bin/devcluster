@@ -14,6 +14,9 @@ SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="${VPSADMIN_DEVCLUSTER_DEFAULT_CONFIG:?VPSADMIN_DEVCLUSTER_DEFAULT_CONFIG is not configured}"
 DEV_SESSION_BIN=dev-session
 source "$SCRIPT_DIR/../../lib/runtime.sh"
+vpsadminos_selected_slug=""
+vpsadminos_selected_path=""
+vpsadminos_selected_input=""
 
 devcluster_validate_cert_directory() {
   local create="${1:-false}"
@@ -678,6 +681,7 @@ build_config_with_credentials() {
     [ "$network" = bridge ] || die "React WebUI requires bridge networking; disable newWebui.enable for local mode"
     validate_webui_domain "$slug"
   fi
+  select_vpsadminos_source "$slug" || return
   ensure_shared_credentials "$slug" || return
   ensure_webui_credentials "$slug" || return
   build_config "$slug" "$topology" "$network" "$context" "$operation"
@@ -697,16 +701,20 @@ slug_optional_path() {
   [ -d "$path" ] && printf '%s\n' "$path"
 }
 
-vpsadminos_input() {
+select_vpsadminos_source() {
   local slug="$1"
   local path
-  path="$(slug_optional_path "$slug" vpsadminos || true)"
+  [ "$vpsadminos_selected_slug" != "$slug" ] || return 0
+  path="$(ruby "$CLUSTER_DIR/lib/source_selection.rb" \
+    "$WORKSPACE" "$slug" "$(config_json_for_slug "$slug")")" || return
 
   if [ -n "$path" ]; then
-    printf 'path:%s\n' "$path"
+    vpsadminos_selected_input="path:$path"
   else
-    printf 'git+file://%s/repos/vpsadminos.git?ref=refs/remotes/origin/staging\n' "$WORKSPACE"
+    vpsadminos_selected_input="git+file://$WORKSPACE/repos/vpsadminos.git?ref=refs/remotes/origin/staging"
   fi
+  vpsadminos_selected_path="$path"
+  vpsadminos_selected_slug="$slug"
 }
 
 source_revision() {
@@ -833,7 +841,8 @@ build_config() {
   ensure_cluster_config "$slug" || return
 
   vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
-  vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
+  select_vpsadminos_source "$slug" || return
+  vpsadminos_path="$vpsadminos_selected_path"
   haveapi_path="$(slug_optional_path "$slug" haveapi || true)"
   config_source_path="$(slug_optional_path "$slug" vpsfree-cz-configuration || true)"
   if [ -n "$context" ] && [ "$context" != null ]; then
@@ -847,7 +856,7 @@ build_config() {
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_go_client_path="$(slug_optional_path "$slug" vpsadmin-go-client || true)"
   vpsadmin_webui_path="$(slug_optional_path "$slug" vpsadmin-webui || true)"
-  vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
+  vpsadminos_input_value="$vpsadminos_selected_input"
 
   if [ -z "$vpsadminos_path" ]; then
     vpsadminos_path=""
@@ -1143,7 +1152,7 @@ start_cluster() {
     build_config_with_credentials "$slug" "$topology" "$network" boot "$build_context" || return
   local vpsadmin_path vpsadminos_input_value vpsf_status_path vpsadmin_webui_path
   vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
-  vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
+  vpsadminos_input_value="$vpsadminos_selected_input"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_webui_path="$(slug_optional_path "$slug" vpsadmin-webui || true)"
 
@@ -1679,8 +1688,9 @@ maintenance_check_hold() {
 launch_recorded_config() {
   local slug="$1" config="$2" mode="$3"
   local vpsadmin_path vpsadminos_input_value vpsf_status_path vpsadmin_webui_path
+  select_vpsadminos_source "$slug" || return
   vpsadmin_path="$(slug_vpsadmin_path "$slug")" || return
-  vpsadminos_input_value="$(vpsadminos_input "$slug")" || return
+  vpsadminos_input_value="$vpsadminos_selected_input"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_webui_path="$(slug_optional_path "$slug" vpsadmin-webui || true)"
   local -a overrides=()

@@ -5,6 +5,7 @@ require 'minitest/autorun'
 require 'open3'
 require 'rbconfig'
 require 'tmpdir'
+require 'yaml'
 require_relative '../dev-clusters/vpsadmin/lib/maintenance'
 
 class DevclusterCommandsTest < Minitest::Test
@@ -137,8 +138,9 @@ class DevclusterCommandsTest < Minitest::Test
   end
 
   def test_creation_and_every_update_use_the_same_os_selector
-    [false, true].product([nil, 'services', 'node1', 'all']).each do |worktree, target|
+    [false, true].product([nil, 'services', 'node1', 'all'], [false, true]).each do |worktree, target, explicit_null|
       with_workspace('vpsadmin', applied: !target.nil?) do |env, directory|
+        set_os_worktree(directory, nil) if explicit_null
         selected = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'worktrees', env.fetch('TEST_SLUG'), 'vpsadminos')
         FileUtils.rm_rf(selected) unless worktree
         before = File.binread(File.join(directory, 'applied-config.json')) if target
@@ -164,6 +166,117 @@ class DevclusterCommandsTest < Minitest::Test
         refute(events(env).any? { |event| %w[copy activate run].include?(event['event']) })
         assert_locks_released(env)
       end
+    end
+  end
+
+  def test_registered_os_worktree_drives_build_labels_and_both_inputs
+    [nil, 'services', 'node1', 'all'].each do |target|
+      with_workspace('vpsadmin', applied: !target.nil?) do |env, directory|
+        selected, revision = register_os_worktree(env, directory)
+        File.write(File.join(selected, 'dirty'), 'local source')
+        before = File.binread(File.join(directory, 'applied-config.json')) if target
+        result = run_helper('vpsadmin', env.merge('FAIL_AT' => 'build'), target ? 'update' : 'start', target)
+        assert_equal(23, result.exitstatus, @last_output)
+        build = events(env).find { |event| event['event'] == 'build' }
+        assert_os_inputs(build, selected)
+        variables = build.fetch('environment')
+        assert_equal(selected, variables.fetch('VPSADMIN_DEVCLUSTER_VPSADMINOS_SOURCE'))
+        assert_equal(revision, variables.fetch('VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION'))
+        assert_equal('1', variables.fetch('VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY'))
+        if target
+          assert_equal(JSON.parse(before).fetch('configuration'), build.fetch('build_context'))
+          refute_equal(selected, build.fetch('build_context').dig('machines', 'services', 'sharedFileSystems', 'vpsadminos'))
+          assert_equal(before, File.binread(File.join(directory, 'applied-config.json')))
+        end
+        refute(events(env).any? { |event| %w[copy activate run].include?(event['event']) })
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_registered_os_worktree_fresh_and_retained_start_keep_the_boot_context
+    [false, true].each do |retained|
+      with_workspace('vpsadmin', applied: retained) do |env, directory|
+        selected, = register_os_worktree(env, directory)
+        before = JSON.parse(File.read(File.join(directory, 'applied-config.json'))) if retained
+        machines = JSON.parse(env.fetch('TEST_BUILT_MACHINES'))
+        machines.each_value { |machine| machine.fetch('sharedFileSystems')['vpsadminos'] = selected }
+        env = env.merge('TEST_BUILT_MACHINES' => JSON.generate(machines))
+        result = if retained
+                   stdout, stderr, status = Open3.capture3(env, File.join(ROOT, 'dev-clusters/vpsadmin/bin/devcluster'),
+                     'start', env.fetch('TEST_SLUG'), '--existing')
+                   @last_output = stdout + stderr
+                   status
+                 else
+                   run_helper('vpsadmin', env, 'start')
+                 end
+        assert(result.success?, @last_output)
+        calls = events(env)
+        build = calls.find { |event| event['event'] == 'build' }
+        boot = calls.find { |event| event['event'] == 'run' }
+        assert_os_inputs(build, selected)
+        assert_os_inputs(boot, selected)
+        boot_config = JSON.parse(File.read(boot.fetch('argv')[boot.fetch('argv').index('--config') + 1]))
+        if retained
+          assert_equal(before.fetch('configuration').fetch('machines'), boot_config.fetch('machines'))
+        else
+          boot_config.fetch('machines').each_value do |machine|
+            assert_equal(selected, machine.fetch('sharedFileSystems').fetch('vpsadminos'))
+          end
+        end
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_invalid_explicit_os_selection_refuses_before_credentials_build_or_launch
+    [false, 1, [], {}, '', '.', '..', '../foreign', '/absolute', 'missing', 'missing-path',
+      'missing-manifest', 'wrong-project', 'duplicate', 'wrong-branch', 'detached',
+      'other-repository', 'symlink', 'foreign-session', 'nested-directory'].each do |failure|
+      with_workspace('vpsadmin') do |env, directory|
+        selected, = register_os_worktree(env, directory)
+        manifest_path = File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'work', env.fetch('TEST_SLUG'), 'portal.yml')
+        manifest = YAML.safe_load_file(manifest_path)
+        entry = manifest.fetch('repositories').first
+        case failure
+        when 'wrong-project' then entry['project'] = 'vpsadmin'
+        when 'duplicate' then manifest['repositories'] << entry.dup
+        when 'wrong-branch' then entry['branch'] = 'other'
+        when 'foreign-session' then manifest['slug'] = 'another-session'
+        when 'missing-path' then File.rename(selected, selected + '-actual')
+        when 'detached' then fixture_git(env, '-C', selected, 'checkout', '--detach')
+        when 'symlink'
+          File.rename(selected, selected + '-actual')
+          File.symlink(selected + '-actual', selected)
+        when 'other-repository'
+          FileUtils.rm_f(File.join(selected, '.git'))
+          fixture_git(env, 'init', selected)
+        when 'nested-directory'
+          File.rename(selected, selected + '-actual')
+          FileUtils.mkdir_p(selected)
+          fixture_git(env, 'init', File.dirname(selected))
+        else set_os_worktree(directory, failure)
+        end
+        File.write(manifest_path, YAML.dump(manifest))
+        File.unlink(manifest_path) if failure == 'missing-manifest'
+        result = run_helper('vpsadmin', env, 'start')
+        refute(result.success?, failure.inspect + @last_output)
+        assert_includes(@last_output, 'vpsadminosWorktree')
+        assert_empty(events(env))
+        assert_locks_released(env)
+      end
+    end
+  end
+
+  def test_ssh_only_refresh_preserves_applied_identity_without_resolving_a_new_source
+    with_workspace('vpsadmin', applied: true) do |env, directory|
+      register_os_worktree(env, directory)
+      File.unlink(File.join(env.fetch('DEVCLUSTER_WORKSPACE'), 'work', env.fetch('TEST_SLUG'), 'portal.yml'))
+      before = File.binread(File.join(directory, 'applied-config.json'))
+      assert(run_helper('vpsadmin', env, 'refresh').success?, @last_output)
+      assert_equal(before, File.binread(File.join(directory, 'applied-config.json')))
+      refute(events(env).any? { |event| %w[build run copy activate].include?(event['event']) })
+      assert_locks_released(env)
     end
   end
 
@@ -1381,6 +1494,7 @@ class DevclusterCommandsTest < Minitest::Test
         'TEST_SLUG' => slug,
         'TEST_KIND' => kind,
         'TEST_REAL_RUBY' => RbConfig.ruby,
+        'TEST_REAL_GIT' => ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |path| File.join(path, 'git') }.find { |path| File.executable?(path) },
         'TEST_STORE' => store,
         'TEST_BUILT_MACHINES' => JSON.generate(machines),
         'TEST_CONFIG' => config,
@@ -1397,6 +1511,47 @@ class DevclusterCommandsTest < Minitest::Test
     ensure
       FileUtils.rm_rf(socket) if socket
     end
+  end
+
+  def set_os_worktree(directory, name)
+    path = File.join(directory, 'config.json')
+    config = JSON.parse(File.read(File.exist?(path) ? path : File.join(ROOT, 'test/fixtures/vpsadmin-config.json')))
+    config['vpsadminosWorktree'] = name
+    File.write(path, JSON.generate(config))
+  end
+
+  def fixture_git(env, *args)
+    stdout, stderr, result = Open3.capture3(env.fetch('TEST_REAL_GIT'), *args)
+    assert(result.success?, stdout + stderr)
+    stdout.strip
+  end
+
+  def register_os_worktree(env, directory)
+    workspace = env.fetch('DEVCLUSTER_WORKSPACE')
+    bare = File.join(workspace, 'repos/vpsadminos.git')
+    FileUtils.mkdir_p(File.dirname(bare))
+    fixture_git(env, 'init', '--bare', bare)
+    seed = File.join(workspace, 'seed')
+    fixture_git(env, 'init', seed)
+    fixture_git(env, '-C', seed, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+      'commit', '--allow-empty', '-m', 'fixture')
+    fixture_git(env, '--git-dir=' + bare, 'fetch', seed, 'HEAD:refs/heads/review')
+    selected = File.join(workspace, 'worktrees', env.fetch('TEST_SLUG'), 'vpsadminos-review')
+    fixture_git(env, '--git-dir=' + bare, 'worktree', 'add', selected, 'review')
+    manifest = { 'slug' => env.fetch('TEST_SLUG'), 'repositories' => [
+      { 'name' => 'vpsadminos-review', 'project' => 'vpsadminos', 'branch' => 'review' }
+    ] }
+    File.write(File.join(workspace, 'work', env.fetch('TEST_SLUG'), 'portal.yml'), YAML.dump(manifest))
+    set_os_worktree(directory, 'vpsadminos-review')
+    env['TEST_OS_SELECTION_PATH'] = selected
+    [selected, fixture_git(env, '-C', selected, 'rev-parse', 'HEAD')]
+  end
+
+  def assert_os_inputs(event, selected)
+    overrides = {}
+    event.fetch('argv').each_cons(3) { |flag, name, value| overrides[name] = value if flag == '--override-input' }
+    assert_equal('path:' + selected, overrides.fetch('vpsadminos'))
+    assert_equal('path:' + selected, overrides.fetch('vpsadmin/vpsadminos'))
   end
 
   def run_helper(kind, env, command, target = nil)
@@ -1611,6 +1766,9 @@ class DevclusterCommandsTest < Minitest::Test
               else command
               end
       if command == 'git'
+        if ARGV.first == '-C' && ARGV[1] == ENV['TEST_OS_SELECTION_PATH']
+          exec ENV.fetch('TEST_REAL_GIT'), *ARGV
+        end
         if ENV['FAIL_GIT_STATUS'] == '1' && ARGV.include?('status') &&
            ARGV.any? { |arg| arg.end_with?('/vpsadmin-webui') }
           exit 23
@@ -1638,6 +1796,14 @@ class DevclusterCommandsTest < Minitest::Test
           config = JSON.parse(File.read(ENV.fetch('TEST_CONFIG')))
           machines = JSON.parse(ENV.fetch('TEST_BUILT_MACHINES'))
           if ENV.fetch('TEST_KIND') == 'vpsadmin'
+            # Match the real flake's bootHost projection for retained guests.
+            if build_context
+              machines.each do |name, machine|
+                old = build_context.fetch('machines').fetch(name)
+                %w[qemu virtiofsd].each { |key| machine[key] = old.fetch(key) }
+                machine.fetch('sharedFileSystems')['vpsadminos'] = old.fetch('sharedFileSystems').fetch('vpsadminos')
+              end
+            end
             source = environment.fetch('VPSADMIN_DEVCLUSTER_CONFIG_SOURCE')
             machines.each_value do |machine|
               if source.empty?

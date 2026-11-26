@@ -394,6 +394,10 @@ per-cluster overrides. Use it to change domains, service and node
 IP addresses, topology membership, seeded users, resource packages, pool
 settings, networks, IP addresses, and mail recipients.
 
+The optional `vpsadminosWorktree` setting selects another registered OS worktree
+in the same session. See [Runtime updates](#runtime-updates) for source selection
+and retained-cluster behavior.
+
 The default seed creates:
 
 - one hypervisor pool on each regular node, using filesystem `tank/ct`;
@@ -819,10 +823,27 @@ vpsadmin-devcluster update <slug> services
 vpsadmin-devcluster update <slug> node1
 ```
 
-Creation and ordinary updates select vpsAdminOS from `worktrees/<slug>/vpsadminos`
-when that checkout exists. Otherwise, they use the canonical repository's local
-`origin/staging` ref. The command does not fetch the ref automatically. Both OS
-inputs use this selection for guest builds and revision metadata.
+By default, creation and ordinary updates select vpsAdminOS from
+`worktrees/<slug>/vpsadminos` when that checkout exists. Otherwise, they use the
+canonical repository's local `origin/staging` ref without fetching it.
+
+To select another OS worktree in the same session, set its registered name in the
+cluster's `config.json`:
+
+```json
+{
+  "vpsadminosWorktree": "vpsadminos-feature"
+}
+```
+
+The name must identify a registered `vpsadminos` worktree in this session, with
+the recorded branch checked out. It is not a path or branch selector. An invalid
+explicit selection stops the operation without falling back to the default.
+Omit the setting or set it to `null` to use the default selection.
+
+Both OS inputs, build revision metadata and dirty-source labels use this
+selection. When a worktree is selected, a fresh cluster exports it at
+`/mnt/vpsadminos`.
 
 An update preserves the recorded host path exported at `/mnt/vpsadminos` and the
 host QEMU and virtiofsd paths established at boot. Selecting a newer OS for the
